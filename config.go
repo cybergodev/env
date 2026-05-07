@@ -336,7 +336,7 @@ func TestingConfig() Config {
 // Example:
 //
 //	cfg := env.ProductionConfig()
-//	cfg.FileConfig.Filenames = []string{"/etc/app/.env"}
+//	cfg.FileConfig.Filenames = []string{"app.env"}
 //	cfg.ComponentConfig.AuditHandler = env.NewJSONAuditHandler(os.Stdout)
 //	loader, err := env.New(cfg)
 func ProductionConfig() Config {

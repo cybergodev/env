@@ -50,8 +50,8 @@ func TestSecureValue(t *testing.T) {
 					t.Error("NewSecureValue() returned nil")
 				}
 			case "string":
-				if sv.String() != tt.wantResult.(string) {
-					t.Errorf("String() = %q, want %q", sv.String(), tt.wantResult)
+				if sv.Reveal() != tt.wantResult.(string) {
+					t.Errorf("Reveal() = %q, want %q", sv.Reveal(), tt.wantResult)
 				}
 			case "bytes":
 				if string(sv.Bytes()) != tt.wantResult.(string) {
@@ -111,8 +111,8 @@ func TestSecureValuePool(t *testing.T) {
 	// Create new ones - should potentially reuse from pool
 	for i := 0; i < 5; i++ {
 		newSv := NewSecureValue("new")
-		if newSv.String() != "new" {
-			t.Errorf("New SecureValue from pool = %q, want %q", newSv.String(), "new")
+		if newSv.Reveal() != "new" {
+			t.Errorf("New SecureValue from pool = %q, want %q", newSv.Reveal(), "new")
 		}
 	}
 }
@@ -145,8 +145,8 @@ func TestSecureValue_ResetStateConsistency(t *testing.T) {
 				t.Errorf("IsClosed() = %v, want %v", sv2.IsClosed(), tt.wantClosed)
 			}
 
-			if sv2.String() != tt.wantString {
-				t.Errorf("String() = %q, want %q", sv2.String(), tt.wantString)
+			if sv2.Reveal() != tt.wantString {
+				t.Errorf("Reveal() = %q, want %q", sv2.Reveal(), tt.wantString)
 			}
 		})
 	}
@@ -259,8 +259,8 @@ func TestSecureMap(t *testing.T) {
 					if sv == nil {
 						t.Fatal("GetSecure() returned nil")
 					}
-					if sv.String() != tt.wantValue.(string) {
-						t.Errorf("GetSecure().String() = %q, want %q", sv.String(), tt.wantValue)
+					if sv.Reveal() != tt.wantValue.(string) {
+						t.Errorf("GetSecure().Reveal() = %q, want %q", sv.Reveal(), tt.wantValue)
 					}
 					sv.Release()
 				}
@@ -350,8 +350,8 @@ func TestMemoryLock_SecureValue(t *testing.T) {
 
 		// On systems with sufficient privileges, the value should be locked
 		// We check that the function doesn't panic and returns a valid value
-		if sv.String() != "sensitive-data" {
-			t.Errorf("String() = %q, want %q", sv.String(), "sensitive-data")
+		if sv.Reveal() != "sensitive-data" {
+			t.Errorf("Reveal() = %q, want %q", sv.Reveal(), "sensitive-data")
 		}
 
 		// Check if there was a lock error (expected on systems without privileges)
@@ -409,8 +409,8 @@ func TestNewSecureValueStrict(t *testing.T) {
 		}
 
 		// The SecureValue should still be usable regardless of lock status
-		if sv != nil && sv.String() != "sensitive-data" {
-			t.Errorf("String() = %q, want %q", sv.String(), "sensitive-data")
+		if sv != nil && sv.Reveal() != "sensitive-data" {
+			t.Errorf("Reveal() = %q, want %q", sv.Reveal(), "sensitive-data")
 		}
 	})
 
@@ -427,8 +427,8 @@ func TestNewSecureValueStrict(t *testing.T) {
 			t.Errorf("NewSecureValueStrict() returned error when locking disabled: %v", err)
 		}
 
-		if sv != nil && sv.String() != "sensitive-data" {
-			t.Errorf("String() = %q, want %q", sv.String(), "sensitive-data")
+		if sv != nil && sv.Reveal() != "sensitive-data" {
+			t.Errorf("Reveal() = %q, want %q", sv.Reveal(), "sensitive-data")
 		}
 	})
 }

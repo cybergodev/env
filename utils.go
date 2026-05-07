@@ -39,44 +39,96 @@ func firstOrZero[T any](values ...T) T {
 // Internal Parse Utilities
 // ============================================================================
 
-// boolValues maps lowercase boolean strings to their values.
-// This provides O(1) lookup for boolean parsing.
-var boolValues = map[string]bool{
-	"1":        true,
-	"0":        false,
-	"true":     true,
-	"false":    false,
-	"yes":      true,
-	"no":       false,
-	"on":       true,
-	"off":      false,
-	"enabled":  true,
-	"disabled": false,
-}
-
 // parseBool parses a boolean string with common variations.
+// Uses byte-level case-insensitive comparison to avoid allocations from
+// strings.ToLower and strings.TrimSpace.
 func parseBool(s string) (bool, error) {
-	s = strings.TrimSpace(s)
+	s = internal.TrimSpace(s)
 	if len(s) == 0 {
 		return false, nil
 	}
-	if v, ok := boolValues[strings.ToLower(s)]; ok {
+	if v, ok := lookupBoolASCII(s); ok {
 		return v, nil
 	}
 	return false, &ValidationError{
 		Field:   "bool",
-		Value:   s,
+		Value:   MaskSensitiveInString(s),
 		Message: "invalid boolean value",
 	}
 }
 
+// lookupBoolASCII performs case-insensitive boolean lookup without allocating.
+// Handles common boolean representations: true/false, yes/no, on/off, 1/0, enabled/disabled.
+func lookupBoolASCII(s string) (bool, bool) {
+	n := len(s)
+	switch n {
+	case 1:
+		if s[0] == '1' || s[0] == '0' {
+			return s[0] == '1', true
+		}
+	case 2:
+		if equalFoldASCII(s, "no") {
+			return false, true
+		}
+		if equalFoldASCII(s, "on") {
+			return true, true
+		}
+	case 3:
+		if equalFoldASCII(s, "yes") {
+			return true, true
+		}
+		if equalFoldASCII(s, "off") {
+			return false, true
+		}
+	case 4:
+		if equalFoldASCII(s, "true") {
+			return true, true
+		}
+	case 5:
+		if equalFoldASCII(s, "false") {
+			return false, true
+		}
+	case 7:
+		if equalFoldASCII(s, "enabled") {
+			return true, true
+		}
+	case 8:
+		if equalFoldASCII(s, "disabled") {
+			return false, true
+		}
+	}
+	return false, false
+}
+
+// equalFoldASCII compares two strings case-insensitively for ASCII characters only.
+// This is faster than strings.EqualFold for the common case of short ASCII strings.
+func equalFoldASCII(a, b string) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := 0; i < len(a); i++ {
+		ca := a[i]
+		cb := b[i]
+		if ca >= 'A' && ca <= 'Z' {
+			ca += 32
+		}
+		if cb >= 'A' && cb <= 'Z' {
+			cb += 32
+		}
+		if ca != cb {
+			return false
+		}
+	}
+	return true
+}
+
 // parseDuration parses a duration string with additional validation.
 func parseDuration(s string) (time.Duration, error) {
-	d, err := time.ParseDuration(strings.TrimSpace(s))
+	d, err := time.ParseDuration(internal.TrimSpace(s))
 	if err != nil {
 		return 0, &ValidationError{
 			Field:   "duration",
-			Value:   s,
+			Value:   MaskSensitiveInString(s),
 			Message: "invalid duration format",
 		}
 	}
@@ -85,11 +137,11 @@ func parseDuration(s string) (time.Duration, error) {
 
 // parseInt parses an integer string with bounds checking.
 func parseInt(s string, bits int) (int64, error) {
-	n, err := strconv.ParseInt(strings.TrimSpace(s), 10, bits)
+	n, err := strconv.ParseInt(internal.TrimSpace(s), 10, bits)
 	if err != nil {
 		return 0, &ValidationError{
 			Field:   "int",
-			Value:   s,
+			Value:   MaskSensitiveInString(s),
 			Message: "invalid integer value",
 		}
 	}
@@ -180,6 +232,7 @@ func toInternalFormat(f FileFormat) internal.MarshalFormat {
 
 // detectDataFormat auto-detects the format of input data.
 // Returns FormatJSON for JSON, FormatYAML for YAML, FormatEnv otherwise.
+// Uses IndexByte line scanning to avoid allocating a full string slice.
 func detectDataFormat(data string) FileFormat {
 	data = strings.TrimSpace(data)
 
@@ -193,9 +246,19 @@ func detectDataFormat(data string) FileFormat {
 		return FormatJSON
 	}
 
-	// Check first non-comment, non-empty line
-	lines := strings.Split(data, "\n")
-	for _, line := range lines {
+	// Scan lines without allocating a slice
+	start := 0
+	for start < len(data) {
+		end := strings.IndexByte(data[start:], '\n')
+		var line string
+		if end == -1 {
+			line = data[start:]
+			start = len(data)
+		} else {
+			line = data[start : start+end]
+			start += end + 1
+		}
+
 		line = strings.TrimSpace(line)
 		if line == "" || strings.HasPrefix(line, "#") {
 			continue
@@ -419,7 +482,7 @@ func parseSliceElement[T sliceElement](value string) (T, error) {
 	var zero T
 
 	// Trim whitespace for consistent behavior across all types
-	trimmed := strings.TrimSpace(value)
+	trimmed := internal.TrimSpace(value)
 
 	switch any(zero).(type) {
 	case string:
@@ -448,7 +511,7 @@ func parseSliceElement[T sliceElement](value string) (T, error) {
 	default:
 		return zero, &ValidationError{
 			Field:   "slice_element",
-			Value:   value,
+			Value:   MaskSensitiveInString(value),
 			Message: "unsupported slice element type",
 		}
 	}

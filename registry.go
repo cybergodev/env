@@ -79,6 +79,13 @@ func ForceRegisterParser(format FileFormat, factory ParserFactory) error {
 		return fmt.Errorf("factory cannot be nil for format: %s", format.String())
 	}
 
+	// Warn when replacing a built-in parser — this has security implications
+	if format == FormatEnv || format == FormatJSON || format == FormatYAML {
+		fmt.Printf("WARNING: ForceRegisterParser is overriding built-in parser for %s. "+
+			"Ensure the replacement implements the same security checks "+
+			"(key validation, value validation, size limits, forbidden keys).\n", format.String())
+	}
+
 	globalParserRegistry.factories[format] = factory
 	return nil
 }

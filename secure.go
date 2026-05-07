@@ -218,44 +218,11 @@ func (sv *SecureValue) finalize() {
 	sv.closed.Store(true)
 }
 
-// clearData securely zeros the data slice.
-// Uses volatile-style writes through unsafe.Pointer to prevent compiler optimization.
-// The compiler cannot optimize away writes through unsafe pointers, ensuring
-// that sensitive data is actually cleared from memory.
-// Also unlocks memory if it was previously locked.
-func (sv *SecureValue) clearData() {
-	// SECURITY: Check for empty/nil slice to avoid panic when accessing &sv.data[0].
-	// Note: len(slice) == 0 correctly handles BOTH cases:
-	// 1. nil slice: len(nil) == 0
-	// 2. empty slice: len([]byte{}) == 0
-	// The unsafe.Pointer(&sv.data[0]) below is safe because we've verified len > 0.
-	if len(sv.data) == 0 {
-		return
-	}
-
-	// Unlock memory before clearing (if it was locked)
-	if sv.locked {
-		internal.UnlockMemory(sv.data)
-		sv.locked = false
-	}
-
-	// Use volatile-style clearing to prevent compiler optimization
-	// This writes through an unsafe pointer which the compiler cannot optimize away
-	dataPtr := unsafe.Pointer(&sv.data[0])
-	for i := range sv.data {
-		// Write through pointer to prevent dead store elimination
-		*(*byte)(unsafe.Pointer(uintptr(dataPtr) + uintptr(i))) = 0
-	}
-	// Use runtime.KeepAlive to ensure the pointer is considered live until here
-	runtime.KeepAlive(sv.data)
-	sv.data = nil
-	sv.lockErr = nil
-}
-
 // clearDataLocked securely zeros the data slice.
+// Uses volatile-style writes through unsafe.Pointer to prevent compiler optimization.
 // Must be called with sv.mu held.
-// This is the locked version used by finalize() for thread-safety.
 func (sv *SecureValue) clearDataLocked() {
+	// SECURITY: len(slice) == 0 handles both nil and empty slices.
 	if len(sv.data) == 0 {
 		return
 	}
@@ -276,10 +243,20 @@ func (sv *SecureValue) clearDataLocked() {
 	sv.lockErr = nil
 }
 
-// String returns the value as a string.
-// This method is provided for convenience but should be used carefully
-// as it creates a copy of the sensitive data.
+// String returns a masked representation safe for logging and formatting.
+// This implements fmt.Stringer to prevent accidental secret leakage through
+// fmt.Printf, log.Println, or error wrapping. For the actual plaintext value,
+// use Reveal() explicitly.
 func (sv *SecureValue) String() string {
+	return sv.Masked()
+}
+
+// Reveal returns the plaintext value as a string.
+// The caller is responsible for handling the returned string securely —
+// avoid logging, serializing, or storing it in persistently accessible locations.
+// Use this only when the actual value is needed for cryptographic operations,
+// API calls, or similar secure processing.
+func (sv *SecureValue) Reveal() string {
 	sv.mu.RLock()
 	defer sv.mu.RUnlock()
 	if sv.closed.Load() || sv.data == nil {
@@ -321,7 +298,7 @@ func (sv *SecureValue) Close() error {
 	if sv.closed.Load() {
 		return nil
 	}
-	sv.clearData()
+	sv.clearDataLocked()
 	sv.closed.Store(true)
 	return nil
 }
@@ -339,7 +316,7 @@ func (sv *SecureValue) Release() {
 	if sv.closed.Load() {
 		return
 	}
-	sv.clearData()
+	sv.clearDataLocked()
 	sv.closed.Store(true)
 	// Clear finalizer before returning to pool. This prevents a race condition
 	// where GC might trigger the finalizer while the object is being reused.
@@ -460,21 +437,21 @@ func (sm *secureMap) getShard(key string) *secureMapShard {
 }
 
 // Set stores a value securely.
+// When overwriting an existing key, updates the SecureValue in-place when possible,
+// avoiding pool Get/Put overhead and reducing allocations.
 func (sm *secureMap) Set(key string, value string) {
 	shard := sm.getShard(key)
 	shard.mu.Lock()
-	var toRelease *SecureValue
 	if existing, ok := shard.values[key]; ok {
-		toRelease = existing // Save reference to release after unlocking
-		shard.values[key] = NewSecureValue(value)
+		// In-place update: reuse existing SecureValue to avoid pool cycle + allocation.
+		// Lock ordering is safe: shard.mu → sv.mu (reset acquires sv.mu.Lock).
+		// No reverse ordering exists anywhere in the codebase.
+		existing.reset(value)
+		shard.mu.Unlock()
 	} else {
 		shard.values[key] = NewSecureValue(value)
 		sm.count.Add(1)
-	}
-	shard.mu.Unlock()
-	// Release old value outside of shard lock to avoid lock order inversion
-	if toRelease != nil {
-		toRelease.Release()
+		shard.mu.Unlock()
 	}
 }
 
@@ -560,6 +537,7 @@ func (sm *secureMap) ensureShardCapacity(shard *secureMapShard, additionalCount 
 
 // setShardValues sets multiple values in a single shard.
 // Handles capacity management and secure value lifecycle.
+// Uses in-place updates for existing keys to reduce allocations.
 func (sm *secureMap) setShardValues(shardIdx int, values map[string]string, count int) {
 	shard := &sm.shards[shardIdx]
 	shard.mu.Lock()
@@ -567,23 +545,18 @@ func (sm *secureMap) setShardValues(shardIdx int, values map[string]string, coun
 	// Ensure capacity for new entries
 	sm.ensureShardCapacity(shard, count)
 
-	// Collect existing values to release after unlocking
-	var toRelease []*SecureValue
+	// Track new keys for count update
 	newKeys := 0
 	for key, value := range values {
 		if existing, ok := shard.values[key]; ok {
-			toRelease = append(toRelease, existing)
+			// In-place update: reuse existing SecureValue
+			existing.reset(value)
 		} else {
+			shard.values[key] = NewSecureValue(value)
 			newKeys++
 		}
-		shard.values[key] = NewSecureValue(value)
 	}
 	shard.mu.Unlock()
-
-	// Release old values outside of shard lock to avoid lock order inversion
-	for _, sv := range toRelease {
-		sv.Release()
-	}
 
 	// Update count after releasing lock
 	if newKeys > 0 {
@@ -600,18 +573,16 @@ func (sm *secureMap) Get(key string) (string, bool) {
 		shard.mu.RUnlock()
 		return "", false
 	}
-	// Check closed state atomically (no SecureValue lock needed)
-	// Holding shard lock prevents concurrent Delete/Release which could acquire sv lock
-	// before checking closed state, ensuring consistent view
-	if sv.closed.Load() || sv.data == nil {
-		shard.mu.RUnlock()
-		return "", false
+	// Acquire SecureValue's read lock for consistency with GetSecure/ToMap
+	sv.mu.RLock()
+	closed := sv.closed.Load() || sv.data == nil
+	var result string
+	if !closed {
+		result = string(sv.data)
 	}
-	// Copy data while holding shard lock
-	// The shard lock prevents Delete/Release from modifying this entry
-	result := string(sv.data)
+	sv.mu.RUnlock()
 	shard.mu.RUnlock()
-	return result, true
+	return result, !closed
 }
 
 // GetSecure retrieves a copy of the SecureValue for the given key.

@@ -206,8 +206,8 @@ func (h *ChannelHandler) Close() error {
 //	// ... use handler ...
 //	handler.Close() // Closes the channel, consumer goroutine exits gracefully
 type CloseableChannelHandler struct {
-	ch     chan Event
-	closed atomic.Bool
+	ch   chan Event
+	done chan struct{} // closed in Close() to unblock Log() without panic
 }
 
 // NewCloseableChannelHandler creates a new CloseableChannelHandler with a
@@ -218,7 +218,8 @@ func NewCloseableChannelHandler(bufferSize int) *CloseableChannelHandler {
 		bufferSize = 0
 	}
 	return &CloseableChannelHandler{
-		ch: make(chan Event, bufferSize),
+		ch:   make(chan Event, bufferSize),
+		done: make(chan struct{}),
 	}
 }
 
@@ -230,39 +231,48 @@ func (h *CloseableChannelHandler) Channel() <-chan Event {
 
 // Log sends an audit event to the channel.
 // Returns an error if the handler has been closed.
-// This method blocks if the channel is full.
-// Uses recover to safely handle the race between Log and Close.
-func (h *CloseableChannelHandler) Log(event Event) (err error) {
-	if h.closed.Load() {
+// Uses a two-phase check: first test done without blocking, then select between
+// done and the send. This prevents the race where both done and ch are ready
+// (after Close) and Go's random select picks the send on a closed channel.
+func (h *CloseableChannelHandler) Log(event Event) error {
+	// Phase 1: non-blocking check — if done is already closed, return immediately.
+	select {
+	case <-h.done:
 		return fmt.Errorf("handler is closed")
+	default:
 	}
-
-	// Use recover to handle the race between Log and Close
-	// This is safe because sending to a closed channel panics
-	defer func() {
-		if r := recover(); r != nil {
-			err = fmt.Errorf("handler is closed")
-		}
-	}()
-
-	h.ch <- event
-	return nil
+	// Phase 2: race between actual send and concurrent Close.
+	// If Close fires here, done is closed before ch, so select picks done first.
+	select {
+	case <-h.done:
+		return fmt.Errorf("handler is closed")
+	case h.ch <- event:
+		return nil
+	}
 }
 
 // Close implements Handler.
-// Closes the underlying channel, signaling to any receivers that no more
-// events will be sent. Safe to call multiple times.
+// Closes done first to unblock any waiting Log calls, then closes the event channel.
+// Safe to call multiple times.
 func (h *CloseableChannelHandler) Close() error {
-	if h.closed.Swap(true) {
+	select {
+	case <-h.done:
 		return nil // Already closed
+	default:
+		close(h.done)
+		close(h.ch)
+		return nil
 	}
-	close(h.ch)
-	return nil
 }
 
 // IsClosed returns true if the handler has been closed.
 func (h *CloseableChannelHandler) IsClosed() bool {
-	return h.closed.Load()
+	select {
+	case <-h.done:
+		return true
+	default:
+		return false
+	}
 }
 
 // NopHandler discards all audit events.
@@ -347,11 +357,13 @@ func NewAuditor(handler Handler, isSensitive IsSensitiveFunc, masker MaskerFunc,
 
 // Log records an audit event.
 func (a *Auditor) Log(action Action, key, reason string, success bool) error {
-	// Fast path: atomic read for enabled check (thread-safe without lock overhead)
+	// Fast path: atomic read avoids lock acquisition when auditing is disabled.
 	if !a.enabled.Load() {
 		return nil
 	}
 	a.mu.RLock()
+	// Re-check under RLock: SetEnabled acquires the write lock, so this ensures
+	// we see a consistent state and don't log after a concurrent SetEnabled(false).
 	if !a.enabled.Load() {
 		a.mu.RUnlock()
 		return nil

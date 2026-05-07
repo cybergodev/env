@@ -70,6 +70,19 @@ func NewChannelAuditHandler(ch chan<- AuditEvent) *ChannelAuditHandler {
 	return internal.NewChannelHandler(ch)
 }
 
+// CloseableChannelHandler sends audit events to an owned channel with lifecycle management.
+// Unlike ChannelAuditHandler which accepts an external channel, CloseableChannelHandler
+// creates and owns its own buffered channel. Call Close() to shut down the handler and
+// close the channel. Use Channel() to receive events.
+type CloseableChannelHandler = internal.CloseableChannelHandler
+
+// NewCloseableChannelHandler creates a new CloseableChannelHandler with a buffered
+// channel of the specified size. The handler owns the channel and will close it
+// when Close() is called.
+func NewCloseableChannelHandler(bufferSize int) *CloseableChannelHandler {
+	return internal.NewCloseableChannelHandler(bufferSize)
+}
+
 // NopAuditHandler discards all audit events.
 type NopAuditHandler = internal.NopHandler
 

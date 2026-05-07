@@ -138,17 +138,15 @@ func ResetDefaultLoader() error {
 
 // setDefaultLoader sets the given loader as the default loader.
 // Returns ErrAlreadyInitialized if already initialized.
-// Uses atomic Swap to avoid TOCTOU race condition between check and store.
+// Uses mutex-protected Load+Store to avoid the transient inconsistency
+// that a Swap+Store-rollback pattern would introduce.
 func setDefaultLoader(loader *Loader) error {
 	defaultMu.Lock()
 	defer defaultMu.Unlock()
 
-	// Use Swap to atomically check-and-set.
-	// If swap returns non-nil, another loader was already set.
-	if old := defaultLoader.Swap(loader); old != nil {
-		// Swap back to preserve the original loader
-		defaultLoader.Store(old)
+	if current := defaultLoader.Load(); current != nil {
 		return ErrAlreadyInitialized
 	}
+	defaultLoader.Store(loader)
 	return nil
 }

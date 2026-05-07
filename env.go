@@ -265,8 +265,10 @@ func (l *Loader) LoadFiles(filenames ...string) error {
 }
 
 // loadFilesInternal is the shared implementation for file loading.
-// Must be called with lock held. The cleanupOnErr parameter determines
-// whether to close the loader on error (used during initialization).
+// Thread safety:
+//   - Called from New(): no lock required (loader not yet shared)
+//   - Called from LoadFiles(): caller must hold l.mu
+// The cleanupOnErr parameter determines whether to close the loader on error (used during initialization).
 func (l *Loader) loadFilesInternal(filenames []string, cleanupOnErr bool) error {
 	start := time.Now()
 
@@ -302,7 +304,8 @@ func (l *Loader) loadFilesInternal(filenames []string, cleanupOnErr bool) error 
 	return nil
 }
 
-// loadFileLocked loads a single file. Must be called with lock held.
+// loadFileLocked loads a single file.
+// Thread safety: safe to call with or without l.mu; secureMap provides its own locking.
 //
 // SECURITY - Defense-in-Depth for TOCTOU:
 // There is a theoretical Time-Of-Check-Time-Of-Use window between Open() and Stat()
@@ -412,7 +415,8 @@ func (l *Loader) Apply() error {
 	return l.applyLocked()
 }
 
-// applyLocked applies variables to the environment. Must be called with lock held.
+// applyLocked applies variables to the environment.
+// Thread safety: safe to call with or without l.mu; individual operations are internally synchronized.
 func (l *Loader) applyLocked() error {
 	keys := l.vars.Keys()
 	for _, key := range keys {
@@ -596,7 +600,8 @@ func buildIndexedKey(baseKey string, index int) string {
 	sb.Grow(totalLen)
 	sb.WriteString(baseKey)
 	sb.WriteByte('_')
-	sb.WriteString(strconv.Itoa(index))
+	var ibuf [20]byte
+	sb.Write(strconv.AppendInt(ibuf[:0], int64(index), 10))
 	return sb.String()
 }
 
@@ -636,9 +641,13 @@ func (l *Loader) Set(key, value string) error {
 	}
 
 	// Check overwrite policy
-	if _, exists := l.vars.Get(key); exists && !l.config.OverwriteExisting {
-		_ = l.auditor.Log(internal.ActionSet, key, "skipped (no overwrite)", false)
-		return nil
+	// Only call Get (which allocates) when we actually need to check the policy.
+	// When OverwriteExisting=true, skip the Get entirely to avoid unnecessary allocation.
+	if !l.config.OverwriteExisting {
+		if _, exists := l.vars.Get(key); exists {
+			_ = l.auditor.Log(internal.ActionSet, key, "skipped (no overwrite)", false)
+			return nil
+		}
 	}
 
 	l.vars.Set(key, value)
@@ -777,9 +786,9 @@ func getWithDefault[T any](loader *Loader, key string, parse func(string) (T, er
 
 // Config returns the loader's configuration.
 // Note: The returned Config should be treated as read-only.
-// Modifying the Security.KeyPattern, AllowedKeys, ForbiddenKeys, or RequiredKeys
-// fields may affect the loader's behavior. For a safe mutable copy,
-// manually copy the necessary fields.
+// Modifying the ValidationConfig (KeyPattern, AllowedKeys, ForbiddenKeys, RequiredKeys),
+// LimitsConfig, or ComponentConfig fields may affect the loader's behavior.
+// For a safe mutable copy, manually copy the necessary fields.
 func (l *Loader) Config() Config {
 	return l.config
 }
