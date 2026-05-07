@@ -6,7 +6,7 @@
 [![Security Policy](https://img.shields.io/badge/security-policy-blue.svg)](docs/SECURITY.md)
 [![Thread Safe](https://img.shields.io/badge/thread%20safe-%E2%9C%93-brightgreen.svg)](docs/CONCURRENCY_SAFETY.md)
 
-**[📖 中文文档](README_zh-CN.md)**
+**[中文文档](README_zh-CN.md)** | **[www.cybergo.dev/env](https://www.cybergo.dev/env)**
 
 ---
 

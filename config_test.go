@@ -7,201 +7,124 @@ import (
 )
 
 // ============================================================================
-// DefaultConfig Tests
+// Config Preset Tests (Table-Driven)
 // ============================================================================
 
-func TestDefaultConfig(t *testing.T) {
-	cfg := DefaultConfig()
+func TestConfigPresets(t *testing.T) {
+	tests := []struct {
+		name     string
+		factory  func() Config
+		checks   []struct {
+			desc string
+			ok   bool
+		}
+	}{
+		{
+			name:    "DefaultConfig",
+			factory: DefaultConfig,
+			checks: []struct {
+				desc string
+				ok   bool
+			}{
+				{"Filenames=[.env]", false},  // placeholder; real checks below
+			},
+		},
+		{
+			name:    "DevelopmentConfig",
+			factory: DevelopmentConfig,
+			checks:  nil, // checked via assertions below
+		},
+		{
+			name:    "TestingConfig",
+			factory: TestingConfig,
+			checks:  nil,
+		},
+		{
+			name:    "ProductionConfig",
+			factory: ProductionConfig,
+			checks:  nil,
+		},
+	}
 
-	t.Run("file handling defaults", func(t *testing.T) {
-		if len(cfg.Filenames) != 1 || cfg.Filenames[0] != ".env" {
-			t.Errorf("Filenames = %v, want [.env]", cfg.Filenames)
-		}
-		if cfg.FailOnMissingFile {
-			t.Error("FailOnMissingFile should be false")
-		}
-		if cfg.OverwriteExisting {
-			t.Error("OverwriteExisting should be false")
-		}
-		if !cfg.AllowExportPrefix {
-			t.Error("AllowExportPrefix should be true")
-		}
-		if cfg.AllowYamlSyntax {
-			t.Error("AllowYamlSyntax should be false")
-		}
-	})
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			cfg := tt.factory()
 
-	t.Run("size limit defaults", func(t *testing.T) {
-		if cfg.MaxFileSize != DefaultMaxFileSize {
-			t.Errorf("MaxFileSize = %d, want %d", cfg.MaxFileSize, DefaultMaxFileSize)
-		}
-		if cfg.MaxLineLength != DefaultMaxLineLength {
-			t.Errorf("MaxLineLength = %d, want %d", cfg.MaxLineLength, DefaultMaxLineLength)
-		}
-		if cfg.MaxKeyLength != DefaultMaxKeyLength {
-			t.Errorf("MaxKeyLength = %d, want %d", cfg.MaxKeyLength, DefaultMaxKeyLength)
-		}
-		if cfg.MaxValueLength != DefaultMaxValueLength {
-			t.Errorf("MaxValueLength = %d, want %d", cfg.MaxValueLength, DefaultMaxValueLength)
-		}
-		if cfg.MaxVariables != DefaultMaxVariables {
-			t.Errorf("MaxVariables = %d, want %d", cfg.MaxVariables, DefaultMaxVariables)
-		}
-		if cfg.MaxExpansionDepth != DefaultMaxExpansionDepth {
-			t.Errorf("MaxExpansionDepth = %d, want %d", cfg.MaxExpansionDepth, DefaultMaxExpansionDepth)
-		}
-	})
+			switch tt.name {
+			case "DefaultConfig":
+				// File handling
+				if len(cfg.Filenames) != 1 || cfg.Filenames[0] != ".env" {
+					t.Error("Filenames should be [.env]")
+				}
+				if cfg.FailOnMissingFile || cfg.OverwriteExisting {
+					t.Error("FailOnMissingFile/OverwriteExisting should be false")
+				}
+				if !cfg.AllowExportPrefix || cfg.AllowYamlSyntax {
+					t.Error("AllowExportPrefix=true, AllowYamlSyntax=false expected")
+				}
+				// Size limits
+				if cfg.MaxFileSize != DefaultMaxFileSize || cfg.MaxLineLength != DefaultMaxLineLength {
+					t.Error("Size limits should match defaults")
+				}
+				if cfg.MaxKeyLength != DefaultMaxKeyLength || cfg.MaxValueLength != DefaultMaxValueLength {
+					t.Error("Length limits should match defaults")
+				}
+				if cfg.MaxVariables != DefaultMaxVariables || cfg.MaxExpansionDepth != DefaultMaxExpansionDepth {
+					t.Error("Variable/depth limits should match defaults")
+				}
+				// Validation
+				if cfg.KeyPattern != nil || len(cfg.AllowedKeys) != 0 || len(cfg.ForbiddenKeys) != 0 || len(cfg.RequiredKeys) != 0 {
+					t.Error("Validation config should be empty/nil by default")
+				}
+				if !cfg.ValidateValues || !cfg.ExpandVariables {
+					t.Error("ValidateValues and ExpandVariables should be true")
+				}
+				if cfg.AuditEnabled {
+					t.Error("AuditEnabled should be false")
+				}
+				// JSON/YAML
+				if !cfg.JSONNullAsEmpty || !cfg.JSONNumberAsString || !cfg.JSONBoolAsString || cfg.JSONMaxDepth != 10 {
+					t.Error("JSON defaults incorrect")
+				}
+				if !cfg.YAMLNullAsEmpty || !cfg.YAMLNumberAsString || !cfg.YAMLBoolAsString || cfg.YAMLMaxDepth != 10 {
+					t.Error("YAML defaults incorrect")
+				}
 
-	t.Run("validation defaults", func(t *testing.T) {
-		// KeyPattern is nil by default to enable fast byte-level validation
-		// This provides ~10x performance improvement over regex validation
-		if cfg.KeyPattern != nil {
-			t.Error("KeyPattern should be nil for fast byte-level validation")
-		}
-		if len(cfg.AllowedKeys) != 0 {
-			t.Errorf("AllowedKeys = %v, want empty", cfg.AllowedKeys)
-		}
-		if len(cfg.ForbiddenKeys) != 0 {
-			t.Errorf("ForbiddenKeys = %v, want empty", cfg.ForbiddenKeys)
-		}
-		if len(cfg.RequiredKeys) != 0 {
-			t.Errorf("RequiredKeys = %v, want empty", cfg.RequiredKeys)
-		}
-	})
+			case "DevelopmentConfig":
+				if cfg.FailOnMissingFile || !cfg.OverwriteExisting || !cfg.AllowYamlSyntax {
+					t.Error("DevelopmentConfig: FailOnMissing=false, Overwrite=true, Yaml=true")
+				}
+				if cfg.MaxFileSize != 10*1024*1024 || cfg.MaxVariables != 500 {
+					t.Errorf("DevelopmentConfig: MaxFileSize=%d, MaxVariables=%d", cfg.MaxFileSize, cfg.MaxVariables)
+				}
+				if !cfg.ValidateValues {
+					t.Error("DevelopmentConfig: ValidateValues should be true")
+				}
 
-	t.Run("security defaults", func(t *testing.T) {
-		if !cfg.ValidateValues {
-			t.Error("ValidateValues should be true")
-		}
-	})
+			case "TestingConfig":
+				if cfg.FailOnMissingFile || !cfg.OverwriteExisting {
+					t.Error("TestingConfig: FailOnMissing=false, Overwrite=true")
+				}
+				if cfg.MaxFileSize != 64*1024 || cfg.MaxVariables != 50 {
+					t.Errorf("TestingConfig: MaxFileSize=%d, MaxVariables=%d", cfg.MaxFileSize, cfg.MaxVariables)
+				}
+				if cfg.AuditEnabled {
+					t.Error("TestingConfig: AuditEnabled should be false")
+				}
 
-	t.Run("expansion defaults", func(t *testing.T) {
-		if !cfg.ExpandVariables {
-			t.Error("ExpandVariables should be true")
-		}
-	})
-
-	t.Run("audit defaults", func(t *testing.T) {
-		if cfg.AuditEnabled {
-			t.Error("AuditEnabled should be false")
-		}
-	})
-
-	t.Run("JSON defaults", func(t *testing.T) {
-		if !cfg.JSONNullAsEmpty {
-			t.Error("JSONNullAsEmpty should be true")
-		}
-		if !cfg.JSONNumberAsString {
-			t.Error("JSONNumberAsString should be true")
-		}
-		if !cfg.JSONBoolAsString {
-			t.Error("JSONBoolAsString should be true")
-		}
-		if cfg.JSONMaxDepth != 10 {
-			t.Errorf("JSONMaxDepth = %d, want 10", cfg.JSONMaxDepth)
-		}
-	})
-
-	t.Run("YAML defaults", func(t *testing.T) {
-		if !cfg.YAMLNullAsEmpty {
-			t.Error("YAMLNullAsEmpty should be true")
-		}
-		if !cfg.YAMLNumberAsString {
-			t.Error("YAMLNumberAsString should be true")
-		}
-		if !cfg.YAMLBoolAsString {
-			t.Error("YAMLBoolAsString should be true")
-		}
-		if cfg.YAMLMaxDepth != 10 {
-			t.Errorf("YAMLMaxDepth = %d, want 10", cfg.YAMLMaxDepth)
-		}
-	})
-}
-
-// ============================================================================
-// DevelopmentConfig Tests
-// ============================================================================
-
-func TestDevelopmentConfig(t *testing.T) {
-	cfg := DevelopmentConfig()
-
-	t.Run("development-specific settings", func(t *testing.T) {
-		if cfg.FailOnMissingFile {
-			t.Error("FailOnMissingFile should be false")
-		}
-		if !cfg.OverwriteExisting {
-			t.Error("OverwriteExisting should be true")
-		}
-		if !cfg.AllowYamlSyntax {
-			t.Error("AllowYamlSyntax should be true")
-		}
-		if cfg.MaxFileSize != 10*1024*1024 {
-			t.Errorf("MaxFileSize = %d, want 10MB", cfg.MaxFileSize)
-		}
-		if cfg.MaxVariables != 500 {
-			t.Errorf("MaxVariables = %d, want 500", cfg.MaxVariables)
-		}
-		// SECURITY: ValidateValues should remain true even in development
-		// to prevent injection attacks during development
-		if !cfg.ValidateValues {
-			t.Error("ValidateValues should be true for security")
-		}
-	})
-}
-
-// ============================================================================
-// TestingConfig Tests
-// ============================================================================
-
-func TestTestingConfig(t *testing.T) {
-	cfg := TestingConfig()
-
-	t.Run("testing-specific settings", func(t *testing.T) {
-		if cfg.FailOnMissingFile {
-			t.Error("FailOnMissingFile should be false")
-		}
-		if !cfg.OverwriteExisting {
-			t.Error("OverwriteExisting should be true")
-		}
-		if cfg.MaxFileSize != 64*1024 {
-			t.Errorf("MaxFileSize = %d, want 64KB", cfg.MaxFileSize)
-		}
-		if cfg.MaxVariables != 50 {
-			t.Errorf("MaxVariables = %d, want 50", cfg.MaxVariables)
-		}
-		if cfg.AuditEnabled {
-			t.Error("AuditEnabled should be false")
-		}
-	})
-}
-
-// ============================================================================
-// ProductionConfig Tests
-// ============================================================================
-
-func TestProductionConfig(t *testing.T) {
-	cfg := ProductionConfig()
-
-	t.Run("production-specific settings", func(t *testing.T) {
-		if !cfg.FailOnMissingFile {
-			t.Error("FailOnMissingFile should be true")
-		}
-		if cfg.OverwriteExisting {
-			t.Error("OverwriteExisting should be false")
-		}
-		if !cfg.AuditEnabled {
-			t.Error("AuditEnabled should be true")
-		}
-		if !cfg.ValidateValues {
-			t.Error("ValidateValues should be true")
-		}
-		if cfg.MaxFileSize != 64*1024 {
-			t.Errorf("MaxFileSize = %d, want 64KB", cfg.MaxFileSize)
-		}
-		if cfg.MaxVariables != 50 {
-			t.Errorf("MaxVariables = %d, want 50", cfg.MaxVariables)
-		}
-	})
+			case "ProductionConfig":
+				if !cfg.FailOnMissingFile || cfg.OverwriteExisting {
+					t.Error("ProductionConfig: FailOnMissing=true, Overwrite=false")
+				}
+				if !cfg.AuditEnabled || !cfg.ValidateValues {
+					t.Error("ProductionConfig: AuditEnabled=true, ValidateValues=true")
+				}
+				if cfg.MaxFileSize != 64*1024 || cfg.MaxVariables != 50 {
+					t.Errorf("ProductionConfig: MaxFileSize=%d, MaxVariables=%d", cfg.MaxFileSize, cfg.MaxVariables)
+				}
+			}
+		})
+	}
 }
 
 // ============================================================================
@@ -218,10 +141,49 @@ func TestConfig_Validate(t *testing.T) {
 
 	t.Run("invalid key pattern", func(t *testing.T) {
 		cfg := DefaultConfig()
-		// Pattern that doesn't match TEST_KEY
 		cfg.KeyPattern = regexp.MustCompile(`^[a-z]+$`)
 		if err := cfg.Validate(); err == nil {
 			t.Error("Validate() should fail with invalid key pattern")
+		}
+	})
+
+	t.Run("invalid JSON max depth zero", func(t *testing.T) {
+		cfg := DefaultConfig()
+		cfg.JSONMaxDepth = 0
+		if err := cfg.Validate(); err == nil {
+			t.Error("Validate() should fail with zero JSONMaxDepth")
+		}
+	})
+
+	t.Run("invalid JSON max depth too large", func(t *testing.T) {
+		cfg := DefaultConfig()
+		cfg.JSONMaxDepth = 101
+		if err := cfg.Validate(); err == nil {
+			t.Error("Validate() should fail with JSONMaxDepth > 100")
+		}
+	})
+
+	t.Run("invalid YAML max depth zero", func(t *testing.T) {
+		cfg := DefaultConfig()
+		cfg.YAMLMaxDepth = 0
+		if err := cfg.Validate(); err == nil {
+			t.Error("Validate() should fail with zero YAMLMaxDepth")
+		}
+	})
+
+	t.Run("invalid YAML max depth too large", func(t *testing.T) {
+		cfg := DefaultConfig()
+		cfg.YAMLMaxDepth = 101
+		if err := cfg.Validate(); err == nil {
+			t.Error("Validate() should fail with YAMLMaxDepth > 100")
+		}
+	})
+
+	t.Run("valid custom key pattern", func(t *testing.T) {
+		cfg := DefaultConfig()
+		cfg.KeyPattern = regexp.MustCompile(`^[A-Z][A-Z0-9_]*$`)
+		if err := cfg.Validate(); err != nil {
+			t.Errorf("Validate() with valid pattern error = %v", err)
 		}
 	})
 }
@@ -647,7 +609,7 @@ func TestConfig_OverwriteExisting(t *testing.T) {
 			t.Fatalf("Set() error = %v", err)
 		}
 		if err := loader.Set("KEY", "value2"); err != nil {
-			t.Fatalf("Set() error = %v", err)
+			t.Fatalf("Set() error = %v, want nil", err)
 		}
 
 		// Value should not change

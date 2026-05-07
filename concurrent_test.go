@@ -1,11 +1,8 @@
 package env
 
 import (
-	"bytes"
 	"errors"
 	"fmt"
-	"io"
-	"os"
 	"runtime"
 	"sync"
 	"sync/atomic"
@@ -1034,145 +1031,6 @@ func TestSingleton_ConcurrentReset(t *testing.T) {
 }
 
 // ============================================================================
-// Mock File System for Testing (local version for resource leak tests)
-// ============================================================================
-
-type mockFileSystem struct {
-	mu      sync.RWMutex
-	files   map[string][]byte
-	env     map[string]string
-	openErr error
-	statErr error
-}
-
-func newMockFileSystem() *mockFileSystem {
-	return &mockFileSystem{
-		files: make(map[string][]byte),
-		env:   make(map[string]string),
-	}
-}
-
-func (m *mockFileSystem) AddFile(name string, content []byte) {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	m.files[name] = content
-}
-
-func (m *mockFileSystem) Open(name string) (File, error) {
-	if m.openErr != nil {
-		return nil, m.openErr
-	}
-	m.mu.RLock()
-	defer m.mu.RUnlock()
-	content, ok := m.files[name]
-	if !ok {
-		return nil, os.ErrNotExist
-	}
-	return &mockFile{reader: bytes.NewReader(content)}, nil
-}
-
-func (m *mockFileSystem) OpenFile(name string, flag int, perm os.FileMode) (File, error) {
-	return m.Open(name)
-}
-
-func (m *mockFileSystem) Stat(name string) (os.FileInfo, error) {
-	if m.statErr != nil {
-		return nil, m.statErr
-	}
-	m.mu.RLock()
-	defer m.mu.RUnlock()
-	content, ok := m.files[name]
-	if !ok {
-		return nil, os.ErrNotExist
-	}
-	return &mockFileInfo{name: name, size: int64(len(content))}, nil
-}
-
-func (m *mockFileSystem) MkdirAll(path string, perm os.FileMode) error {
-	return nil
-}
-
-func (m *mockFileSystem) Remove(name string) error {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	delete(m.files, name)
-	return nil
-}
-
-func (m *mockFileSystem) Rename(oldpath, newpath string) error {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	if content, ok := m.files[oldpath]; ok {
-		m.files[newpath] = content
-		delete(m.files, oldpath)
-	}
-	return nil
-}
-
-func (m *mockFileSystem) Getenv(key string) string {
-	m.mu.RLock()
-	defer m.mu.RUnlock()
-	return m.env[key]
-}
-
-func (m *mockFileSystem) Setenv(key, value string) error {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	m.env[key] = value
-	return nil
-}
-
-func (m *mockFileSystem) Unsetenv(key string) error {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	delete(m.env, key)
-	return nil
-}
-
-func (m *mockFileSystem) LookupEnv(key string) (string, bool) {
-	m.mu.RLock()
-	defer m.mu.RUnlock()
-	val, ok := m.env[key]
-	return val, ok
-}
-
-type mockFile struct {
-	reader *bytes.Reader
-}
-
-func (m *mockFile) Read(p []byte) (n int, err error) {
-	return m.reader.Read(p)
-}
-
-func (m *mockFile) Write(p []byte) (n int, err error) {
-	return 0, io.ErrUnexpectedEOF
-}
-
-func (m *mockFile) Close() error {
-	return nil
-}
-
-func (m *mockFile) Stat() (os.FileInfo, error) {
-	return &mockFileInfo{size: m.reader.Size()}, nil
-}
-
-func (m *mockFile) Sync() error {
-	return nil
-}
-
-type mockFileInfo struct {
-	name string
-	size int64
-}
-
-func (m *mockFileInfo) Name() string       { return m.name }
-func (m *mockFileInfo) Size() int64        { return m.size }
-func (m *mockFileInfo) Mode() os.FileMode  { return 0644 }
-func (m *mockFileInfo) ModTime() time.Time { return time.Time{} }
-func (m *mockFileInfo) IsDir() bool        { return false }
-func (m *mockFileInfo) Sys() interface{}   { return nil }
-
-// ============================================================================
 // Resource Leak Tests
 // ============================================================================
 
@@ -1269,8 +1127,8 @@ func TestCloseableChannelHandler_ReceiverUnblocked(t *testing.T) {
 // when Close() is called.
 func TestLoader_ResourceCleanup(t *testing.T) {
 	// Use a mock filesystem to avoid path validation issues
-	mockFS := newMockFileSystem()
-	mockFS.AddFile(".env", []byte("KEY1=value1\nKEY2=value2"))
+	mockFS := newTestFileSystem()
+	mockFS.files[".env"] = "KEY1=value1\nKEY2=value2"
 
 	cfg := DefaultConfig()
 	cfg.Filenames = []string{".env"}
@@ -1414,8 +1272,8 @@ func TestMultipleLoader_NoResourceLeak(t *testing.T) {
 	initialGoroutines := runtime.NumGoroutine()
 
 	// Use a mock filesystem to avoid path validation issues
-	mockFS := newMockFileSystem()
-	mockFS.AddFile(".env", []byte("KEY=value"))
+	mockFS := newTestFileSystem()
+	mockFS.files[".env"] = "KEY=value"
 
 	// Create and close multiple loaders
 	for i := 0; i < 20; i++ {
@@ -1546,8 +1404,8 @@ func TestSingleton_ResetClosesLoader(t *testing.T) {
 	_ = ResetDefaultLoader()
 
 	// Create a new default loader via Load
-	mockFS := newMockFileSystem()
-	mockFS.AddFile(".env", []byte("TEST_KEY=test_value"))
+	mockFS := newTestFileSystem()
+	mockFS.files[".env"] = "TEST_KEY=test_value"
 
 	cfg := DefaultConfig()
 	cfg.Filenames = []string{".env"}
@@ -1607,8 +1465,8 @@ func TestKeyInternCache_BoundedGrowth(t *testing.T) {
 // TestLoader_MultipleCloseSafe verifies that calling Close() on a Loader
 // multiple times is safe.
 func TestLoader_MultipleCloseSafe(t *testing.T) {
-	mockFS := newMockFileSystem()
-	mockFS.AddFile(".env", []byte("KEY=value"))
+	mockFS := newTestFileSystem()
+	mockFS.files[".env"] = "KEY=value"
 
 	cfg := DefaultConfig()
 	cfg.Filenames = []string{".env"}

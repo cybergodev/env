@@ -4,7 +4,34 @@ All notable changes to the cybergodev/env library will be documented in this fil
 
 ---
 
-## v1.1.0 — Performance & Architecture Refactoring (2026-03-22)
+## v1.1.1 - Production Readiness & Performance (2026-05-07)
+
+### Added
+- `Reveal()` — explicit plaintext access method on `SecureValue`
+- `ErrDuplicateKey` — sentinel error for duplicate key detection
+
+### Changed
+- `ForceRegisterParser()` prints security warning when overriding built-in parsers
+- `secureMap.Get()` acquires read lock for thread-safety consistency
+
+### Fixed
+- Stale `Config()` godoc referencing non-existent `Security.*` fields
+- Transient loader inconsistency during `setDefaultLoader` rollback
+- Sensitive data residue in pooled scanner buffers
+
+### Security
+- `ValidationError` messages now consistently mask sensitive values
+- `CloseableChannelHandler` uses select/done pattern instead of recover()
+
+### Performance
+- `secureMap.Set` updates in-place, 25-100% fewer allocs for overwrite workloads
+- `parseBool` uses byte-level comparison, eliminating per-parse allocations
+- `detectDataFormat` uses `IndexByte` scanning instead of `strings.Split`
+- `Loader.Set` skips redundant lookup when `OverwriteExisting=true`
+
+---
+
+## v1.1.0 - Performance & Architecture Refactoring (2026-03-22)
 
 ### Breaking Changes
 - Removed deprecated grouped accessors: use direct `Config` field access instead of `GetFileConfig()`/`SetFileConfig()`, `GetValidationConfig()`/`SetValidationConfig()`, etc.
@@ -43,7 +70,7 @@ All notable changes to the cybergodev/env library will be documented in this fil
 
 ---
 
-## v1.0.1 — Security Hardening & Performance (2026-03-19)
+## v1.0.1 - Security Hardening & Performance (2026-03-19)
 
 ### Added
 - `CloseableChannelHandler` — audit handler with owned channel lifecycle for proper resource cleanup
@@ -67,7 +94,7 @@ All notable changes to the cybergodev/env library will be documented in this fil
 
 ---
 
-## v1.0.0 — Initial Release (2026-03-01)
+## v1.0.0 - Initial Release (2026-03-01)
 
 ### Core Features
 

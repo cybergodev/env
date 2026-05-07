@@ -46,6 +46,8 @@ func putScannerBuffer(buf *[]byte) {
 		// Don't pool very large buffers
 		return
 	}
+	// Clear sensitive data before returning to pool
+	clear(*buf)
 	scannerBufferPool.Put(buf)
 }
 
@@ -65,11 +67,8 @@ var _ EnvParser = (*parser)(nil)
 // newParserWithFactory creates a new parser with a ComponentFactory.
 // This is more efficient as it reuses the same Validator, Auditor, and Expander
 // instances instead of creating new ones.
+// The caller is responsible for validating cfg before calling this function.
 func newParserWithFactory(cfg Config, factory *ComponentFactory) (*parser, error) {
-	if err := cfg.Validate(); err != nil {
-		return nil, err
-	}
-
 	if factory == nil {
 		return nil, fmt.Errorf("factory cannot be nil")
 	}
@@ -242,11 +241,11 @@ func (p *parser) Close() error {
 }
 
 // parseString parses environment variables from a string.
-// This is an internal function used by Unmarshal.
+// This is an internal function used by UnmarshalMap.
+// Uses a shared ComponentFactory to avoid per-call allocation overhead.
 func parseString(s string) (map[string]string, error) {
 	cfg := DefaultConfig()
-	factory := cfg.buildComponentFactory()
-	defer func() { _ = factory.Close() }()
+	factory := getSharedParseFactory()
 
 	p, err := newParserWithFactory(cfg, factory)
 	if err != nil {
@@ -255,4 +254,20 @@ func parseString(s string) (map[string]string, error) {
 
 	result, err := p.Parse(strings.NewReader(s), "")
 	return result, err
+}
+
+// sharedParseFactory caches a ComponentFactory for parseString to reuse.
+// The factory's auditor handler is internal.DefaultHandler() (Nop), which is stateless and safe to share.
+var (
+	sharedParseFactory     *ComponentFactory
+	sharedParseFactoryOnce sync.Once
+)
+
+// getSharedParseFactory returns a lazily-initialized shared ComponentFactory.
+func getSharedParseFactory() *ComponentFactory {
+	sharedParseFactoryOnce.Do(func() {
+		cfg := DefaultConfig()
+		sharedParseFactory = cfg.buildComponentFactory()
+	})
+	return sharedParseFactory
 }
