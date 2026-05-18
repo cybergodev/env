@@ -513,6 +513,88 @@ func TestIsMarshalError(t *testing.T) {
 // MarshalStruct Tests
 // ============================================================================
 
+// testMarshaler implements the Marshaler interface for testing.
+type testMarshaler struct {
+	data string
+}
+
+func (m *testMarshaler) MarshalEnv() ([]byte, error) {
+	return []byte(m.data), nil
+}
+
+func TestToMap(t *testing.T) {
+	tests := []struct {
+		name    string
+		input   interface{}
+		want    map[string]string
+		wantErr bool
+	}{
+		{
+			name:  "map[string]string passthrough",
+			input: map[string]string{"KEY": "value"},
+			want:  map[string]string{"KEY": "value"},
+		},
+		{
+			name:    "nil input",
+			input:   nil,
+			wantErr: true,
+		},
+		{
+			name:    "nil map pointer",
+			input:   (*map[string]string)(nil),
+			wantErr: true,
+		},
+		{
+			name: "valid map pointer",
+			input: func() interface{} {
+				m := map[string]string{"KEY": "value"}
+				return &m
+			}(),
+			want: map[string]string{"KEY": "value"},
+		},
+		{
+			name: "struct input",
+			input: struct {
+				Name string `env:"NAME"`
+			}{Name: "test"},
+			want: map[string]string{"NAME": "test"},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got, err := toMap(tt.input)
+			if (err != nil) != tt.wantErr {
+				t.Errorf("toMap() error = %v, wantErr %v", err, tt.wantErr)
+				return
+			}
+			if !tt.wantErr {
+				for k, v := range tt.want {
+					if got[k] != v {
+						t.Errorf("toMap()[%q] = %q, want %q", k, got[k], v)
+					}
+				}
+			}
+		})
+	}
+}
+
+func TestMarshalStruct_Marshaler(t *testing.T) {
+	t.Run("implements Marshaler interface", func(t *testing.T) {
+		m := &testMarshaler{data: "KEY=value\nPORT=8080"}
+		result, err := MarshalStruct(m)
+		if err != nil {
+			t.Fatalf("MarshalStruct() error = %v", err)
+		}
+		if result["KEY"] != "value" {
+			t.Errorf("result[\"KEY\"] = %q, want %q", result["KEY"], "value")
+		}
+		if result["PORT"] != "8080" {
+			t.Errorf("result[\"PORT\"] = %q, want %q", result["PORT"], "8080")
+		}
+	})
+}
+
 func TestMarshalStruct(t *testing.T) {
 	t.Run("basic struct", func(t *testing.T) {
 		type TestMarshalConfig struct {

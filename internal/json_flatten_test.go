@@ -2,6 +2,7 @@ package internal
 
 import (
 	"errors"
+	"fmt"
 	"testing"
 )
 
@@ -626,5 +627,66 @@ func TestFlattenJSON_EmptyArray(t *testing.T) {
 	// Empty array should result in no entries for that key
 	if len(result) != 0 {
 		t.Errorf("expected 0 items for empty array, got %d", len(result))
+	}
+}
+
+func TestFlattenJSON_LongKeys(t *testing.T) {
+	cfg := JSONFlattenConfig{
+		KeyDelimiter:     "_",
+		ArrayIndexFormat: "underscore",
+		NullAsEmpty:      true,
+		NumberAsString:   true,
+		BoolAsString:     true,
+		MaxDepth:         10,
+	}
+
+	// Test with long key prefix that exceeds 64 chars to hit builder path
+	longKey := "A"
+	for i := 0; i < 70; i++ {
+		longKey += "B"
+	}
+
+	input := fmt.Sprintf(`{"%s": {"nested": "value"}}`, longKey)
+	result, err := FlattenJSON([]byte(input), cfg)
+	if err != nil {
+		t.Fatalf("FlattenJSON() error = %v", err)
+	}
+
+	if len(result) != 1 {
+		t.Errorf("expected 1 item, got %d", len(result))
+	}
+
+	// Verify the key contains both parts
+	for k := range result {
+		if len(k) < 70 {
+			t.Errorf("expected key length >= 70, got %d: %q", len(k), k)
+		}
+	}
+}
+
+func TestFlattenJSON_BracketArrayFormat(t *testing.T) {
+	cfg := JSONFlattenConfig{
+		KeyDelimiter:     "_",
+		ArrayIndexFormat: "bracket",
+		NullAsEmpty:      true,
+		NumberAsString:   true,
+		BoolAsString:     true,
+		MaxDepth:         10,
+	}
+
+	input := `{"items": ["a", "b", "c"]}`
+	result, err := FlattenJSON([]byte(input), cfg)
+	if err != nil {
+		t.Fatalf("FlattenJSON() error = %v", err)
+	}
+
+	if result["ITEMS[0]"] != "a" {
+		t.Errorf("ITEMS[0] = %q, want %q", result["ITEMS[0]"], "a")
+	}
+	if result["ITEMS[1]"] != "b" {
+		t.Errorf("ITEMS[1] = %q, want %q", result["ITEMS[1]"], "b")
+	}
+	if result["ITEMS[2]"] != "c" {
+		t.Errorf("ITEMS[2] = %q, want %q", result["ITEMS[2]"], "c")
 	}
 }

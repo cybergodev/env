@@ -553,3 +553,16 @@ func TestWriteFile_NoDoubleClose(t *testing.T) {
 		}
 	}
 }
+
+func TestWriteFile_ErrorPaths(t *testing.T) {
+	t.Run("invalid path", func(t *testing.T) {
+		var buf bytes.Buffer
+		buf.WriteString("test")
+
+		// Use an invalid path that should fail
+		err := WriteFile(string([]byte{0}), &buf)
+		if err == nil {
+			t.Error("WriteFile() should fail for invalid path")
+		}
+	})
+}

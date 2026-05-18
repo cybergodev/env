@@ -49,7 +49,16 @@ type AuditHandler = internal.Handler
 // JSONAuditHandler writes audit events as JSON to an io.Writer.
 type JSONAuditHandler = internal.JSONHandler
 
-// NewJSONAuditHandler creates a new JSONAuditHandler.
+// NewJSONAuditHandler creates a new JSONAuditHandler that writes audit events
+// as JSON lines to the provided writer.
+//
+// Example:
+//
+//	handler := env.NewJSONAuditHandler(os.Stdout)
+//	cfg := env.DefaultConfig()
+//	cfg.ComponentConfig.AuditHandler = handler
+//	cfg.ComponentConfig.AuditEnabled = true
+//	loader, _ := env.New(cfg)
 func NewJSONAuditHandler(w io.Writer) *JSONAuditHandler {
 	return internal.NewJSONHandler(w)
 }
@@ -57,7 +66,14 @@ func NewJSONAuditHandler(w io.Writer) *JSONAuditHandler {
 // LogAuditHandler writes audit events using the standard log package.
 type LogAuditHandler = internal.LogHandler
 
-// NewLogAuditHandler creates a new LogAuditHandler.
+// NewLogAuditHandler creates a new LogAuditHandler that writes audit events
+// using the standard log package.
+//
+// Example:
+//
+//	logger := log.New(os.Stderr, "[AUDIT] ", log.LstdFlags)
+//	handler := env.NewLogAuditHandler(logger)
+//	cfg.ComponentConfig.AuditHandler = handler
 func NewLogAuditHandler(logger *log.Logger) *LogAuditHandler {
 	return internal.NewLogHandler(logger)
 }
@@ -65,7 +81,18 @@ func NewLogAuditHandler(logger *log.Logger) *LogAuditHandler {
 // ChannelAuditHandler sends audit events to a channel.
 type ChannelAuditHandler = internal.ChannelHandler
 
-// NewChannelAuditHandler creates a new ChannelAuditHandler.
+// NewChannelAuditHandler creates a new ChannelAuditHandler that sends audit events
+// to the provided channel. The caller is responsible for managing the channel lifecycle.
+//
+// Example:
+//
+//	ch := make(chan env.AuditEvent, 100)
+//	handler := env.NewChannelAuditHandler(ch)
+//	go func() {
+//	    for event := range ch {
+//	        fmt.Println(event)
+//	    }
+//	}()
 func NewChannelAuditHandler(ch chan<- AuditEvent) *ChannelAuditHandler {
 	return internal.NewChannelHandler(ch)
 }
@@ -79,6 +106,16 @@ type CloseableChannelHandler = internal.CloseableChannelHandler
 // NewCloseableChannelHandler creates a new CloseableChannelHandler with a buffered
 // channel of the specified size. The handler owns the channel and will close it
 // when Close() is called.
+//
+// Example:
+//
+//	handler := env.NewCloseableChannelHandler(64)
+//	defer handler.Close()
+//	go func() {
+//	    for event := range handler.Channel() {
+//	        fmt.Println(event)
+//	    }
+//	}()
 func NewCloseableChannelHandler(bufferSize int) *CloseableChannelHandler {
 	return internal.NewCloseableChannelHandler(bufferSize)
 }

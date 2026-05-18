@@ -100,9 +100,9 @@ func demonstrateSliceAccess() {
 	hosts := env.GetSlice[string]("cache.hosts")
 	fmt.Printf("cache.hosts: %v\n", hosts)
 
-	// Integer slice
-	ports := env.GetSlice("ports", []int{8080, 8081})
-	fmt.Printf("ports (default): %v\n", ports)
+	// Integer slice (default fallback when key not found)
+	ports := env.GetSlice[int]("nonexistent_ports", []int{8080, 8081})
+	fmt.Printf("nonexistent_ports (default): %v\n", ports)
 }
 
 func demonstrateLookup() {
@@ -112,8 +112,8 @@ func demonstrateLookup() {
 		fmt.Printf("app.port exists: %v\n", value)
 	}
 
-	if value, exists := env.Lookup("db.password"); exists {
-		fmt.Printf("db.password exists: %v\n", value)
+	if _, exists := env.Lookup("db.password"); exists {
+		fmt.Println("db.password: [HIDDEN]")
 	}
 
 	// Missing key

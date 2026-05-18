@@ -25,10 +25,13 @@ func demonstrateBasics() {
 	// Create a SecureValue from a sensitive string
 	password := env.NewSecureValue("super_secret_password_123")
 
-	// Access the value (creates a copy)
-	fmt.Printf("Value: %s\n", password.String())
+	// Reveal the plaintext value (use only when the actual value is needed)
+	fmt.Printf("Value: %s\n", password.Reveal())
 
-	// Get masked representation (safe for logging)
+	// String() returns masked representation (safe for %s formatting)
+	fmt.Printf("String(): %s\n", password.String())
+
+	// Masked() returns a safe representation for logging
 	fmt.Printf("Masked: %s\n", password.Masked())
 
 	// Get length without exposing the value
@@ -67,18 +70,22 @@ func demonstrateLifecycle() {
 	fmt.Println("\n=== Lifecycle: Close vs Release ===")
 	// Close() zeros memory but doesn't return to pool
 	secret := env.NewSecureValue("temporary_secret")
-	fmt.Printf("Before close: %s\n", secret.Masked())
+	fmt.Printf("Before close: %s\n", secret.Reveal())
 	secret.Close()
-	fmt.Printf("After close: %s\n", secret.Masked())
+	fmt.Printf("After close: %s\n", secret.Reveal())
 
 	// Release() zeros memory AND returns to pool (more efficient for frequent use)
 	secret2 := env.NewSecureValue("another_secret")
-	bytes := secret2.Bytes()
-	fmt.Printf("\nBytes length: %d\n", len(bytes))
-
-	// Clear external copies when done
-	env.ClearBytes(bytes)
+	fmt.Printf("Before release: %s\n", secret2.Reveal())
 
 	// Release returns the object to the pool for reuse
 	secret2.Release()
+	fmt.Printf("After release: %s\n", secret2.Reveal())
+
+	// Bytes() returns a copy that must be cleared by the caller
+	secret3 := env.NewSecureValue("byte_example")
+	bytes := secret3.Bytes()
+	fmt.Printf("\nBytes length: %d\n", len(bytes))
+	env.ClearBytes(bytes) // Clear external copies when done
+	secret3.Release()
 }

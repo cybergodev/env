@@ -1,6 +1,4 @@
-// Package env provides environment variable loading and management.
-//
-// # Adapter Pattern Implementation
+// Package env — Adapter Pattern Implementation.
 //
 // This file implements adapters for internal types that need to be exposed
 // via public interfaces with extended functionality.

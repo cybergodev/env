@@ -139,6 +139,75 @@ func TestIsASCII(t *testing.T) {
 	}
 }
 
+func TestTrimSpace(t *testing.T) {
+	tests := []struct {
+		name     string
+		input    string
+		expected string
+	}{
+		{"empty", "", ""},
+		{"no whitespace", "hello", "hello"},
+		{"leading space", "  hello", "hello"},
+		{"trailing space", "hello  ", "hello"},
+		{"both sides", "  hello  ", "hello"},
+		{"tabs", "\thello\t", "hello"},
+		{"newlines", "\nhello\n", "hello"},
+		{"mixed whitespace", " \t\nhello\n\t ", "hello"},
+		{"only whitespace", "   \t\n  ", ""},
+		{"inner whitespace preserved", "hello world", "hello world"},
+		{"single space", " ", ""},
+		{"single char", "a", "a"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			result := TrimSpace(tt.input)
+			if result != tt.expected {
+				t.Errorf("TrimSpace(%q) = %q, want %q", tt.input, result, tt.expected)
+			}
+		})
+	}
+}
+
+func TestInternKey_EdgeCases(t *testing.T) {
+	ClearInternCache()
+
+	tests := []struct {
+		name  string
+		key   string
+		want  string
+	}{
+		{"empty string not interned", "", ""},
+		{"simple key", "SIMPLE", "SIMPLE"},
+		{"key with underscores", "MY_KEY_NAME", "MY_KEY_NAME"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := InternKey(tt.key)
+			if got != tt.want {
+				t.Errorf("InternKey(%q) = %q, want %q", tt.key, got, tt.want)
+			}
+		})
+	}
+}
+
+func TestInternKey_Eviction(t *testing.T) {
+	ClearInternCache()
+
+	// Fill the cache to trigger eviction
+	for i := 0; i < maxInternSize*2; i++ {
+		key := "EVICT_KEY_" + strings.Repeat("x", i%20+1)
+		InternKey(key)
+	}
+
+	// Verify cache still works after eviction
+	key := "POST_EVICT_KEY"
+	if got := InternKey(key); got != key {
+		t.Errorf("InternKey after eviction = %q, want %q", got, key)
+	}
+}
+
 func TestInternKeyConsistency(t *testing.T) {
 	// Clear cache before test
 	ClearInternCache()

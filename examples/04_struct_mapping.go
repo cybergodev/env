@@ -16,7 +16,7 @@ import (
 type AppConfig struct {
 	Name    string `env:"APP_NAME"`
 	Port    int    `env:"APP_PORT"`
-	Debug   bool   `env:"DEBUG"`
+	Debug   bool   `env:"APP_DEBUG"`
 	Version string `env:"APP_VERSION" envDefault:"1.0.0"`
 }
 

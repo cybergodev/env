@@ -22,6 +22,12 @@ const (
 // DetectFormat detects the file format based on the file extension.
 // Returns FormatEnv for ".env" files, FormatJSON for ".json" files,
 // FormatYAML for ".yaml" and ".yml" files, and FormatAuto for unknown extensions.
+//
+// Example:
+//
+//	fmt.Println(env.DetectFormat("config.json"))  // json
+//	fmt.Println(env.DetectFormat("settings.yaml")) // yaml
+//	fmt.Println(env.DetectFormat(".env"))           // dotenv
 func DetectFormat(filename string) FileFormat {
 	ext := strings.ToLower(filepath.Ext(filename))
 	switch ext {

@@ -4,7 +4,6 @@ import (
 	"bytes"
 	"fmt"
 	"os"
-	"path/filepath"
 	"strings"
 	"testing"
 
@@ -41,17 +40,6 @@ func generateEnvContentWithExpansion(numVars int) string {
 		}
 	}
 	return sb.String()
-}
-
-// createTempEnvFile creates a temporary .env file and returns its path.
-func createTempEnvFile(b *testing.B, content string) string {
-	b.Helper()
-	tmpDir := b.TempDir()
-	path := filepath.Join(tmpDir, ".env")
-	if err := os.WriteFile(path, []byte(content), 0600); err != nil {
-		b.Fatalf("Failed to create temp file: %v", err)
-	}
-	return path
 }
 
 // ============================================================================
@@ -149,17 +137,19 @@ func BenchmarkLoader_LoadFiles_Small(b *testing.B) {
 	content := generateEnvContent(10)
 	cfg := DefaultConfig()
 
+	const benchFile = "bench_loader_small.env"
+	if err := os.WriteFile(benchFile, []byte(content), 0600); err != nil {
+		b.Fatal(err)
+	}
+	defer os.Remove(benchFile)
+
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
-		b.StopTimer()
-		path := createTempEnvFile(b, content)
 		loader, err := New(cfg)
 		if err != nil {
 			b.Fatal(err)
 		}
-		b.StartTimer()
-
-		if err := loader.LoadFiles(path); err != nil {
+		if err := loader.LoadFiles(benchFile); err != nil {
 			b.Fatal(err)
 		}
 		loader.Close()
@@ -169,18 +159,21 @@ func BenchmarkLoader_LoadFiles_Small(b *testing.B) {
 func BenchmarkLoader_LoadFiles_Medium(b *testing.B) {
 	content := generateEnvContent(100)
 	cfg := DefaultConfig()
+	cfg.MaxVariables = 200
+
+	const benchFile = "bench_loader_medium.env"
+	if err := os.WriteFile(benchFile, []byte(content), 0600); err != nil {
+		b.Fatal(err)
+	}
+	defer os.Remove(benchFile)
 
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
-		b.StopTimer()
-		path := createTempEnvFile(b, content)
 		loader, err := New(cfg)
 		if err != nil {
 			b.Fatal(err)
 		}
-		b.StartTimer()
-
-		if err := loader.LoadFiles(path); err != nil {
+		if err := loader.LoadFiles(benchFile); err != nil {
 			b.Fatal(err)
 		}
 		loader.Close()

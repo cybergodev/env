@@ -337,6 +337,21 @@ func TrimSpace(s string) string {
 	return s[start:end]
 }
 
+// TrimSpaceBytes trims leading and trailing whitespace from a byte slice,
+// converting to string. Avoids the intermediate string(buf.String()) that
+// strings.TrimSpace would require.
+func TrimSpaceBytes(b []byte) string {
+	start := 0
+	end := len(b)
+	for start < end && (b[start] == ' ' || b[start] == '\t' || b[start] == '\n' || b[start] == '\r') {
+		start++
+	}
+	for end > start && (b[end-1] == ' ' || b[end-1] == '\t' || b[end-1] == '\n' || b[end-1] == '\r') {
+		end--
+	}
+	return string(b[start:end])
+}
+
 // ToUpperASCII converts an ASCII string to uppercase.
 // This is faster than strings.ToUpper for ASCII-only strings.
 // Uses single-pass algorithm: convert while detecting lowercase.

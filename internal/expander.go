@@ -12,10 +12,11 @@ import (
 type Mode int
 
 const (
-	// ModeNone disables variable expansion.
-	ModeNone Mode = iota
 	// ModeEnv expands $VAR and ${VAR} syntax.
-	ModeEnv
+	// This is the zero value, making it the default when Mode is not explicitly set.
+	ModeEnv Mode = iota
+	// ModeNone disables variable expansion entirely.
+	ModeNone
 	// ModeAll expands $VAR, ${VAR}, and ${VAR:-default} syntax.
 	ModeAll
 )
@@ -31,7 +32,7 @@ var braceOperators = [256]bool{
 // visitedMapPool provides a pool of reusable visited maps for cycle detection.
 // This reduces allocations during recursive expansion and cycle detection.
 var visitedMapPool = sync.Pool{
-	New: func() interface{} {
+	New: func() any {
 		return make(map[string]bool, 16)
 	},
 }
@@ -111,7 +112,7 @@ func NewExpander(cfg ExpanderConfig) *Expander {
 
 	mode := cfg.Mode
 	if mode == Mode(0) {
-		mode = ModeEnv
+		mode = ModeEnv // redundant safety: zero value is already ModeEnv
 	}
 
 	// Use default check (isValidDefaultKey) if no custom pattern provided
@@ -129,6 +130,10 @@ func NewExpander(cfg ExpanderConfig) *Expander {
 
 // Expand performs variable expansion on the input string.
 func (e *Expander) Expand(s string) (string, error) {
+	// ModeNone: expansion is disabled, return input unchanged.
+	if e.mode == ModeNone {
+		return s, nil
+	}
 	// Fast path: if no dollar sign, no expansion needed
 	// Use IndexByte which is SIMD-optimized
 	dollarIdx := strings.IndexByte(s, '$')
@@ -552,8 +557,14 @@ func DetectCycle(vars map[string]string) (string, bool) {
 		putVisitedMap(inStack)
 	}()
 
-	var dfs func(key string) (string, bool)
-	dfs = func(key string) (string, bool) {
+	var dfs func(key string, dfsDepth int) (string, bool)
+	dfs = func(key string, dfsDepth int) (string, bool) {
+		// SECURITY: Limit recursion depth to prevent stack overflow on long chains.
+		// If we exceed this limit, return no cycle found — the expansion depth
+		// limit will catch actual issues during expansion.
+		if dfsDepth > 1000 {
+			return "", false
+		}
 		visited[key] = true
 		inStack[key] = true
 
@@ -623,7 +634,7 @@ func DetectCycle(vars map[string]string) (string, bool) {
 						return refKey, true
 					}
 					if !visited[refKey] {
-						if cycle, found := dfs(refKey); found {
+						if cycle, found := dfs(refKey, dfsDepth+1); found {
 							return cycle, true
 						}
 					}
@@ -637,7 +648,7 @@ func DetectCycle(vars map[string]string) (string, bool) {
 
 	for key := range vars {
 		if !visited[key] {
-			if cycle, found := dfs(key); found {
+			if cycle, found := dfs(key, 0); found {
 				return cycle, true
 			}
 		}
@@ -652,10 +663,15 @@ func DetectCycle(vars map[string]string) (string, bool) {
 // The method:
 // 1. Checks if any values need expansion (fast path for no variables)
 // 2. Detects cycles to prevent infinite loops
-// 3. Expands all values recursively
+// 3. Expands all values recursively using a cached lookup for performance
 //
 // Returns the original map if no expansion is needed, avoiding allocations.
 func (e *Expander) ExpandAllInMap(vars map[string]string) (map[string]string, error) {
+	// ModeNone: expansion is disabled, return input unchanged.
+	if e.mode == ModeNone {
+		return vars, nil
+	}
+
 	// Fast path: check if any values need expansion
 	needsExpansion := false
 	for _, value := range vars {
@@ -678,18 +694,51 @@ func (e *Expander) ExpandAllInMap(vars map[string]string) (map[string]string, er
 		}
 	}
 
+	// Build a lookup cache that first checks vars, then falls back to e.lookup.
+	// This avoids repeated os.LookupEnv syscalls for variables already present
+	// in the parsed map (the most common case for $VAR references).
+	lookupCache := make(map[string]lookupResult, len(vars))
+	cachedLookup := func(key string) (string, bool) {
+		if r, ok := lookupCache[key]; ok {
+			return r.value, r.ok
+		}
+		// Check vars first (most common source for $VAR refs)
+		if v, ok := vars[key]; ok {
+			lookupCache[key] = lookupResult{v, true}
+			return v, true
+		}
+		// Fall back to external lookup (os.LookupEnv)
+		v, ok := e.lookup(key)
+		lookupCache[key] = lookupResult{v, ok}
+		return v, ok
+	}
+
+	// Create a cached expander for batch expansion
+	cached := &Expander{
+		maxDepth:        e.maxDepth,
+		lookup:          cachedLookup,
+		mode:            e.mode,
+		keyPattern:      e.keyPattern,
+		useDefaultCheck: e.useDefaultCheck,
+	}
+
 	// Pre-allocate result map with exact size
 	result := make(map[string]string, len(vars))
 
-	// Expand all values
+	// Expand all values using the cached expander
 	for key, value := range vars {
-		expanded, err := e.Expand(value)
+		expanded, err := cached.Expand(value)
 		if err != nil {
 			return nil, err
 		}
-		// Store expanded value (may be same as original)
 		result[key] = expanded
 	}
 
 	return result, nil
+}
+
+// lookupResult caches a single lookup result to avoid repeated map lookups.
+type lookupResult struct {
+	value string
+	ok    bool
 }

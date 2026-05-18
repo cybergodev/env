@@ -33,7 +33,7 @@ func TestConvenienceGet(t *testing.T) {
 		name       string
 		key        string
 		value      string
-		getter     string // "string", "int", "bool", "duration"
+		getter     string // "string", "int", "bool", "duration", "uint64", "float64"
 		defaultVal interface{}
 		wantValue  interface{}
 	}{
@@ -57,6 +57,16 @@ func TestConvenienceGet(t *testing.T) {
 		{"get duration existing", "TIMEOUT", "30s", "duration", nil, 30 * time.Second},
 		{"get duration with default", "MISSING", "", "duration", 5 * time.Minute, 5 * time.Minute},
 		{"get duration missing no default", "NOT_EXISTS", "", "duration", nil, time.Duration(0)},
+
+		// Uint64 tests
+		{"get uint64 existing", "PORT", "8080", "uint64", nil, uint64(8080)},
+		{"get uint64 with default", "MISSING", "", "uint64", uint64(9999), uint64(9999)},
+		{"get uint64 missing no default", "NOT_EXISTS", "", "uint64", nil, uint64(0)},
+
+		// Float64 tests
+		{"get float64 existing", "RATE", "3.14", "float64", nil, 3.14},
+		{"get float64 with default", "MISSING", "", "float64", 0.5, 0.5},
+		{"get float64 missing no default", "NOT_EXISTS", "", "float64", nil, 0.0},
 	}
 
 	for _, tt := range tests {
@@ -117,6 +127,28 @@ func TestConvenienceGet(t *testing.T) {
 				}
 				if got != tt.wantValue.(time.Duration) {
 					t.Errorf("GetDuration() = %v, want %v", got, tt.wantValue)
+				}
+
+			case "uint64":
+				var got uint64
+				if tt.defaultVal != nil {
+					got = GetUint64(tt.key, tt.defaultVal.(uint64))
+				} else {
+					got = GetUint64(tt.key)
+				}
+				if got != tt.wantValue.(uint64) {
+					t.Errorf("GetUint64() = %v, want %v", got, tt.wantValue)
+				}
+
+			case "float64":
+				var got float64
+				if tt.defaultVal != nil {
+					got = GetFloat64(tt.key, tt.defaultVal.(float64))
+				} else {
+					got = GetFloat64(tt.key)
+				}
+				if got != tt.wantValue.(float64) {
+					t.Errorf("GetFloat64() = %v, want %v", got, tt.wantValue)
 				}
 			}
 		})
@@ -225,6 +257,16 @@ func TestConvenienceNoLoader(t *testing.T) {
 		t.Errorf("GetDuration with no loader = %v, want 10s", gotDuration)
 	}
 
+	gotUint64 := GetUint64("KEY", 999)
+	if gotUint64 != 999 {
+		t.Errorf("GetUint64 with no loader = %d, want 999", gotUint64)
+	}
+
+	gotFloat64 := GetFloat64("KEY", 3.14)
+	if gotFloat64 != 3.14 {
+		t.Errorf("GetFloat64 with no loader = %f, want 3.14", gotFloat64)
+	}
+
 	// Without defaults
 	if GetString("KEY") != "" {
 		t.Error("GetString with no loader and no default should return \"\"")
@@ -234,6 +276,12 @@ func TestConvenienceNoLoader(t *testing.T) {
 	}
 	if GetBool("KEY") != false {
 		t.Error("GetBool with no loader and no default should return false")
+	}
+	if GetUint64("KEY") != 0 {
+		t.Error("GetUint64 with no loader and no default should return 0")
+	}
+	if GetFloat64("KEY") != 0.0 {
+		t.Error("GetFloat64 with no loader and no default should return 0")
 	}
 	if GetDuration("KEY") != 0 {
 		t.Error("GetDuration with no loader and no default should return 0")
@@ -387,24 +435,58 @@ func TestParseInto_WithInlineDefault(t *testing.T) {
 	}
 }
 
+func TestParseInto_LowercaseTag(t *testing.T) {
+	ResetDefaultLoader()
+	defer ResetDefaultLoader()
+
+	cfg := DefaultConfig()
+	loader, err := New(cfg)
+	if err != nil {
+		t.Fatalf("New() error = %v", err)
+	}
+
+	if err := loader.Set("DEEPSEEK_KEY", "sk-test-123"); err != nil {
+		t.Fatalf("Set() error = %v", err)
+	}
+	if err := loader.Set("DATABASE_HOST", "db.example.com"); err != nil {
+		t.Fatalf("Set() error = %v", err)
+	}
+
+	if err := setDefaultLoader(loader); err != nil {
+		t.Fatalf("setDefaultLoader() error = %v", err)
+	}
+
+	type Config struct {
+		APIKey string `env:"deepseek_key"`
+		DBHost string `env:"database.host"`
+	}
+
+	var c Config
+	if err := ParseInto(&c); err != nil {
+		t.Fatalf("ParseInto() error = %v", err)
+	}
+
+	if c.APIKey != "sk-test-123" {
+		t.Errorf("APIKey = %q, want %q", c.APIKey, "sk-test-123")
+	}
+	if c.DBHost != "db.example.com" {
+		t.Errorf("DBHost = %q, want %q", c.DBHost, "db.example.com")
+	}
+}
+
 func TestParseInto_NoLoader(t *testing.T) {
 	ResetDefaultLoader()
 	defer ResetDefaultLoader()
 
-	// Without explicit loader, getDefaultLoader creates one automatically
-	// So ParseInto should succeed but struct fields remain empty
+	// Without Load(), ParseInto should return ErrNotInitialized
 	type Config struct {
 		Host string `env:"DB_HOST"`
 	}
 
 	var c Config
 	err := ParseInto(&c)
-	if err != nil {
-		t.Errorf("ParseInto with no loader should not error, got: %v", err)
-	}
-	// Host should be empty since DB_HOST is not set
-	if c.Host != "" {
-		t.Errorf("Host = %q, want empty string", c.Host)
+	if !errors.Is(err, ErrNotInitialized) {
+		t.Errorf("ParseInto with no loader error = %v, want ErrNotInitialized", err)
 	}
 }
 
@@ -758,11 +840,10 @@ func TestKeys_NoLoader(t *testing.T) {
 	ResetDefaultLoader()
 	defer ResetDefaultLoader()
 
-	// getDefaultLoader creates a default loader automatically
-	// So Keys() should return an empty slice, not nil
+	// Without Load(), Keys() returns nil
 	keys := Keys()
-	if len(keys) != 0 {
-		t.Errorf("Keys() with no loader = %v, want empty slice", keys)
+	if keys != nil {
+		t.Errorf("Keys() with no loader = %v, want nil", keys)
 	}
 }
 
@@ -804,11 +885,10 @@ func TestAll_NoLoader(t *testing.T) {
 	ResetDefaultLoader()
 	defer ResetDefaultLoader()
 
-	// getDefaultLoader creates a default loader automatically
-	// So All() should return an empty map, not nil
+	// Without Load(), All() returns nil
 	all := All()
-	if len(all) != 0 {
-		t.Errorf("All() with no loader = %v, want empty map", all)
+	if all != nil {
+		t.Errorf("All() with no loader = %v, want nil", all)
 	}
 }
 
@@ -887,11 +967,10 @@ func TestDelete_NoLoader(t *testing.T) {
 	ResetDefaultLoader()
 	defer ResetDefaultLoader()
 
-	// getDefaultLoader creates a default loader automatically
-	// So Delete() should succeed (deleting non-existent key is ok)
+	// Without Load(), Delete() should return ErrNotInitialized
 	err := Delete("KEY")
-	if err != nil {
-		t.Errorf("Delete() with auto-created loader error = %v, want nil", err)
+	if !errors.Is(err, ErrNotInitialized) {
+		t.Errorf("Delete() with no loader error = %v, want ErrNotInitialized", err)
 	}
 }
 
@@ -1013,11 +1092,10 @@ func TestValidate_NoLoader(t *testing.T) {
 	ResetDefaultLoader()
 	defer ResetDefaultLoader()
 
-	// getDefaultLoader creates a default loader automatically
-	// So Validate() should succeed (no required keys means validation passes)
+	// Without Load(), Validate() should return ErrNotInitialized
 	err := Validate()
-	if err != nil {
-		t.Errorf("Validate() with auto-created loader error = %v, want nil", err)
+	if !errors.Is(err, ErrNotInitialized) {
+		t.Errorf("Validate() with no loader error = %v, want ErrNotInitialized", err)
 	}
 }
 func TestGetSliceFrom(t *testing.T) {
@@ -1375,6 +1453,47 @@ func TestLookup_CommaSeparatedFallback(t *testing.T) {
 	}
 }
 
+// TestGetSlice_WithDefaultLoader tests the GetSlice convenience function through the default loader.
+func TestGetSlice_WithDefaultLoader(t *testing.T) {
+	ResetDefaultLoader()
+	defer ResetDefaultLoader()
+
+	cfg := DefaultConfig()
+	loader, err := New(cfg)
+	if err != nil {
+		t.Fatalf("New() error = %v", err)
+	}
+
+	if err := loader.Set("PORTS_0", "8080"); err != nil {
+		t.Fatalf("Set() error = %v", err)
+	}
+	if err := loader.Set("PORTS_1", "8081"); err != nil {
+		t.Fatalf("Set() error = %v", err)
+	}
+
+	if err := setDefaultLoader(loader); err != nil {
+		t.Fatalf("setDefaultLoader() error = %v", err)
+	}
+
+	result := GetSlice[int]("PORTS")
+	if len(result) != 2 || result[0] != 8080 || result[1] != 8081 {
+		t.Errorf("GetSlice[int]() = %v, want [8080 8081]", result)
+	}
+
+	// Test with missing key returns default
+	resultDefault := GetSlice[int]("MISSING", []int{42})
+	if len(resultDefault) != 1 || resultDefault[0] != 42 {
+		t.Errorf("GetSlice[int]() with default = %v, want [42]", resultDefault)
+	}
+
+	// Test with no loader returns default
+	ResetDefaultLoader()
+	noLoaderResult := GetSlice[string]("KEY", []string{"fallback"})
+	if len(noLoaderResult) != 1 || noLoaderResult[0] != "fallback" {
+		t.Errorf("GetSlice[string]() no loader = %v, want [fallback]", noLoaderResult)
+	}
+}
+
 func TestGetString_CommaSeparatedIndex(t *testing.T) {
 	cfg := DefaultConfig()
 	loader, err := New(cfg)
@@ -1456,7 +1575,7 @@ func TestNewIsolation(t *testing.T) {
 		}
 
 		// Default loader should not have this key
-		// (getDefaultLoader creates a new loader, so it won't have ISOLATED_KEY)
+		// (no loader has been set via Load(), so GetString returns "")
 		defaultVal := GetString("ISOLATED_KEY")
 		if defaultVal != "" {
 			t.Errorf("GetString(\"ISOLATED_KEY\") = %q, want empty (isolated loader should not affect default)", defaultVal)

@@ -14,6 +14,10 @@ import (
 // Type Constraints
 // ============================================================================
 
+// defaultUnmarshalDepth is the default nesting depth used by UnmarshalMap
+// when no Config is available. Matches the DefaultConfig depth of 10.
+const defaultUnmarshalDepth = 10
+
 // sliceElement is a type constraint for supported slice element types.
 // This constraint is used by GetSlice and GetSliceFrom functions to ensure
 // type-safe parsing of slice values from environment variables.
@@ -148,6 +152,32 @@ func parseInt(s string, bits int) (int64, error) {
 	return n, nil
 }
 
+// parseUint parses an unsigned integer string with bounds checking.
+func parseUint(s string, bits int) (uint64, error) {
+	n, err := strconv.ParseUint(internal.TrimSpace(s), 10, bits)
+	if err != nil {
+		return 0, &ValidationError{
+			Field:   "uint",
+			Value:   MaskSensitiveInString(s),
+			Message: "invalid unsigned integer value",
+		}
+	}
+	return n, nil
+}
+
+// parseFloat64 parses a floating-point string with bounds checking.
+func parseFloat64(s string) (float64, error) {
+	n, err := strconv.ParseFloat(internal.TrimSpace(s), 64)
+	if err != nil {
+		return 0, &ValidationError{
+			Field:   "float",
+			Value:   MaskSensitiveInString(s),
+			Message: "invalid float value",
+		}
+	}
+	return n, nil
+}
+
 // ============================================================================
 // Marshal/Unmarshal Utilities
 // ============================================================================
@@ -269,13 +299,13 @@ func detectDataFormat(data string) FileFormat {
 			return FormatYAML
 		}
 
-		// YAML pattern: key: value (with space after colon)
-		// .env pattern: KEY=value
-		if strings.Contains(line, ": ") && !strings.Contains(line, "=") {
+		// YAML pattern: key: value (colon+space takes precedence over equals)
+		// Correctly handles YAML values containing "=" like: connection: host=db port=5432
+		if strings.Contains(line, ": ") {
 			return FormatYAML
 		}
 
-		// .env pattern: contains = but not ": "
+		// .env pattern: contains = (only when no ": " pattern found)
 		if strings.Contains(line, "=") {
 			return FormatEnv
 		}
@@ -335,7 +365,7 @@ func unmarshalJSON(data string) (map[string]string, error) {
 		NullAsEmpty:      true,
 		NumberAsString:   true,
 		BoolAsString:     true,
-		MaxDepth:         10,
+		MaxDepth:         defaultUnmarshalDepth,
 	}
 
 	result, err := internal.FlattenJSON([]byte(data), cfg)
@@ -358,7 +388,7 @@ func unmarshalYAML(data string) (map[string]string, error) {
 		NullAsEmpty:      true,
 		NumberAsString:   true,
 		BoolAsString:     true,
-		MaxDepth:         10,
+		MaxDepth:         defaultUnmarshalDepth,
 	}
 
 	value, err := internal.ParseYAML([]byte(data), cfg.MaxDepth)

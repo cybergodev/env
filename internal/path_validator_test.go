@@ -178,3 +178,60 @@ func TestCheckReservedDeviceNames(t *testing.T) {
 		})
 	}
 }
+
+// ============================================================================
+// validateResolvedPath Tests
+// ============================================================================
+
+func TestValidateResolvedPath(t *testing.T) {
+	v := &PathValidator{maskKey: DefaultMaskKey}
+
+	tests := []struct {
+		name     string
+		resolved string
+		wantErr  bool
+		errMsg   string
+	}{
+		// Safe resolved paths
+		{"relative path", "config/.env", false, ""},
+		{"current dir file", ".env", false, ""},
+		{"nested relative", "a/b/c/.env", false, ""},
+
+		// Path traversal in resolved path should be rejected
+		{"path traversal resolved", "../etc/passwd", true, "symlink escapes allowed directory"},
+		{"multi traversal resolved", "../../etc/passwd", true, "symlink escapes allowed directory"},
+
+		// Edge cases
+		{"empty resolved", "", false, ""},
+		{"dot", ".", false, ""},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			err := v.validateResolvedPath(tt.resolved)
+			if (err != nil) != tt.wantErr {
+				t.Errorf("validateResolvedPath(%q) error = %v, wantErr %v", tt.resolved, err, tt.wantErr)
+				return
+			}
+			if tt.wantErr && err != nil {
+				var secErr *SecurityError
+				if !AsError(err, &secErr) {
+					t.Errorf("validateResolvedPath(%q) error type = %T, want *SecurityError", tt.resolved, err)
+					return
+				}
+				if tt.errMsg != "" && secErr.Reason != "" {
+					found := false
+					for i := 0; i <= len(secErr.Reason)-len(tt.errMsg); i++ {
+						if secErr.Reason[i:i+len(tt.errMsg)] == tt.errMsg {
+							found = true
+							break
+						}
+					}
+					if !found {
+						t.Errorf("validateResolvedPath(%q) error reason = %q, should contain %q", tt.resolved, secErr.Reason, tt.errMsg)
+					}
+				}
+			}
+		})
+	}
+}

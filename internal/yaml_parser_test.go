@@ -603,3 +603,40 @@ func TestYAMLParser_ArrayWithComments(t *testing.T) {
 		t.Errorf("items length = %d, want 2", len(items.Array))
 	}
 }
+
+func TestReleaseValue_Nil(t *testing.T) {
+	ReleaseValue(nil) // should not panic
+}
+
+func TestReleaseValue_Scalar(t *testing.T) {
+	v := NewScalarValue("test", 1, 1)
+	ReleaseValue(v)
+	if v.Scalar != "" {
+		t.Error("scalar not cleared after release")
+	}
+}
+
+func TestReleaseValue_Nested(t *testing.T) {
+	input := `
+parent:
+  child1: value1
+  child2:
+    - a
+    - b
+`
+	value, err := ParseYAML([]byte(input), 10)
+	if err != nil {
+		t.Fatalf("ParseYAML() error = %v", err)
+	}
+	ReleaseValue(value)
+	// Verify the tree is cleared
+	if value.Map != nil {
+		t.Error("map not cleared after release")
+	}
+}
+
+func TestReleaseValue_DoubleRelease(t *testing.T) {
+	v := NewScalarValue("test", 1, 1)
+	ReleaseValue(v)
+	ReleaseValue(v) // should not panic
+}

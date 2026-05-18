@@ -1,7 +1,7 @@
 # Env - Go 高性能环境变量库
 
 [![Go Reference](https://pkg.go.dev/badge/github.com/cybergodev/env.svg)](https://pkg.go.dev/github.com/cybergodev/env)
-[![Go Version](https://img.shields.io/badge/Go-1.24+-00ADD8?style=flat&logo=go)](https://go.dev/)
+[![Go Version](https://img.shields.io/badge/Go-1.25+-00ADD8?style=flat&logo=go)](https://go.dev/)
 [![License: MIT](https://img.shields.io/badge/license-MIT-green.svg)](LICENSE)
 [![Security Policy](https://img.shields.io/badge/security-policy-blue.svg)](docs/SECURITY.md)
 [![Thread Safe](https://img.shields.io/badge/thread%20safe-%E2%9C%93-brightgreen.svg)](docs/CONCURRENCY_SAFETY.md)
@@ -36,7 +36,7 @@
 go get github.com/cybergodev/env
 ```
 
-**要求：** Go 1.24+
+**要求：** Go 1.25+
 
 ---
 
@@ -164,10 +164,14 @@ if err != nil {
 defer loader.Close()
 
 // 加载额外文件
-loader.LoadFiles("override.env")
+if err := loader.LoadFiles("override.env"); err != nil {
+    log.Fatal(err)
+}
 
 // 应用到 os.Environ
-loader.Apply()
+if err := loader.Apply(); err != nil {
+    log.Fatal(err)
+}
 
 // 访问值
 port := loader.GetInt("PORT", 8080)
@@ -281,11 +285,12 @@ sv := env.GetSecure("API_KEY")
 if sv != nil {
     defer sv.Release()
 
-    // 安全日志输出
+    // 安全日志输出（String() 返回掩码表示）
+    fmt.Println(sv)                // [SECURE:32 bytes]
     fmt.Println(sv.Masked())       // [SECURE:32 bytes]
 
-    // 访问实际值
-    value := sv.String()
+    // 访问实际值（请谨慎使用！）
+    value := sv.Reveal()
 
     // 获取字节（调用者必须清理）
     data := sv.Bytes()
@@ -308,14 +313,16 @@ defer secret.Release()
 
 | 方法 | 描述 |
 |:-----|:-----|
-| `String()` | 获取字符串值 |
+| `String()` | 获取掩码表示（可用于 `fmt.Printf`、日志输出） |
+| `Reveal()` | 获取明文值（**请谨慎使用！**） |
 | `Bytes()` | 获取字节切片副本（调用者必须清理） |
-| `Length()` | 获取值长度 |
+| `Length()` | 获取值长度（不暴露值本身） |
 | `Masked()` | 获取掩码表示用于日志 |
 | `Close()` | 清零内存，不归还到池 |
 | `Release()` | 清零内存并归还到池 |
 | `IsClosed()` | 检查是否已关闭 |
 | `IsMemoryLocked()` | 检查内存是否受保护（防止交换到磁盘） |
+| `MemoryLockError()` | 获取内存锁定失败的错误信息 |
 
 ---
 
@@ -333,10 +340,11 @@ loader, _ := env.New(cfg)
 **内置处理器：**
 
 ```go
-env.NewJSONAuditHandler(w)      // JSON 格式 → io.Writer
-env.NewLogAuditHandler(logger)  // 标准 log.Logger
-env.NewChannelAuditHandler(ch)  // 通道（外部处理）
-env.NewNopAuditHandler()        // 空操作（丢弃）
+env.NewJSONAuditHandler(w)              // JSON 格式 → io.Writer
+env.NewLogAuditHandler(logger)          // 标准 log.Logger
+env.NewChannelAuditHandler(ch)          // 通道（外部处理）
+env.NewCloseableChannelHandler(size)    // 自有缓冲通道，带生命周期管理
+env.NewNopAuditHandler()                // 空操作（丢弃）
 ```
 
 ---
@@ -429,40 +437,56 @@ env.ProductionConfig()  // 严格安全 + 审计
 ```go
 cfg := env.DefaultConfig()
 
-// === 文件处理 ===
+// === 文件处理（FileConfig）===
 cfg.Filenames         = []string{".env"}
 cfg.FailOnMissingFile = false
 cfg.OverwriteExisting = true
 cfg.AutoApply         = true
 
-// === 验证 ===
+// === 验证（ValidationConfig）===
 cfg.RequiredKeys   = []string{"DB_URL"}
 cfg.AllowedKeys    = []string{"PORT", "DEBUG"}  // 空 = 允许所有
 cfg.ForbiddenKeys  = []string{"PATH"}           // 阻止危险键
-
-// === 安全限制 ===
-cfg.MaxFileSize    = 2 << 20   // 2 MB
-cfg.MaxVariables   = 500
 cfg.ValidateValues = true
+cfg.ValidateUTF8   = true
 
-// === 解析选项 ===
+// === 安全限制（LimitsConfig）===
+cfg.MaxFileSize       = 2 << 20   // 2 MB
+cfg.MaxVariables      = 500
 cfg.MaxLineLength     = 1024
 cfg.MaxKeyLength      = 64
 cfg.MaxValueLength    = 4096
 cfg.MaxExpansionDepth = 5
 
-// === JSON/YAML 选项 ===
-cfg.JSONNullAsEmpty = true
-cfg.YAMLNullAsEmpty = true
+// === 解析（ParsingConfig）===
+cfg.AllowExportPrefix = true    // 允许 "export KEY=value" 语法
+cfg.AllowYamlSyntax   = false   // .env 中的 YAML 风格值
+cfg.ExpandVariables   = true    // 展开 ${VAR} 引用
 
-// === 高级选项 ===
+// === JSON 选项（JSONConfig）===
+cfg.JSONNullAsEmpty    = true
+cfg.JSONNumberAsString = true
+cfg.JSONBoolAsString   = true
+cfg.JSONMaxDepth       = 10
+
+// === YAML 选项（YAMLConfig）===
+cfg.YAMLNullAsEmpty    = true
+cfg.YAMLNumberAsString = true
+cfg.YAMLBoolAsString   = true
+cfg.YAMLMaxDepth       = 10
+
+// === 高级选项（ComponentConfig）===
 cfg.Prefix     = "APP_"      // 仅加载带前缀的键
 cfg.FileSystem = nil         // nil = 操作系统文件系统
 
-// === 审计日志 ===
+// === 审计日志（ComponentConfig）===
 cfg.AuditEnabled = true
 cfg.AuditHandler = env.NewJSONAuditHandler(os.Stdout)
 ```
+
+> **注意：** Config 使用嵌套结构体（`FileConfig`、`ValidationConfig`、`LimitsConfig`、
+> `JSONConfig`、`YAMLConfig`、`ParsingConfig`、`ComponentConfig`）并通过字段提升访问。
+> 你可以直接访问字段（`cfg.Filenames`）或显式访问（`cfg.FileConfig.Filenames`）。
 
 ### 默认限制
 
@@ -505,6 +529,7 @@ cfg.AuditHandler = env.NewJSONAuditHandler(os.Stdout)
 | `UnmarshalStruct(string, &struct, format?)` | 解析字符串到结构体 |
 | `UnmarshalInto(map, &struct)` | 从 map 填充结构体 |
 | `MarshalStruct(struct)` | 将结构体转换为 map |
+| `IsMarshalError(err)` | 检查是否为序列化错误 |
 | `New(cfg)` | 使用配置创建新加载器 |
 | `NewSecureValue(string)` | 从字符串创建 SecureValue |
 | `NewSecureValueStrict(string)` | 创建 SecureValue，锁定失败时返回错误 |
@@ -517,20 +542,41 @@ cfg.AuditHandler = env.NewJSONAuditHandler(os.Stdout)
 | `IsMemoryLockSupported()` | 检查平台是否支持内存锁定 |
 | `RegisterParser(format, factory)` | 注册自定义解析器 |
 | `ForceRegisterParser(format, factory)` | 覆盖内置解析器 |
-| `MaskSensitiveInString(string)` | 掩码字符串中的敏感内容 |
+| `DetectFormat(filename)` | 根据扩展名检测文件格式 |
+| `IsSensitiveKey(key)` | 检查键名是否暗示敏感数据 |
+| `MaskValue(key, value)` | 根据键敏感性掩码值 |
+| `MaskKey(key)` | 掩码键名用于日志 |
+| `SanitizeForLog(s)` | 移除字符串中的敏感信息 |
+| `MaskSensitiveInString(s)` | 掩码字符串中的敏感内容 |
 
 ### Loader 方法
 
 | 方法 | 说明 |
 |:-----|:-----|
-| `LoadFiles(files...)` | 加载文件到 loader |
-| `Apply()` | 应用到 `os.Environ` |
-| `Validate()` | 验证必需键 |
+| **访问** | |
+| `GetString(key, def...)` | 获取字符串值 |
+| `GetInt(key, def...)` | 获取 `int64` 值 |
+| `GetBool(key, def...)` | 获取布尔值 |
+| `GetDuration(key, def...)` | 获取时间间隔值 |
+| `Lookup(key)` | 获取值 + 存在性检查 |
+| `GetSecure(key)` | 获取敏感数据的 `SecureValue` |
+| `Keys()` | 获取所有键 |
+| `All()` | 获取所有变量为 map |
+| `Len()` | 获取变量数量 |
+| **修改** | |
+| `Set(key, value)` | 设置值（返回 error） |
+| `Delete(key)` | 删除键（返回 error） |
+| **文件与生命周期** | |
+| `LoadFiles(files...)` | 加载文件到 loader（返回 error） |
+| `Apply()` | 应用到 `os.Environ`（返回 error） |
+| `ParseInto(&struct)` | 从环境变量填充结构体 |
+| `Validate()` | 验证必需键（返回 error） |
 | `Close()` | 关闭并清理资源 |
+| **状态** | |
 | `IsApplied()` | 检查是否已应用到 os.Environ |
 | `IsClosed()` | 检查是否已关闭 |
 | `LoadTime()` | 获取最后加载时间 |
-| `Config()` | 获取 loader 配置 |
+| `Config()` | 获取 loader 配置（只读） |
 
 ---
 

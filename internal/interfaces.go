@@ -21,19 +21,11 @@ type AuditLogger interface {
 	LogError(action Action, key, errMsg string) error
 }
 
-// Dependencies combines all parser dependencies.
-type Dependencies interface {
-	KeyValidator
-	ValueValidator
-	VariableExpander
-	AuditLogger
-}
-
 // Type aliases for backward compatibility with existing internal code.
+// New code should use the canonical names (KeyValidator, ValueValidator, etc.) directly.
 type (
-	LineKeyValidator       = KeyValidator
-	LineValueValidator     = ValueValidator
-	LineExpander           = VariableExpander
-	LineAuditLogger        = AuditLogger
-	LineParserDependencies = Dependencies
+	LineKeyValidator   = KeyValidator
+	LineValueValidator = ValueValidator
+	LineExpander       = VariableExpander
+	LineAuditLogger    = AuditLogger
 )

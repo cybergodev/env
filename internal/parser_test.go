@@ -504,6 +504,192 @@ func TestKeysToUpperPooled_LargeMap(t *testing.T) {
 	PutKeysToUpperMap(result)
 }
 
+// mockValueValidator is a separate value validator for testing SetValueValidator.
+type mockValueValidator struct {
+	err error
+}
+
+func (m *mockValueValidator) ValidateValue(value string) error {
+	return m.err
+}
+
+func TestParseValueBytes(t *testing.T) {
+	v := NewValidator(ValidatorConfig{MaxKeyLength: 64})
+	a := NewAuditor(nil, nil, nil, false)
+	e := NewExpander(ExpanderConfig{MaxDepth: 5, Mode: ModeNone})
+	lp := NewLineParser(LineParserConfig{}, v, a, e)
+
+	tests := []struct {
+		name    string
+		input   string
+		want    string
+		wantErr bool
+	}{
+		{"empty", "", "", false},
+		{"whitespace only", "   ", "", false},
+		{"simple value", "hello", "hello", false},
+		{"double quoted", `"hello world"`, "hello world", false},
+		{"single quoted", "'hello world'", "hello world", false},
+		{"with trailing comment", "value # comment", "value", false},
+		{"with leading whitespace", "  value  ", "value", false},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got, err := lp.ParseValueBytes([]byte(tt.input))
+			if (err != nil) != tt.wantErr {
+				t.Errorf("ParseValueBytes() error = %v, wantErr %v", err, tt.wantErr)
+			}
+			if got != tt.want {
+				t.Errorf("ParseValueBytes() = %q, want %q", got, tt.want)
+			}
+		})
+	}
+}
+
+func TestParseSingleQuotedBytes(t *testing.T) {
+	tests := []struct {
+		name    string
+		input   string
+		want    string
+		wantErr bool
+	}{
+		{"valid", "'hello'", "hello", false},
+		{"empty quotes", "''", "", false},
+		{"too short", "'", "", true},
+		{"missing closing quote", "'hello", "", true},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got, err := ParseSingleQuotedBytes([]byte(tt.input))
+			if (err != nil) != tt.wantErr {
+				t.Errorf("ParseSingleQuotedBytes() error = %v, wantErr %v", err, tt.wantErr)
+			}
+			if got != tt.want {
+				t.Errorf("ParseSingleQuotedBytes() = %q, want %q", got, tt.want)
+			}
+		})
+	}
+}
+
+func TestTryParseYamlValueBytes(t *testing.T) {
+	tests := []struct {
+		input     string
+		wantVal   string
+		wantMatch bool
+	}{
+		{"true", "true", true},
+		{"True", "True", true},
+		{"TRUE", "TRUE", true},
+		{"false", "false", true},
+		{"False", "False", true},
+		{"null", "", true},
+		{"Null", "", true},
+		{"NULL", "", true},
+		{"~", "", true},
+		{"123", "123", true},
+		{"3.14", "3.14", true},
+		{"-42", "-42", true},
+		{"1e10", "1e10", true},
+		{"hello", "", false},
+		{"", "", false},
+		{"abc", "", false},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.input, func(t *testing.T) {
+			gotVal, gotMatch := TryParseYamlValueBytes([]byte(tt.input))
+			if gotMatch != tt.wantMatch {
+				t.Errorf("TryParseYamlValueBytes(%q) match = %v, want %v", tt.input, gotMatch, tt.wantMatch)
+			}
+			if gotVal != tt.wantVal {
+				t.Errorf("TryParseYamlValueBytes(%q) = %q, want %q", tt.input, gotVal, tt.wantVal)
+			}
+		})
+	}
+}
+
+func TestSetValueValidator(t *testing.T) {
+	v := NewValidator(ValidatorConfig{MaxKeyLength: 64})
+	a := NewAuditor(nil, nil, nil, false)
+	e := NewExpander(ExpanderConfig{MaxDepth: 5, Mode: ModeNone})
+
+	lp := NewLineParser(LineParserConfig{}, v, a, e)
+
+	// Set a separate value validator - just verify it doesn't panic
+	lp.SetValueValidator(&mockValueValidator{err: nil})
+	lp.SetValueValidator(&mockValueValidator{err: fmt.Errorf("bad value")})
+}
+
+// mockExpander is a non-*Expander implementation for testing expandAllUsingInterface.
+type mockExpander struct {
+	expandErr error
+}
+
+func (m *mockExpander) Expand(s string) (string, error) {
+	if s == "$FAIL" {
+		return "", m.expandErr
+	}
+	return "expanded_" + s, nil
+}
+
+func TestExpandAllUsingInterface(t *testing.T) {
+	v := NewValidator(ValidatorConfig{MaxKeyLength: 64})
+	a := NewAuditor(nil, nil, nil, false)
+
+	t.Run("uses interface expander", func(t *testing.T) {
+		me := &mockExpander{}
+		lp := NewLineParser(LineParserConfig{}, v, a, me)
+
+		vars := map[string]string{
+			"KEY1": "$VAR1",
+			"KEY2": "$VAR2",
+		}
+
+		result, err := lp.ExpandAll(vars)
+		if err != nil {
+			t.Fatalf("ExpandAll() error = %v", err)
+		}
+		if result["KEY1"] != "expanded_$VAR1" {
+			t.Errorf("KEY1 = %q, want %q", result["KEY1"], "expanded_$VAR1")
+		}
+	})
+
+	t.Run("no expansion needed", func(t *testing.T) {
+		me := &mockExpander{}
+		lp := NewLineParser(LineParserConfig{}, v, a, me)
+
+		vars := map[string]string{
+			"KEY1": "plain_value",
+			"KEY2": "another_value",
+		}
+
+		result, err := lp.ExpandAll(vars)
+		if err != nil {
+			t.Fatalf("ExpandAll() error = %v", err)
+		}
+		// Should return the same map since no expansion needed
+		if result["KEY1"] != "plain_value" {
+			t.Errorf("KEY1 = %q, want %q", result["KEY1"], "plain_value")
+		}
+	})
+
+	t.Run("expansion error", func(t *testing.T) {
+		me := &mockExpander{expandErr: fmt.Errorf("expansion failed")}
+		lp := NewLineParser(LineParserConfig{}, v, a, me)
+
+		vars := map[string]string{
+			"KEY1": "$FAIL",
+		}
+
+		_, err := lp.ExpandAll(vars)
+		if err == nil {
+			t.Error("ExpandAll() should return error on expansion failure")
+		}
+	})
+}
+
 func TestPutKeysToUpperMap_Nil(t *testing.T) {
 	// Should not panic with nil
 	PutKeysToUpperMap(nil)

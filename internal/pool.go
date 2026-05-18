@@ -14,7 +14,7 @@ import (
 // This is shared across multiple packages to reduce allocations for
 // string building operations.
 var builderPool = sync.Pool{
-	New: func() interface{} {
+	New: func() any {
 		return new(strings.Builder)
 	},
 }
@@ -57,6 +57,18 @@ func PutBuilder(sb *strings.Builder) {
 	}
 }
 
+// PutBuilderDiscard discards a builder without returning it to the pool.
+// Use this when the builder may have processed sensitive content (passwords,
+// API keys, tokens) to prevent residual data from persisting in pooled buffers.
+// The builder will be garbage collected and its memory reclaimed.
+func PutBuilderDiscard(sb *strings.Builder) {
+	if sb == nil {
+		return
+	}
+	sb.Reset()
+	// Intentionally do not return to pool — let GC reclaim
+}
+
 // ============================================================================
 // Byte Slice Pool for Value Parsing
 // ============================================================================
@@ -64,7 +76,7 @@ func PutBuilder(sb *strings.Builder) {
 // byteSlicePool provides a pool of reusable byte slices for value parsing.
 // This reduces allocations when converting byte slices to strings.
 var byteSlicePool = sync.Pool{
-	New: func() interface{} {
+	New: func() any {
 		buf := make([]byte, 0, 256)
 		return &buf
 	},
@@ -109,7 +121,7 @@ func PutByteSlice(buf *[]byte) {
 // keysToUpperPool provides a pool of reusable maps for KeysToUpper operations.
 // This reduces allocations when converting map keys to uppercase for comparison.
 var keysToUpperPool = sync.Pool{
-	New: func() interface{} {
+	New: func() any {
 		return make(map[string]bool, 64)
 	},
 }

@@ -41,7 +41,13 @@ func FlattenJSON(data []byte, cfg JSONFlattenConfig) (map[string]string, error) 
 		}
 	}
 
-	result := make(map[string]string)
+	// Estimate capacity from input size to reduce map growth.
+	// Average JSON key-value pair is ~30-50 bytes of raw JSON, producing one flat entry.
+	estSize := len(data) / 40
+	if estSize < 4 {
+		estSize = 4
+	}
+	result := make(map[string]string, estSize)
 	if err := flattenValue(raw, "", cfg, result, 0); err != nil {
 		return nil, err
 	}
@@ -128,16 +134,19 @@ func flattenValue(value interface{}, prefix string, cfg JSONFlattenConfig, resul
 }
 
 // buildKey constructs a key from prefix and key parts.
-// Uses pooled strings.Builder for efficiency when concatenation is needed.
+// Uses direct concatenation for short keys to avoid pool overhead.
 func buildKey(prefix, key string, cfg JSONFlattenConfig) string {
 	key = ToUpperASCII(key)
 	if prefix == "" {
 		return key
 	}
-	// Use pooled strings.Builder for efficient concatenation
+	totalLen := len(prefix) + len(cfg.KeyDelimiter) + len(key)
+	if totalLen <= 64 {
+		return prefix + cfg.KeyDelimiter + key
+	}
 	sb := GetBuilder()
 	defer PutBuilder(sb)
-	sb.Grow(len(prefix) + len(cfg.KeyDelimiter) + len(key))
+	sb.Grow(totalLen)
 	sb.WriteString(prefix)
 	sb.WriteString(cfg.KeyDelimiter)
 	sb.WriteString(key)
@@ -145,24 +154,32 @@ func buildKey(prefix, key string, cfg JSONFlattenConfig) string {
 }
 
 // buildArrayIndex constructs a key for array elements.
-// Uses pooled strings.Builder and strconv.Itoa for efficient conversion.
+// Uses direct concatenation for short keys to avoid pool overhead.
 func buildArrayIndex(prefix string, index int, cfg JSONFlattenConfig) string {
 	indexStr := strconv.Itoa(index)
-	sb := GetBuilder()
-	defer PutBuilder(sb)
 
 	switch cfg.ArrayIndexFormat {
 	case "bracket":
-		// prefix[index] format
-		sb.Grow(len(prefix) + 1 + len(indexStr) + 1)
+		totalLen := len(prefix) + 1 + len(indexStr) + 1
+		if totalLen <= 64 {
+			return prefix + "[" + indexStr + "]"
+		}
+		sb := GetBuilder()
+		defer PutBuilder(sb)
+		sb.Grow(totalLen)
 		sb.WriteString(prefix)
 		sb.WriteByte('[')
 		sb.WriteString(indexStr)
 		sb.WriteByte(']')
 		return sb.String()
-	default: // underscore
-		// prefix_index format
-		sb.Grow(len(prefix) + len(cfg.KeyDelimiter) + len(indexStr))
+	default:
+		totalLen := len(prefix) + len(cfg.KeyDelimiter) + len(indexStr)
+		if totalLen <= 64 {
+			return prefix + cfg.KeyDelimiter + indexStr
+		}
+		sb := GetBuilder()
+		defer PutBuilder(sb)
+		sb.Grow(totalLen)
 		sb.WriteString(prefix)
 		sb.WriteString(cfg.KeyDelimiter)
 		sb.WriteString(indexStr)

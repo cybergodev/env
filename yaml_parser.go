@@ -49,7 +49,7 @@ func (p *yamlParser) Parse(r io.Reader, filename string) (map[string]string, err
 	start := time.Now()
 
 	// Wrap with secure reader
-	secureRd := internal.NewSecureReader(r, p.config.MaxFileSize, 0)
+	secureRd := internal.NewSecureReader(r, p.config.MaxFileSize, p.config.MaxLineLength)
 	data, err := io.ReadAll(secureRd)
 	if err != nil {
 		if errors.Is(err, internal.ErrFileTooLarge) || errors.Is(err, internal.ErrLineTooLong) {
@@ -69,6 +69,8 @@ func (p *yamlParser) Parse(r io.Reader, filename string) (map[string]string, err
 		_ = p.auditor.LogError(internal.ActionParse, "", "invalid YAML syntax")
 		return nil, err
 	}
+	// Ensure the Value tree is always released back to the pool.
+	defer internal.ReleaseValue(value)
 
 	// Flatten YAML to environment variables
 	result, err := internal.FlattenYAML(value, p.flatten)

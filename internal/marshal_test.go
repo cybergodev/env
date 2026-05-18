@@ -617,3 +617,123 @@ func TestStructInto_EdgeCases(t *testing.T) {
 		}
 	})
 }
+
+// ============================================================================
+// Lowercase and Dot-Notation Tag Tests
+// ============================================================================
+
+func TestStructInto_LowercaseTag(t *testing.T) {
+	t.Run("lowercase tag matches uppercase key", func(t *testing.T) {
+		type Config struct {
+			APIKey string `env:"deepseek_key"`
+		}
+
+		data := map[string]string{"DEEPSEEK_KEY": "sk-123"}
+		var result Config
+		err := StructInto(data, reflect.ValueOf(&result).Elem(), "")
+		if err != nil {
+			t.Errorf("StructInto() error = %v", err)
+		}
+		if result.APIKey != "sk-123" {
+			t.Errorf("APIKey = %q, want %q", result.APIKey, "sk-123")
+		}
+	})
+
+	t.Run("lowercase tag with prefix", func(t *testing.T) {
+		type Config struct {
+			Host string `env:"host"`
+		}
+
+		data := map[string]string{"APP_HOST": "localhost"}
+		var result Config
+		err := StructInto(data, reflect.ValueOf(&result).Elem(), "app")
+		if err != nil {
+			t.Errorf("StructInto() error = %v", err)
+		}
+		if result.Host != "localhost" {
+			t.Errorf("Host = %q, want %q", result.Host, "localhost")
+		}
+	})
+
+	t.Run("mixed case tag", func(t *testing.T) {
+		type Config struct {
+			Key string `env:"DeepSeek_Key"`
+		}
+
+		data := map[string]string{"DEEPSEEK_KEY": "val"}
+		var result Config
+		err := StructInto(data, reflect.ValueOf(&result).Elem(), "")
+		if err != nil {
+			t.Errorf("StructInto() error = %v", err)
+		}
+		if result.Key != "val" {
+			t.Errorf("Key = %q, want %q", result.Key, "val")
+		}
+	})
+}
+
+func TestStructInto_DotNotationTag(t *testing.T) {
+	t.Run("dot-notation tag resolves to flattened key", func(t *testing.T) {
+		type Config struct {
+			Host string `env:"database.host"`
+		}
+
+		data := map[string]string{"DATABASE_HOST": "localhost"}
+		var result Config
+		err := StructInto(data, reflect.ValueOf(&result).Elem(), "")
+		if err != nil {
+			t.Errorf("StructInto() error = %v", err)
+		}
+		if result.Host != "localhost" {
+			t.Errorf("Host = %q, want %q", result.Host, "localhost")
+		}
+	})
+
+	t.Run("multi-level dot-notation", func(t *testing.T) {
+		type Config struct {
+			Port string `env:"server.http.port"`
+		}
+
+		data := map[string]string{"SERVER_HTTP_PORT": "8080"}
+		var result Config
+		err := StructInto(data, reflect.ValueOf(&result).Elem(), "")
+		if err != nil {
+			t.Errorf("StructInto() error = %v", err)
+		}
+		if result.Port != "8080" {
+			t.Errorf("Port = %q, want %q", result.Port, "8080")
+		}
+	})
+
+	t.Run("dot-notation with envDefault", func(t *testing.T) {
+		type Config struct {
+			Host string `env:"database.host" envDefault:"127.0.0.1"`
+		}
+
+		data := map[string]string{}
+		var result Config
+		err := StructInto(data, reflect.ValueOf(&result).Elem(), "")
+		if err != nil {
+			t.Errorf("StructInto() error = %v", err)
+		}
+		if result.Host != "127.0.0.1" {
+			t.Errorf("Host = %q, want %q", result.Host, "127.0.0.1")
+		}
+	})
+
+	t.Run("dot-notation takes precedence over default", func(t *testing.T) {
+		type Config struct {
+			Host string `env:"database.host" envDefault:"127.0.0.1"`
+		}
+
+		data := map[string]string{"DATABASE_HOST": "production.db"}
+		var result Config
+		err := StructInto(data, reflect.ValueOf(&result).Elem(), "")
+		if err != nil {
+			t.Errorf("StructInto() error = %v", err)
+		}
+		if result.Host != "production.db" {
+			t.Errorf("Host = %q, want %q", result.Host, "production.db")
+		}
+	})
+}

@@ -206,8 +206,9 @@ func (h *ChannelHandler) Close() error {
 //	// ... use handler ...
 //	handler.Close() // Closes the channel, consumer goroutine exits gracefully
 type CloseableChannelHandler struct {
-	ch   chan Event
-	done chan struct{} // closed in Close() to unblock Log() without panic
+	ch      chan Event
+	done    chan struct{} // closed in Close() to unblock Log() without panic
+	closeMu sync.Mutex
 }
 
 // NewCloseableChannelHandler creates a new CloseableChannelHandler with a
@@ -230,24 +231,24 @@ func (h *CloseableChannelHandler) Channel() <-chan Event {
 }
 
 // Log sends an audit event to the channel.
-// Returns an error if the handler has been closed.
-// Uses a two-phase check: first test done without blocking, then select between
-// done and the send. This prevents the race where both done and ch are ready
-// (after Close) and Go's random select picks the send on a closed channel.
+// Returns an error if the handler has been closed or the channel is full.
+// Holds closeMu during the send to prevent Close() from closing the channel
+// concurrently, which would cause a send-on-closed-channel panic.
 func (h *CloseableChannelHandler) Log(event Event) error {
-	// Phase 1: non-blocking check — if done is already closed, return immediately.
+	h.closeMu.Lock()
+	defer h.closeMu.Unlock()
+
 	select {
 	case <-h.done:
 		return fmt.Errorf("handler is closed")
 	default:
 	}
-	// Phase 2: race between actual send and concurrent Close.
-	// If Close fires here, done is closed before ch, so select picks done first.
+
 	select {
-	case <-h.done:
-		return fmt.Errorf("handler is closed")
 	case h.ch <- event:
 		return nil
+	default:
+		return fmt.Errorf("audit channel full, event dropped")
 	}
 }
 
@@ -255,6 +256,8 @@ func (h *CloseableChannelHandler) Log(event Event) error {
 // Closes done first to unblock any waiting Log calls, then closes the event channel.
 // Safe to call multiple times.
 func (h *CloseableChannelHandler) Close() error {
+	h.closeMu.Lock()
+	defer h.closeMu.Unlock()
 	select {
 	case <-h.done:
 		return nil // Already closed
@@ -311,7 +314,7 @@ type Auditor struct {
 // auditEventPool provides a pool of reusable Event structs.
 // This reduces allocations for high-frequency audit logging.
 var auditEventPool = sync.Pool{
-	New: func() interface{} {
+	New: func() any {
 		return &Event{}
 	},
 }
@@ -387,40 +390,56 @@ func (a *Auditor) Log(action Action, key, reason string, success bool) error {
 
 // LogWithFile records an audit event with file information.
 func (a *Auditor) LogWithFile(action Action, key, file, reason string, success bool) error {
-	a.mu.RLock()
-	defer a.mu.RUnlock()
+	// Fast path: atomic read avoids lock acquisition when auditing is disabled.
 	if !a.enabled.Load() {
 		return nil
 	}
-	event := Event{
-		Timestamp: time.Now(),
-		Action:    action,
-		Key:       a.maskKey(key),
-		File:      file,
-		Reason:    reason,
-		Success:   success,
-		Masked:    key != "" && a.isSensitive(key),
+	a.mu.RLock()
+	// Re-check under RLock: SetEnabled acquires the write lock, so this ensures
+	// we see a consistent state and don't log after a concurrent SetEnabled(false).
+	if !a.enabled.Load() {
+		a.mu.RUnlock()
+		return nil
 	}
-	return a.handler.Log(event)
+	event := getAuditEvent()
+	event.Timestamp = time.Now()
+	event.Action = action
+	event.Key = a.maskKey(key)
+	event.File = file
+	event.Reason = reason
+	event.Success = success
+	event.Masked = key != "" && a.isSensitive(key)
+	err := a.handler.Log(*event)
+	putAuditEvent(event)
+	a.mu.RUnlock()
+	return err
 }
 
 // LogWithDuration records an audit event with timing information.
 func (a *Auditor) LogWithDuration(action Action, key, reason string, success bool, duration time.Duration) error {
-	a.mu.RLock()
-	defer a.mu.RUnlock()
+	// Fast path: atomic read avoids lock acquisition when auditing is disabled.
 	if !a.enabled.Load() {
 		return nil
 	}
-	event := Event{
-		Timestamp: time.Now(),
-		Action:    action,
-		Key:       a.maskKey(key),
-		Reason:    reason,
-		Success:   success,
-		Duration:  duration.Nanoseconds(),
-		Masked:    key != "" && a.isSensitive(key),
+	a.mu.RLock()
+	// Re-check under RLock: SetEnabled acquires the write lock, so this ensures
+	// we see a consistent state and don't log after a concurrent SetEnabled(false).
+	if !a.enabled.Load() {
+		a.mu.RUnlock()
+		return nil
 	}
-	return a.handler.Log(event)
+	event := getAuditEvent()
+	event.Timestamp = time.Now()
+	event.Action = action
+	event.Key = a.maskKey(key)
+	event.Reason = reason
+	event.Success = success
+	event.Duration = duration.Nanoseconds()
+	event.Masked = key != "" && a.isSensitive(key)
+	err := a.handler.Log(*event)
+	putAuditEvent(event)
+	a.mu.RUnlock()
+	return err
 }
 
 // LogError records an error event.
@@ -500,7 +519,7 @@ type BufferedHandlerConfig struct {
 //   - Batched writes reduce system call overhead
 //   - Time-based auto-flush ensures events are written promptly
 //   - Thread-safe for concurrent use
-//   - Graceful shutdown on Close()
+//   - Graceful shutdown on Close() with guaranteed goroutine exit
 //
 // Example:
 //
@@ -522,6 +541,7 @@ type BufferedHandler struct {
 	stopCh  chan struct{}
 	flushCh chan struct{}
 	stopped bool
+	wg      sync.WaitGroup
 }
 
 // Default values for BufferedHandler.
@@ -554,6 +574,7 @@ func NewBufferedHandler(cfg BufferedHandlerConfig) *BufferedHandler {
 
 	// Start background flush goroutine if interval is set
 	if h.interval > 0 {
+		h.wg.Add(1)
 		go h.flushLoop()
 	}
 
@@ -562,6 +583,7 @@ func NewBufferedHandler(cfg BufferedHandlerConfig) *BufferedHandler {
 
 // flushLoop periodically flushes the buffer.
 func (h *BufferedHandler) flushLoop() {
+	defer h.wg.Done()
 	ticker := time.NewTicker(h.interval)
 	defer ticker.Stop()
 
@@ -654,6 +676,7 @@ func (h *BufferedHandler) Close() error {
 
 	// Stop background goroutine
 	close(h.stopCh)
+	h.wg.Wait()
 
 	// Final flush
 	if err := h.Flush(); err != nil {

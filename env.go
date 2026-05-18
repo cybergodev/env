@@ -1,4 +1,4 @@
-// Package env provides a high-security environment variable library for Go 1.24+.
+// Package env provides a high-security environment variable library for Go 1.25+.
 // It is designed for applications where security, concurrent access, and production-grade
 // features are critical.
 //
@@ -249,6 +249,9 @@ func New(cfg ...Config) (*Loader, error) {
 //	// Load specific files
 //	err := loader.LoadFiles(".env", ".env.local")
 func (l *Loader) LoadFiles(filenames ...string) error {
+	if l == nil {
+		return ErrClosed
+	}
 	l.mu.Lock()
 	defer l.mu.Unlock()
 
@@ -360,6 +363,10 @@ func (l *Loader) loadFileLocked(filename string) error {
 		parser = l.parsers[FormatEnv]
 	}
 
+	if parser == nil {
+		return newFileError(filename, "parse", fmt.Errorf("no parser registered for format %v", format))
+	}
+
 	vars, err := parser.Parse(file, filename)
 	if err != nil {
 		return err
@@ -380,9 +387,13 @@ func (l *Loader) loadFileLocked(filename string) error {
 
 	// Filter and prepare variables for batch set
 	toSet := make(map[string]string, len(vars))
+
+	// Pre-compute uppercase prefix once outside the loop
+	upperPrefix := internal.ToUpperASCII(l.config.Prefix)
+
 	for key, value := range vars {
-		// Check prefix if configured
-		if l.config.Prefix != "" && !strings.HasPrefix(key, l.config.Prefix) {
+		// Check prefix if configured (case-insensitive for consistency with other key matching)
+		if l.config.Prefix != "" && !strings.HasPrefix(internal.ToUpperASCII(key), upperPrefix) {
 			continue
 		}
 
@@ -405,6 +416,9 @@ func (l *Loader) loadFileLocked(filename string) error {
 
 // Apply applies all loaded variables to the process environment.
 func (l *Loader) Apply() error {
+	if l == nil {
+		return ErrClosed
+	}
 	l.mu.Lock()
 	defer l.mu.Unlock()
 
@@ -465,7 +479,12 @@ func (l *Loader) GetString(key string, defaultValue ...string) string {
 }
 
 // GetSecure retrieves a SecureValue by key.
+// Uses the same key resolution strategy as Lookup (exact match, uppercase fallback,
+// dot-notation) via internal.ResolveKeyName to ensure consistency.
 func (l *Loader) GetSecure(key string) *SecureValue {
+	if l == nil {
+		return nil
+	}
 	l.mu.RLock()
 	defer l.mu.RUnlock()
 
@@ -473,7 +492,21 @@ func (l *Loader) GetSecure(key string) *SecureValue {
 		return nil
 	}
 
-	return l.vars.GetSecure(key)
+	// Phase 1: find the matching storage key without allocating SecureValues.
+	var matchedKey string
+	internal.ResolveKeyName(key, func(k string) bool {
+		if l.vars.exists(k) {
+			matchedKey = k
+			return true
+		}
+		return false
+	})
+	if matchedKey == "" {
+		return nil
+	}
+
+	// Phase 2: allocate SecureValue only for the matched key.
+	return l.vars.GetSecure(matchedKey)
 }
 
 // Lookup retrieves a value by key and reports whether it exists.
@@ -482,6 +515,9 @@ func (l *Loader) GetSecure(key string) *SecureValue {
 // if indexed key is not found.
 // Returns the value with leading and trailing whitespace trimmed.
 func (l *Loader) Lookup(key string) (string, bool) {
+	if l == nil {
+		return "", false
+	}
 	l.mu.RLock()
 	defer l.mu.RUnlock()
 
@@ -489,73 +525,7 @@ func (l *Loader) Lookup(key string) (string, bool) {
 		return "", false
 	}
 
-	// Fast path for simple keys (no dots) - skip ResolvePath allocation
-	// This is the most common case and avoids creating candidate slices
-	if strings.IndexByte(key, '.') == -1 {
-		// Try exact key first
-		if value, ok := l.vars.Get(key); ok {
-			return internal.TrimSpace(value), true
-		}
-		// Try uppercase version if different
-		upper := internal.ToUpperASCII(key)
-		if upper != key {
-			if value, ok := l.vars.Get(upper); ok {
-				return internal.TrimSpace(value), true
-			}
-		}
-		return "", false
-	}
-
-	// Slow path for dot-notation keys - use path resolver
-	candidates := internal.ResolvePath(key)
-
-	// Try each candidate in priority order
-	for _, candidate := range candidates {
-		if value, ok := l.vars.Get(candidate); ok {
-			return internal.TrimSpace(value), true
-		}
-	}
-
-	// Fallback to comma-separated values for indexed access
-	if basePath, index, hasIndex := internal.ExtractNumericIndex(key); hasIndex {
-		baseCandidates := internal.ResolvePath(basePath)
-		for _, baseCandidate := range baseCandidates {
-			if value, ok := l.vars.Get(baseCandidate); ok {
-				if elem, found := splitAndTrimAt(value, index); found {
-					return elem, true
-				}
-			}
-		}
-	}
-
-	return "", false
-}
-
-// splitAndTrimAt returns the element at the given index from a comma-separated string.
-// It iterates without allocation, returning the trimmed element at the specified index.
-// Returns empty string and false if the index is out of bounds or negative.
-func splitAndTrimAt(s string, index int) (string, bool) {
-	// SECURITY: Defensive check for negative index
-	if index < 0 {
-		return "", false
-	}
-	currentIdx := 0
-	start := 0
-	for i := 0; i <= len(s); i++ {
-		if i == len(s) || s[i] == ',' {
-			if i > start {
-				trimmed := internal.TrimSpace(s[start:i])
-				if trimmed != "" {
-					if currentIdx == index {
-						return trimmed, true
-					}
-					currentIdx++
-				}
-			}
-			start = i + 1
-		}
-	}
-	return "", false
+	return internal.ResolveKey(key, l.vars.Get)
 }
 
 // buildIndexedKey efficiently constructs an indexed key (e.g., "KEY_0", "KEY_1").
@@ -605,20 +575,11 @@ func buildIndexedKey(baseKey string, index int) string {
 	return sb.String()
 }
 
-// splitAndTrimComma splits by comma and trims whitespace.
-func splitAndTrimComma(s string) []string {
-	parts := strings.Split(s, ",")
-	result := make([]string, 0, len(parts))
-	for _, part := range parts {
-		if trimmed := internal.TrimSpace(part); trimmed != "" {
-			result = append(result, trimmed)
-		}
-	}
-	return result
-}
-
 // Set sets a value for a key.
 func (l *Loader) Set(key, value string) error {
+	if l == nil {
+		return ErrClosed
+	}
 	l.mu.Lock()
 	defer l.mu.Unlock()
 
@@ -665,6 +626,9 @@ func (l *Loader) Set(key, value string) error {
 
 // Delete removes a key.
 func (l *Loader) Delete(key string) error {
+	if l == nil {
+		return ErrClosed
+	}
 	l.mu.Lock()
 	defer l.mu.Unlock()
 
@@ -687,6 +651,9 @@ func (l *Loader) Delete(key string) error {
 
 // Keys returns all keys.
 func (l *Loader) Keys() []string {
+	if l == nil {
+		return nil
+	}
 	l.mu.RLock()
 	defer l.mu.RUnlock()
 
@@ -699,6 +666,9 @@ func (l *Loader) Keys() []string {
 
 // All returns all environment variables as a map.
 func (l *Loader) All() map[string]string {
+	if l == nil {
+		return nil
+	}
 	l.mu.RLock()
 	defer l.mu.RUnlock()
 
@@ -711,6 +681,9 @@ func (l *Loader) All() map[string]string {
 
 // Len returns the number of loaded variables.
 func (l *Loader) Len() int {
+	if l == nil {
+		return 0
+	}
 	l.mu.RLock()
 	defer l.mu.RUnlock()
 
@@ -723,6 +696,9 @@ func (l *Loader) Len() int {
 
 // IsApplied returns true if the variables have been applied to os.Environ.
 func (l *Loader) IsApplied() bool {
+	if l == nil {
+		return false
+	}
 	l.mu.RLock()
 	defer l.mu.RUnlock()
 	return l.applied
@@ -730,6 +706,9 @@ func (l *Loader) IsApplied() bool {
 
 // LoadTime returns the time when variables were last loaded.
 func (l *Loader) LoadTime() time.Time {
+	if l == nil {
+		return time.Time{}
+	}
 	l.mu.RLock()
 	defer l.mu.RUnlock()
 	return l.loadTime
@@ -738,6 +717,9 @@ func (l *Loader) LoadTime() time.Time {
 // Close closes the loader and securely clears all stored values.
 // If the loader owns its ComponentFactory, it will also close the factory.
 func (l *Loader) Close() error {
+	if l == nil {
+		return nil
+	}
 	l.mu.Lock()
 	defer l.mu.Unlock()
 
@@ -761,6 +743,9 @@ func (l *Loader) Close() error {
 
 // IsClosed returns true if the loader has been closed.
 func (l *Loader) IsClosed() bool {
+	if l == nil {
+		return true
+	}
 	l.mu.RLock()
 	defer l.mu.RUnlock()
 	return l.closed
@@ -771,6 +756,9 @@ func (l *Loader) IsClosed() bool {
 // a default value if the key is not found or parsing fails.
 // Parse failures are logged to the auditor for debugging purposes.
 func getWithDefault[T any](loader *Loader, key string, parse func(string) (T, error), defaultValue ...T) T {
+	if loader == nil {
+		return firstOrZero(defaultValue...)
+	}
 	value, ok := loader.Lookup(key)
 	if !ok {
 		return firstOrZero(defaultValue...)
@@ -790,6 +778,9 @@ func getWithDefault[T any](loader *Loader, key string, parse func(string) (T, er
 // LimitsConfig, or ComponentConfig fields may affect the loader's behavior.
 // For a safe mutable copy, manually copy the necessary fields.
 func (l *Loader) Config() Config {
+	if l == nil {
+		return Config{}
+	}
 	return l.config
 }
 
@@ -804,6 +795,30 @@ func (l *Loader) GetInt(key string, defaultValue ...int64) int64 {
 	return getWithDefault(l, key, func(s string) (int64, error) {
 		return parseInt(s, 64)
 	}, defaultValue...)
+}
+
+// GetUint64 retrieves an unsigned integer value with optional default.
+// If the key is not found and no default is provided, returns 0.
+//
+// Example:
+//
+//	port := loader.GetUint64("PORT")           // Returns 0 if not found
+//	port := loader.GetUint64("PORT", 8080)     // Returns 8080 if not found
+func (l *Loader) GetUint64(key string, defaultValue ...uint64) uint64 {
+	return getWithDefault(l, key, func(s string) (uint64, error) {
+		return parseUint(s, 64)
+	}, defaultValue...)
+}
+
+// GetFloat64 retrieves a floating-point value with optional default.
+// If the key is not found and no default is provided, returns 0.
+//
+// Example:
+//
+//	rate := loader.GetFloat64("RATE")           // Returns 0 if not found
+//	rate := loader.GetFloat64("RATE", 0.5)      // Returns 0.5 if not found
+func (l *Loader) GetFloat64(key string, defaultValue ...float64) float64 {
+	return getWithDefault(l, key, parseFloat64, defaultValue...)
 }
 
 // GetBool retrieves a boolean value with optional default.
@@ -931,11 +946,17 @@ func getSliceFromIndexedKeys[T sliceElement](loader *Loader, baseKey string, def
 // Struct fields can be tagged with `env:"KEY"` to specify the env variable name.
 // Optional `envDefault:"value"` sets a default if the key is not found.
 func (l *Loader) ParseInto(v interface{}) error {
+	if l == nil {
+		return ErrClosed
+	}
 	return UnmarshalInto(l.All(), v)
 }
 
 // Validate validates the loaded environment against required and allowed keys.
 func (l *Loader) Validate() error {
+	if l == nil {
+		return ErrClosed
+	}
 	return l.validator.ValidateRequired(l.keysToUpper())
 }
 

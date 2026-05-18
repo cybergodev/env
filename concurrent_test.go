@@ -410,7 +410,7 @@ func TestComponentFactory_ConcurrentAccess(t *testing.T) {
 			for j := 0; j < iterations; j++ {
 				_ = factory.Validator()
 				_ = factory.Auditor()
-				_ = factory.LineParserExpander()
+				_ = factory.lineParserExpander()
 				_ = factory.IsClosed()
 			}
 		}()
@@ -888,11 +888,26 @@ func TestGetDefaultLoader(t *testing.T) {
 	ResetDefaultLoader()
 	defer ResetDefaultLoader()
 
-	loader, err := getDefaultLoader()
-	if err != nil {
-		t.Fatalf("getDefaultLoader() error = %v", err)
+	// Without Load(), should return ErrNotInitialized
+	_, err := getDefaultLoader()
+	if !errors.Is(err, ErrNotInitialized) {
+		t.Fatalf("getDefaultLoader() error = %v, want ErrNotInitialized", err)
 	}
-	if loader == nil {
+
+	// After explicit setup, should succeed
+	loader, err := New(DefaultConfig())
+	if err != nil {
+		t.Fatalf("New() error = %v", err)
+	}
+	if err := setDefaultLoader(loader); err != nil {
+		t.Fatalf("setDefaultLoader() error = %v", err)
+	}
+
+	got, err := getDefaultLoader()
+	if err != nil {
+		t.Fatalf("getDefaultLoader() after set error = %v", err)
+	}
+	if got == nil {
 		t.Fatal("getDefaultLoader() returned nil")
 	}
 }
@@ -901,18 +916,24 @@ func TestResetDefaultLoader(t *testing.T) {
 	ResetDefaultLoader()
 	defer ResetDefaultLoader()
 
+	// Set a loader first
+	loader, err := New(DefaultConfig())
+	if err != nil {
+		t.Fatalf("New() error = %v", err)
+	}
+	if err := setDefaultLoader(loader); err != nil {
+		t.Fatalf("setDefaultLoader() error = %v", err)
+	}
+
 	// Create and reset multiple times
 	for i := 0; i < 3; i++ {
 		ResetDefaultLoader()
 	}
 
-	// Check that reset cleans up properly
-	loader, err := getDefaultLoader()
-	if err != nil {
-		t.Fatalf("getDefaultLoader() after reset error = %v", err)
-	}
-	if loader == nil {
-		t.Fatal("getDefaultLoader() returned nil")
+	// After reset, should return ErrNotInitialized
+	_, err = getDefaultLoader()
+	if !errors.Is(err, ErrNotInitialized) {
+		t.Fatalf("getDefaultLoader() after reset error = %v, want ErrNotInitialized", err)
 	}
 }
 
@@ -966,6 +987,15 @@ func TestSingleton_ConcurrentAccess(t *testing.T) {
 	ResetDefaultLoader()
 	defer ResetDefaultLoader()
 
+	// Set up loader before concurrent access
+	loader, err := New(DefaultConfig())
+	if err != nil {
+		t.Fatalf("New() error = %v", err)
+	}
+	if err := setDefaultLoader(loader); err != nil {
+		t.Fatalf("setDefaultLoader() error = %v", err)
+	}
+
 	var wg sync.WaitGroup
 	iterations := 100
 	concurrency := 10
@@ -997,10 +1027,19 @@ func TestSingleton_ConcurrentReset(t *testing.T) {
 	for run := 0; run < 10; run++ {
 		ResetDefaultLoader()
 
+		// Set up initial loader
+		initLoader, err := New(DefaultConfig())
+		if err != nil {
+			t.Fatalf("New() error = %v", err)
+		}
+		if err := setDefaultLoader(initLoader); err != nil {
+			t.Fatalf("setDefaultLoader() error = %v", err)
+		}
+
 		var wg sync.WaitGroup
 		iterations := 50
 
-		// Getters
+		// Getters — tolerate ErrNotInitialized during reset windows
 		for i := 0; i < 5; i++ {
 			wg.Add(1)
 			go func() {
@@ -1014,13 +1053,17 @@ func TestSingleton_ConcurrentReset(t *testing.T) {
 			}()
 		}
 
-		// Resetters
+		// Resetters — alternate between reset and re-set
 		for i := 0; i < 2; i++ {
 			wg.Add(1)
 			go func() {
 				defer wg.Done()
 				for j := 0; j < iterations/10; j++ {
 					ResetDefaultLoader()
+					l, lerr := New(DefaultConfig())
+					if lerr == nil {
+						setDefaultLoader(l)
+					}
 				}
 			}()
 		}

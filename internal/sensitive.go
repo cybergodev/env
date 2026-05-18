@@ -143,18 +143,9 @@ func containsIgnoreCase(s, pattern string) bool {
 		return false
 	}
 
-	// Fast path: check for non-ASCII characters in the search window
-	// If found, fall back to standard library for correct Unicode handling
-	for i := 0; i <= sLen-patternLen; i++ {
-		hasNonASCII := false
-		for j := 0; j < patternLen; j++ {
-			if s[i+j] >= 0x80 {
-				hasNonASCII = true
-				break
-			}
-		}
-		if hasNonASCII {
-			// Fallback: use standard library for non-ASCII input
+	// Quick scan for non-ASCII — exit early to fallback path
+	for i := 0; i < sLen; i++ {
+		if s[i] >= 0x80 {
 			return strings.Contains(strings.ToUpper(s), pattern)
 		}
 	}
@@ -164,7 +155,6 @@ func containsIgnoreCase(s, pattern string) bool {
 		match := true
 		for j := 0; j < patternLen; j++ {
 			c := s[i+j]
-			// Convert to uppercase inline
 			if c >= 'a' && c <= 'z' {
 				c -= 32
 			}
@@ -180,24 +170,24 @@ func containsIgnoreCase(s, pattern string) bool {
 	return false
 }
 
+// maxValueDisplayLen is the maximum length of non-sensitive values displayed in logs.
+const maxValueDisplayLen = 20
+
 // MaskValue masks a value based on its sensitivity.
 // This is a utility function for general value masking.
 func MaskValue(key, value string) string {
 	if IsKey(key) {
 		return fmt.Sprintf("[MASKED:%d chars]", len(value))
 	}
-	if len(value) <= 20 {
+	if len(value) <= maxValueDisplayLen {
 		return value
 	}
-	return value[:17] + "..."
+	return value[:maxValueDisplayLen-3] + "..."
 }
 
 // MaskKey masks a key name for logging purposes.
 func MaskKey(key string) string {
-	if len(key) <= 3 {
-		return "***"
-	}
-	return key[:2] + "***"
+	return DefaultMaskKey(key)
 }
 
 // MaskInString masks potentially sensitive content in a string.

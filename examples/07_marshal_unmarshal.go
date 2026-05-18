@@ -60,7 +60,10 @@ func demonstrateMarshal() {
 		"APP_PORT": "8080",
 	}
 
-	envString, _ := env.Marshal(envMap)
+	envString, err := env.Marshal(envMap)
+	if err != nil {
+		log.Fatal(err)
+	}
 	fmt.Printf("Map to .env:\n%s", envString)
 
 	// Struct to .env format
@@ -70,7 +73,10 @@ func demonstrateMarshal() {
 	}
 
 	config := Config{Name: "myapp", Port: 8080}
-	configEnv, _ := env.Marshal(config)
+	configEnv, err := env.Marshal(config)
+	if err != nil {
+		log.Fatal(err)
+	}
 	fmt.Printf("Struct to .env:\n%s", configEnv)
 }
 
@@ -83,11 +89,17 @@ func demonstrateFormats() {
 	}
 
 	// JSON output
-	jsonString, _ := env.Marshal(envMap, env.FormatJSON)
+	jsonString, err := env.Marshal(envMap, env.FormatJSON)
+	if err != nil {
+		log.Fatal(err)
+	}
 	fmt.Printf("JSON:\n%s\n", jsonString)
 
 	// YAML output
-	yamlString, _ := env.Marshal(envMap, env.FormatYAML)
+	yamlString, err := env.Marshal(envMap, env.FormatYAML)
+	if err != nil {
+		log.Fatal(err)
+	}
 	fmt.Printf("YAML:\n%s", yamlString)
 }
 
@@ -101,11 +113,16 @@ func demonstrateRoundTrip() {
 
 	// Struct -> Map
 	original := ServerConfig{Host: "localhost", Port: 8080, Timeout: 30 * time.Second}
-	envMap, _ := env.MarshalStruct(original)
+	envMap, err := env.MarshalStruct(original)
+	if err != nil {
+		log.Fatal(err)
+	}
 
 	// Map -> Struct
 	var restored ServerConfig
-	env.UnmarshalInto(envMap, &restored)
+	if err := env.UnmarshalInto(envMap, &restored); err != nil {
+		log.Fatal(err)
+	}
 
 	fmt.Printf("Original: Host=%s, Port=%d\n", original.Host, original.Port)
 	fmt.Printf("Restored: Host=%s, Port=%d\n", restored.Host, restored.Port)

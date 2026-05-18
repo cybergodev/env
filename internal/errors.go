@@ -59,9 +59,15 @@ func (e *ValidationError) Error() string {
 }
 
 // Is implements errors.Is for ValidationError.
-// This allows errors.Is(err, ErrInvalidConfig) to match ValidationError.
+// Only matches ErrInvalidValue when the error is value-related (not key or config errors).
 func (e *ValidationError) Is(target error) bool {
-	return target == ErrInvalidValue
+	if target == ErrInvalidValue {
+		switch e.Rule {
+		case "value", "null_byte", "control_char", "utf8":
+			return true
+		}
+	}
+	return false
 }
 
 // SecurityError provides detailed information about security violations.
@@ -129,12 +135,9 @@ func (e *ExpansionError) Error() string {
 }
 
 // maskKeyName masks a key name for safe error reporting.
-// Shows only the first 2 characters followed by "***" for keys longer than 3 characters.
+// Delegates to DefaultMaskKey for consistency with the rest of the codebase.
 func maskKeyName(key string) string {
-	if len(key) <= 3 {
-		return "***"
-	}
-	return key[:2] + "***"
+	return DefaultMaskKey(key)
 }
 
 // JSONError represents a JSON parsing error.

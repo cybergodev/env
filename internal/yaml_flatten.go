@@ -33,12 +33,30 @@ func FlattenYAML(value *Value, cfg YAMLFlattenConfig) (map[string]string, error)
 		return make(map[string]string), nil
 	}
 
-	result := make(map[string]string)
+	// Estimate leaf count from the root map for pre-allocation
+	estSize := estimateLeafCount(value)
+	result := make(map[string]string, estSize)
 	if err := flattenYAMLValue(value, "", cfg, result, 0); err != nil {
 		return nil, err
 	}
 
 	return result, nil
+}
+
+// estimateLeafCount provides a rough estimate of the number of leaf values
+// in a YAML tree to pre-size the result map. Only traverses one level deep.
+func estimateLeafCount(v *Value) int {
+	if v == nil {
+		return 0
+	}
+	switch v.Type {
+	case ValueTypeMap:
+		return len(v.Map)
+	case ValueTypeArray:
+		return len(v.Array)
+	default:
+		return 1
+	}
 }
 
 // flattenYAMLValue recursively flattens a YAML value.
@@ -123,36 +141,70 @@ func convertYAMLScalar(s string, cfg YAMLFlattenConfig) string {
 		return s
 	}
 
-	// Handle numbers
+	// Handle numbers: fast path to skip strconv when the string clearly isn't a number.
+	// This avoids the massive allocation from strconv.syntaxError for non-numeric scalars.
 	if cfg.NumberAsString {
-		// Try integer
-		if num, err := strconv.ParseInt(s, 10, 64); err == nil {
-			return strconv.FormatInt(num, 10)
-		}
-		// Try float
-		if num, err := strconv.ParseFloat(s, 64); err == nil {
-			// Format as integer if it's a whole number
-			if num == float64(int64(num)) {
-				return strconv.FormatInt(int64(num), 10)
+		if looksLikeNumber(s) {
+			// Try integer
+			if num, err := strconv.ParseInt(s, 10, 64); err == nil {
+				return strconv.FormatInt(num, 10)
 			}
-			return strconv.FormatFloat(num, 'f', -1, 64)
+			// Try float
+			if num, err := strconv.ParseFloat(s, 64); err == nil {
+				if num == float64(int64(num)) {
+					return strconv.FormatInt(int64(num), 10)
+				}
+				return strconv.FormatFloat(num, 'f', -1, 64)
+			}
 		}
 	}
 
 	return s
 }
 
+// looksLikeNumber does a cheap byte-level scan to reject strings that
+// cannot possibly be parsed as an integer or float.
+// Returns true only if the string starts with a digit or sign and
+// contains only [0-9eE.+-] with at least one digit.
+func looksLikeNumber(s string) bool {
+	if len(s) == 0 {
+		return false
+	}
+	i := 0
+	if s[0] == '+' || s[0] == '-' {
+		if len(s) == 1 {
+			return false
+		}
+		i = 1
+	}
+	hasDigit := false
+	for ; i < len(s); i++ {
+		c := s[i]
+		if c >= '0' && c <= '9' {
+			hasDigit = true
+		} else if c != '.' && c != 'e' && c != 'E' && c != '+' && c != '-' {
+			return false
+		}
+	}
+	return hasDigit
+}
+
 // buildYAMLKey constructs a key from prefix and key parts.
-// Uses pooled strings.Builder for efficiency when concatenation is needed.
+// Uses direct concatenation for the common case (short keys) to avoid pool overhead.
 func buildYAMLKey(prefix, key string, cfg YAMLFlattenConfig) string {
 	key = ToUpperASCII(key)
 	if prefix == "" {
 		return key
 	}
-	// Use pooled strings.Builder for efficient concatenation
+	// For the common case of short keys, direct concatenation is faster
+	// than pool Get/Put overhead. The pool is beneficial only for very long keys.
+	totalLen := len(prefix) + len(cfg.KeyDelimiter) + len(key)
+	if totalLen <= 64 {
+		return prefix + cfg.KeyDelimiter + key
+	}
 	sb := GetBuilder()
 	defer PutBuilder(sb)
-	sb.Grow(len(prefix) + len(cfg.KeyDelimiter) + len(key))
+	sb.Grow(totalLen)
 	sb.WriteString(prefix)
 	sb.WriteString(cfg.KeyDelimiter)
 	sb.WriteString(key)
@@ -160,16 +212,20 @@ func buildYAMLKey(prefix, key string, cfg YAMLFlattenConfig) string {
 }
 
 // buildYAMLArrayIndex constructs a key for array elements.
-// Uses pooled strings.Builder and strconv.Itoa for efficient conversion.
+// Uses direct concatenation for short keys to avoid pool overhead.
 func buildYAMLArrayIndex(prefix string, index int, cfg YAMLFlattenConfig) string {
 	indexStr := strconv.Itoa(index)
-	sb := GetBuilder()
-	defer PutBuilder(sb)
 
 	switch cfg.ArrayIndexFormat {
 	case "bracket":
 		// prefix[index] format
-		sb.Grow(len(prefix) + 1 + len(indexStr) + 1)
+		totalLen := len(prefix) + 1 + len(indexStr) + 1
+		if totalLen <= 64 {
+			return prefix + "[" + indexStr + "]"
+		}
+		sb := GetBuilder()
+		defer PutBuilder(sb)
+		sb.Grow(totalLen)
 		sb.WriteString(prefix)
 		sb.WriteByte('[')
 		sb.WriteString(indexStr)
@@ -177,7 +233,13 @@ func buildYAMLArrayIndex(prefix string, index int, cfg YAMLFlattenConfig) string
 		return sb.String()
 	default: // underscore
 		// prefix_index format
-		sb.Grow(len(prefix) + len(cfg.KeyDelimiter) + len(indexStr))
+		totalLen := len(prefix) + len(cfg.KeyDelimiter) + len(indexStr)
+		if totalLen <= 64 {
+			return prefix + cfg.KeyDelimiter + indexStr
+		}
+		sb := GetBuilder()
+		defer PutBuilder(sb)
+		sb.Grow(totalLen)
 		sb.WriteString(prefix)
 		sb.WriteString(cfg.KeyDelimiter)
 		sb.WriteString(indexStr)
@@ -187,6 +249,39 @@ func buildYAMLArrayIndex(prefix string, index int, cfg YAMLFlattenConfig) string
 
 // flattenInlineJSON parses and flattens inline JSON arrays or objects within YAML.
 func flattenInlineJSON(jsonStr, prefix string, cfg YAMLFlattenConfig, result map[string]string, depth int) error {
+	// SECURITY: Pre-validate JSON nesting depth to prevent excessive memory
+	// allocation during json.Unmarshal. Count brackets conservatively
+	// (may overcount brackets inside quoted strings, but that's safe).
+	nesting := 0
+	for i := 0; i < len(jsonStr); i++ {
+		switch jsonStr[i] {
+		case '{', '[':
+			nesting++
+			if depth+nesting > cfg.MaxDepth {
+				return &YAMLError{
+					Path:    prefix,
+					Message: fmt.Sprintf("maximum nesting depth exceeded (%d)", cfg.MaxDepth),
+				}
+			}
+		case '}', ']':
+			nesting--
+			if nesting < 0 {
+				nesting = 0
+			}
+		case '"':
+			// Skip string contents to avoid counting brackets inside strings
+			i++
+			for i < len(jsonStr) {
+				if jsonStr[i] == '\\' {
+					i++ // skip escaped char
+				} else if jsonStr[i] == '"' {
+					break
+				}
+				i++
+			}
+		}
+	}
+
 	// Parse the inline JSON
 	var raw interface{}
 	if err := json.Unmarshal([]byte(jsonStr), &raw); err != nil {

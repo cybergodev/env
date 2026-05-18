@@ -48,7 +48,7 @@ func (p *jsonParser) Parse(r io.Reader, filename string) (map[string]string, err
 	start := time.Now()
 
 	// Wrap with secure reader
-	secureRd := internal.NewSecureReader(r, p.config.MaxFileSize, 0)
+	secureRd := internal.NewSecureReader(r, p.config.MaxFileSize, p.config.MaxLineLength)
 	data, err := io.ReadAll(secureRd)
 	if err != nil {
 		if errors.Is(err, internal.ErrFileTooLarge) || errors.Is(err, internal.ErrLineTooLong) {
