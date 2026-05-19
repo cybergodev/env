@@ -51,11 +51,13 @@ func getDefaultLoader() (*Loader, error) {
 func ResetDefaultLoader() error {
 	defaultMu.Lock()
 	oldLoader := defaultLoader.Swap(nil)
-	defaultMu.Unlock()
 
 	if oldLoader != nil {
-		return oldLoader.Close()
+		err := oldLoader.Close()
+		defaultMu.Unlock()
+		return err
 	}
+	defaultMu.Unlock()
 	return nil
 }
 

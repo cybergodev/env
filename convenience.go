@@ -58,17 +58,6 @@ func withLoader[T any](fn func(*Loader) T, def T) T {
 	return fn(loader)
 }
 
-// withLoaderError executes a function with the default loader that may return an error.
-// If the loader cannot be obtained, returns the error directly.
-func withLoaderError[T any](fn func(*Loader) (T, error)) (T, error) {
-	loader, err := getDefaultLoader()
-	if err != nil {
-		var zero T
-		return zero, err
-	}
-	return fn(loader)
-}
-
 // GetString retrieves a value from the default loader with optional default.
 // Requires Load() or LoadWithConfig() to have been called first.
 // Returns an empty string if the key is not found and no default is provided.
@@ -196,10 +185,11 @@ func Lookup(key string) (string, bool) {
 //	    log.Fatal(err)
 //	}
 func Set(key, value string) error {
-	_, err := withLoaderError(func(l *Loader) (struct{}, error) {
-		return struct{}{}, l.Set(key, value)
-	})
-	return err
+	loader, err := getDefaultLoader()
+	if err != nil {
+		return err
+	}
+	return loader.Set(key, value)
 }
 
 // GetSlice retrieves a slice of values from the default loader.
@@ -277,10 +267,11 @@ func Len() int {
 //	    log.Fatal(err)
 //	}
 func Delete(key string) error {
-	_, err := withLoaderError(func(l *Loader) (struct{}, error) {
-		return struct{}{}, l.Delete(key)
-	})
-	return err
+	loader, err := getDefaultLoader()
+	if err != nil {
+		return err
+	}
+	return loader.Delete(key)
 }
 
 // GetSecure retrieves a SecureValue from the default loader.
@@ -313,10 +304,11 @@ func GetSecure(key string) *SecureValue {
 //	    log.Fatal("Environment validation failed:", err)
 //	}
 func Validate() error {
-	_, err := withLoaderError(func(l *Loader) (struct{}, error) {
-		return struct{}{}, l.Validate()
-	})
-	return err
+	loader, err := getDefaultLoader()
+	if err != nil {
+		return err
+	}
+	return loader.Validate()
 }
 
 // ============================================================================
@@ -445,7 +437,7 @@ func LoadWithConfig(cfg Config) error {
 //	if err := env.ParseInto(&cfg); err != nil {
 //	    log.Fatal(err)
 //	}
-func ParseInto(v interface{}) error {
+func ParseInto(v any) error {
 	loader, err := getDefaultLoader()
 	if err != nil {
 		return err

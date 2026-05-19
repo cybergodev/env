@@ -18,6 +18,8 @@ func main() {
 	demonstrateFromLoader()
 
 	demonstrateLifecycle()
+
+	demonstrateMemoryLock()
 }
 
 func demonstrateBasics() {
@@ -68,11 +70,11 @@ func demonstrateFromLoader() {
 
 func demonstrateLifecycle() {
 	fmt.Println("\n=== Lifecycle: Close vs Release ===")
-	// Close() zeros memory but doesn't return to pool
+	// Close() zeros memory — subsequent Reveal() returns empty string
 	secret := env.NewSecureValue("temporary_secret")
 	fmt.Printf("Before close: %s\n", secret.Reveal())
 	secret.Close()
-	fmt.Printf("After close: %s\n", secret.Reveal())
+	fmt.Printf("After close (zeroed): %q\n", secret.Reveal())
 
 	// Release() zeros memory AND returns to pool (more efficient for frequent use)
 	secret2 := env.NewSecureValue("another_secret")
@@ -80,7 +82,7 @@ func demonstrateLifecycle() {
 
 	// Release returns the object to the pool for reuse
 	secret2.Release()
-	fmt.Printf("After release: %s\n", secret2.Reveal())
+	fmt.Printf("After release (zeroed): %q\n", secret2.Reveal())
 
 	// Bytes() returns a copy that must be cleared by the caller
 	secret3 := env.NewSecureValue("byte_example")
@@ -88,4 +90,31 @@ func demonstrateLifecycle() {
 	fmt.Printf("\nBytes length: %d\n", len(bytes))
 	env.ClearBytes(bytes) // Clear external copies when done
 	secret3.Release()
+}
+
+func demonstrateMemoryLock() {
+	fmt.Println("\n=== Memory Lock Configuration ===")
+	// Memory locking prevents sensitive data from being swapped to disk.
+	// On Linux: uses mlock/mlockall. On Windows: uses VirtualLock.
+	if env.IsMemoryLockSupported() {
+		fmt.Printf("Memory lock supported on this platform\n")
+		fmt.Printf("Enabled: %v, Strict: %v\n",
+			env.IsMemoryLockEnabled(), env.IsMemoryLockStrict())
+
+		// Enable strict mode — SecureValue creation fails if mlock fails
+		env.SetMemoryLockStrict(true)
+
+		strict, err := env.NewSecureValueStrict("needs_mlock")
+		if err != nil {
+			fmt.Printf("Strict mlock failed: %v\n", err)
+		} else {
+			fmt.Printf("Strict mlock locked: %v\n", strict.IsMemoryLocked())
+			strict.Close()
+		}
+
+		// Reset to default (non-strict)
+		env.SetMemoryLockStrict(false)
+	} else {
+		fmt.Println("Memory lock not supported on this platform")
+	}
 }

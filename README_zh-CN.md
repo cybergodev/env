@@ -127,10 +127,49 @@ debug := env.GetBool("DEBUG", false)
 // 时间间隔
 timeout := env.GetDuration("TIMEOUT", 30*time.Second)
 
+// 浮点数（返回 float64）
+ratio := env.GetFloat64("RATIO", 0.5)
+
+// 无符号整数（返回 uint64）
+maxSize := env.GetUint64("MAX_SIZE", 1024)
+
 // 泛型切片: string, int, int64, uint, uint64, bool, float64, time.Duration
 hosts := env.GetSlice[string]("HOSTS", []string{"localhost"})
 ports := env.GetSlice[int]("PORTS", []int{8080})
 ```
+
+### 灵活键查找
+
+所有 `Get*` 方法均支持**不区分大小写**和**点号语法**的键解析，你可以用最符合代码风格的方式访问值：
+
+```go
+// 已知 .env: DEEPSEEK_KEY=sk-abc123
+
+// 不区分大小写查找（大写回退）
+env.GetString("DEEPSEEK_KEY")   // "sk-abc123" — 精确匹配
+env.GetString("deepseek_key")   // "sk-abc123" — 大写回退匹配
+env.GetString("DeepSeek_Key")   // "sk-abc123" — 大写回退匹配
+
+// 点号语法（点号 → 下划线，自动转大写）
+env.GetString("deepseek.key")   // "sk-abc123" — 解析为 DEEPSEEK_KEY
+env.GetString("db.host")        // 解析为 DB_HOST
+
+// 下划线与点号混用
+env.GetString("test_app.key")   // 解析为 TEST_APP_KEY
+
+// 适用于所有 Get* 方法
+env.GetInt("app.port")          // 解析为 APP_PORT
+env.GetBool("debug.mode")       // 解析为 DEBUG_MODE
+```
+
+**解析策略：**
+
+| 步骤 | 简单键（无点号） | 点号语法键 |
+|:-----|:----------------|:-----------|
+| 1 | 精确匹配 | 点号转下划线，转大写 → 查找 |
+| 2 | 大写回退 | （已在步骤 1 完成） |
+
+**最佳实践：** 在 `.env` 文件中使用 `UPPER_SNAKE_CASE`（大写下划线格式），确保所有查找方式均可正确工作。
 
 ### 结构体映射
 
@@ -513,6 +552,8 @@ cfg.AuditHandler = env.NewJSONAuditHandler(os.Stdout)
 | `GetInt(key, def...)` | 获取 `int64` 值 |
 | `GetBool(key, def...)` | 获取布尔值 |
 | `GetDuration(key, def...)` | 获取时间间隔值 |
+| `GetFloat64(key, def...)` | 获取 `float64` 值 |
+| `GetUint64(key, def...)` | 获取 `uint64` 值 |
 | `GetSlice[T](key, def...)` | 获取泛型切片 |
 | `GetSliceFrom[T](loader, key, def...)` | 从指定加载器获取切片 |
 | `Lookup(key)` | 获取值 + 存在性检查 |
@@ -533,7 +574,7 @@ cfg.AuditHandler = env.NewJSONAuditHandler(os.Stdout)
 | `New(cfg)` | 使用配置创建新加载器 |
 | `NewSecureValue(string)` | 从字符串创建 SecureValue |
 | `NewSecureValueStrict(string)` | 创建 SecureValue，锁定失败时返回错误 |
-| `ResetDefaultLoader()` | 重置单例（测试用） |
+| `ResetDefaultLoader()` | 重置单例（测试用，返回 error） |
 | `ClearBytes([]byte)` | 安全清零字节切片 |
 | `SetMemoryLockEnabled(bool)` | 启用/禁用内存锁定 |
 | `IsMemoryLockEnabled()` | 检查内存锁定是否启用 |
@@ -558,6 +599,8 @@ cfg.AuditHandler = env.NewJSONAuditHandler(os.Stdout)
 | `GetInt(key, def...)` | 获取 `int64` 值 |
 | `GetBool(key, def...)` | 获取布尔值 |
 | `GetDuration(key, def...)` | 获取时间间隔值 |
+| `GetFloat64(key, def...)` | 获取 `float64` 值 |
+| `GetUint64(key, def...)` | 获取 `uint64` 值 |
 | `Lookup(key)` | 获取值 + 存在性检查 |
 | `GetSecure(key)` | 获取敏感数据的 `SecureValue` |
 | `Keys()` | 获取所有键 |

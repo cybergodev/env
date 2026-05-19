@@ -12,64 +12,98 @@ import (
 
 // FileConfig controls file loading behavior.
 type FileConfig struct {
-	Filenames         []string // Files to load (default: [".env"])
-	FailOnMissingFile bool     // Return error if file doesn't exist
-	OverwriteExisting bool     // Overwrite existing environment variables
-	AutoApply         bool     // Auto-apply to os.Environ
+	// Filenames lists the files to load. Defaults to [".env"].
+	Filenames []string
+	// FailOnMissingFile causes LoadFiles to return an error when a file does not exist.
+	FailOnMissingFile bool
+	// OverwriteExisting allows overwriting environment variables that are already set.
+	OverwriteExisting bool
+	// AutoApply calls Apply automatically after loading files in New.
+	AutoApply bool
 }
 
 // ValidationConfig controls key and value validation.
 type ValidationConfig struct {
-	RequiredKeys   []string       // Require these keys to be present
-	AllowedKeys    []string       // Only allow these keys (empty = all allowed)
-	ForbiddenKeys  []string       // Always forbid these keys
-	KeyPattern     *regexp.Regexp // Pattern for valid keys (nil = default)
-	ValidateValues bool           // Validate values for security issues
-	ValidateUTF8   bool           // Validate that values are valid UTF-8
+	// RequiredKeys lists keys that must be present after loading. Validate returns ErrMissingRequired if any are missing.
+	RequiredKeys []string
+	// AllowedKeys restricts which keys are permitted. Empty means all keys are allowed.
+	AllowedKeys []string
+	// ForbiddenKeys lists keys that are always rejected. Set returns ErrForbiddenKey if any are present.
+	ForbiddenKeys []string
+	// KeyPattern is a custom regexp for validating key names. Nil uses DefaultKeyPattern.
+	KeyPattern *regexp.Regexp
+	// ValidateValues enables security validation of values (e.g., injection detection).
+	ValidateValues bool
+	// ValidateUTF8 enables validation that all values are valid UTF-8.
+	ValidateUTF8 bool
 }
 
 // LimitsConfig controls size and count limits for parsing.
 type LimitsConfig struct {
-	MaxFileSize       int64 // Maximum file size in bytes
-	MaxVariables      int   // Maximum variables per file
-	MaxLineLength     int   // Maximum line length
-	MaxKeyLength      int   // Maximum key length
-	MaxValueLength    int   // Maximum value length
-	MaxExpansionDepth int   // Maximum variable expansion depth
+	// MaxFileSize is the maximum allowed file size in bytes.
+	MaxFileSize int64
+	// MaxVariables is the maximum number of variables per file.
+	MaxVariables int
+	// MaxLineLength is the maximum allowed line length in bytes.
+	MaxLineLength int
+	// MaxKeyLength is the maximum allowed key length in bytes.
+	MaxKeyLength int
+	// MaxValueLength is the maximum allowed value length in bytes.
+	MaxValueLength int
+	// MaxExpansionDepth limits recursive variable expansion depth.
+	MaxExpansionDepth int
 }
 
 // JSONConfig controls JSON parsing behavior.
 type JSONConfig struct {
-	JSONNullAsEmpty    bool // Convert null to empty string
-	JSONNumberAsString bool // Convert numbers to strings
-	JSONBoolAsString   bool // Convert booleans to strings
-	JSONMaxDepth       int  // Maximum nesting depth
+	// JSONNullAsEmpty converts JSON null values to empty strings.
+	JSONNullAsEmpty bool
+	// JSONNumberAsString converts JSON numbers to strings instead of rejecting them.
+	JSONNumberAsString bool
+	// JSONBoolAsString converts JSON booleans to strings instead of rejecting them.
+	JSONBoolAsString bool
+	// JSONMaxDepth limits nesting depth for JSON objects. Must be between 1 and 100.
+	JSONMaxDepth int
 }
 
 // YAMLConfig controls YAML parsing behavior.
 type YAMLConfig struct {
-	YAMLNullAsEmpty    bool // Convert null/~ to empty string
-	YAMLNumberAsString bool // Convert numbers to strings
-	YAMLBoolAsString   bool // Convert booleans to strings
-	YAMLMaxDepth       int  // Maximum nesting depth
+	// YAMLNullAsEmpty converts YAML null/~ values to empty strings.
+	YAMLNullAsEmpty bool
+	// YAMLNumberAsString converts YAML numbers to strings instead of rejecting them.
+	YAMLNumberAsString bool
+	// YAMLBoolAsString converts YAML booleans to strings instead of rejecting them.
+	YAMLBoolAsString bool
+	// YAMLMaxDepth limits nesting depth for YAML mappings. Must be between 1 and 100.
+	YAMLMaxDepth int
 }
 
 // ParsingConfig controls general parsing behavior.
 type ParsingConfig struct {
-	AllowExportPrefix bool // Allow "export KEY=value" syntax
-	AllowYamlSyntax   bool // Allow YAML-style values in .env
-	ExpandVariables   bool // Expand ${VAR} references
+	// AllowExportPrefix allows the "export KEY=value" shell syntax in .env files.
+	AllowExportPrefix bool
+	// AllowYamlSyntax enables YAML-style values (lists, maps) in .env files.
+	AllowYamlSyntax bool
+	// ExpandVariables enables ${VAR} and $VAR expansion in values.
+	ExpandVariables bool
 }
 
 // ComponentConfig holds custom component implementations and advanced options.
 type ComponentConfig struct {
-	CustomValidator Validator        // Custom key/value validator
-	CustomExpander  VariableExpander // Custom variable expander
-	CustomAuditor   AuditLogger      // Custom audit logger
-	FileSystem      FileSystem       // Custom file system (for testing)
-	AuditHandler    AuditHandler     // Custom audit handler
-	AuditEnabled    bool             // Enable audit logging
-	Prefix          string           // Only process vars with this prefix
+	// CustomValidator replaces the built-in key/value validator. Nil uses the default.
+	CustomValidator Validator
+	// CustomExpander replaces the built-in variable expander. Nil uses the default.
+	CustomExpander VariableExpander
+	// CustomAuditor replaces the built-in audit logger. Nil uses the default.
+	CustomAuditor AuditLogger
+	// FileSystem overrides file system operations. Nil uses OSFileSystem. Useful for testing.
+	FileSystem FileSystem
+	// AuditHandler receives audit events when AuditEnabled is true.
+	AuditHandler AuditHandler
+	// AuditEnabled activates audit logging for all loader operations.
+	AuditEnabled bool
+	// Prefix restricts processing to environment variables that start with this prefix.
+	Prefix string
 }
 
 // ============================================================================
@@ -95,13 +129,20 @@ type ComponentConfig struct {
 //	cfg := env.DefaultConfig()
 //	cfg.FileConfig.Filenames = []string{".env"}
 type Config struct {
-	FileConfig       // File loading behavior
-	ValidationConfig // Key and value validation
-	LimitsConfig     // Size and count limits
-	JSONConfig       // JSON parsing options
-	YAMLConfig       // YAML parsing options
-	ParsingConfig    // General parsing behavior
-	ComponentConfig  // Custom components and advanced options
+	// FileConfig controls file loading behavior.
+	FileConfig
+	// ValidationConfig controls key and value validation rules.
+	ValidationConfig
+	// LimitsConfig controls size and count limits for parsing.
+	LimitsConfig
+	// JSONConfig controls JSON file parsing options.
+	JSONConfig
+	// YAMLConfig controls YAML file parsing options.
+	YAMLConfig
+	// ParsingConfig controls general parsing behavior for .env files.
+	ParsingConfig
+	// ComponentConfig holds custom components and advanced options.
+	ComponentConfig
 }
 
 // Validate validates the configuration and returns an error if invalid.

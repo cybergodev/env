@@ -26,6 +26,10 @@ func main() {
 
 	demonstrateDurationAccess()
 
+	demonstrateFloatAccess()
+
+	demonstrateUintAccess()
+
 	demonstrateSliceAccess()
 
 	demonstrateLookup()
@@ -90,19 +94,54 @@ func demonstrateDurationAccess() {
 	fmt.Printf("missing.duration (default): %v\n", missing)
 }
 
+func demonstrateFloatAccess() {
+	fmt.Println("\n=== Float Access ===")
+	// Float64 values
+	ratio := env.GetFloat64("cache.ratio", 0.5)
+	fmt.Printf("cache.ratio: %v\n", ratio)
+
+	// Missing key returns 0 or default
+	missing := env.GetFloat64("nonexistent", 3.14)
+	fmt.Printf("nonexistent (with default): %v\n", missing)
+}
+
+func demonstrateUintAccess() {
+	fmt.Println("\n=== Unsigned Integer Access ===")
+	// Uint64 values (useful for sizes, counters)
+	maxSize := env.GetUint64("cache.max_size", 1024)
+	fmt.Printf("cache.max_size: %d\n", maxSize)
+
+	// Missing key returns 0 or default
+	missing := env.GetUint64("nonexistent", 4096)
+	fmt.Printf("nonexistent (with default): %d\n", missing)
+}
+
 func demonstrateSliceAccess() {
 	fmt.Println("\n=== Slice Access ===")
 	// Indexed access (arrays in JSON/YAML)
 	host0 := env.GetString("cache.hosts.0")
 	fmt.Printf("cache.hosts.0: %q\n", host0)
 
-	// String slice from array
+	// String slice from array (global mode)
 	hosts := env.GetSlice[string]("cache.hosts")
 	fmt.Printf("cache.hosts: %v\n", hosts)
 
 	// Integer slice (default fallback when key not found)
 	ports := env.GetSlice[int]("nonexistent_ports", []int{8080, 8081})
 	fmt.Printf("nonexistent_ports (default): %v\n", ports)
+
+	// Instance mode slice access using GetSliceFrom
+	// GetSliceFrom reads indexed keys: TAGS_0, TAGS_1, TAGS_2, ...
+	loader, err := env.New(env.DefaultConfig())
+	if err != nil {
+		log.Fatalf("Failed to create loader: %v", err)
+	}
+	defer loader.Close()
+	loader.Set("TAGS_0", "alpha")
+	loader.Set("TAGS_1", "beta")
+	loader.Set("TAGS_2", "stable")
+	tags := env.GetSliceFrom[string](loader, "TAGS")
+	fmt.Printf("TAGS (instance mode): %v\n", tags)
 }
 
 func demonstrateLookup() {

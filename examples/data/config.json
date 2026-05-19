@@ -17,7 +17,9 @@
   "cache": {
     "enabled": true,
     "ttl": "5m",
-    "hosts": ["redis1:6379", "redis2:6379"]
+    "hosts": ["redis1:6379", "redis2:6379"],
+    "ratio": 0.85,
+    "max_size": 2048
   },
   "features": {
     "rate_limit": false,

@@ -3,6 +3,7 @@ package internal
 import (
 	"errors"
 	"fmt"
+	"strings"
 	"testing"
 )
 
@@ -688,5 +689,124 @@ func TestFlattenJSON_BracketArrayFormat(t *testing.T) {
 	}
 	if result["ITEMS[2]"] != "c" {
 		t.Errorf("ITEMS[2] = %q, want %q", result["ITEMS[2]"], "c")
+	}
+}
+
+func TestFlattenJSON_LongKeyWithBracketFormat(t *testing.T) {
+	cfg := JSONFlattenConfig{
+		KeyDelimiter:     "_",
+		ArrayIndexFormat: "bracket",
+		NullAsEmpty:      true,
+		NumberAsString:   true,
+		BoolAsString:     true,
+		MaxDepth:         10,
+	}
+
+	longKey := strings.Repeat("K", 70)
+	input := fmt.Sprintf(`{"%s": ["a", "b"]}`, longKey)
+	result, err := FlattenJSON([]byte(input), cfg)
+	if err != nil {
+		t.Fatalf("FlattenJSON() error = %v", err)
+	}
+
+	count := 0
+	for k, v := range result {
+		if !strings.Contains(k, "[") {
+			t.Errorf("expected bracket in key %q", k)
+		}
+		if v != "a" && v != "b" {
+			t.Errorf("unexpected value %q for key %q", v, k)
+		}
+		count++
+	}
+	if count != 2 {
+		t.Errorf("expected 2 items, got %d", count)
+	}
+}
+
+func TestFlattenJSON_LongKeyWithUnderscoreFormat(t *testing.T) {
+	cfg := JSONFlattenConfig{
+		KeyDelimiter:     "_",
+		ArrayIndexFormat: "underscore",
+		NullAsEmpty:      true,
+		NumberAsString:   true,
+		BoolAsString:     true,
+		MaxDepth:         10,
+	}
+
+	longKey := strings.Repeat("K", 70)
+	input := fmt.Sprintf(`{"%s": ["a"]}`, longKey)
+	result, err := FlattenJSON([]byte(input), cfg)
+	if err != nil {
+		t.Fatalf("FlattenJSON() error = %v", err)
+	}
+
+	if len(result) != 1 {
+		t.Errorf("expected 1 item, got %d", len(result))
+	}
+	for k := range result {
+		if len(k) < 70 {
+			t.Errorf("expected key length >= 70, got %d: %q", len(k), k)
+		}
+	}
+}
+
+func TestFlattenJSON_NullNotAsEmpty(t *testing.T) {
+	cfg := JSONFlattenConfig{
+		KeyDelimiter:     "_",
+		ArrayIndexFormat: "underscore",
+		NullAsEmpty:      false,
+		NumberAsString:   true,
+		BoolAsString:     true,
+		MaxDepth:         10,
+	}
+
+	input := `{"key": null}`
+	result, err := FlattenJSON([]byte(input), cfg)
+	if err != nil {
+		t.Fatalf("FlattenJSON() error = %v", err)
+	}
+	if result["KEY"] != "null" {
+		t.Errorf("KEY = %q, want %q", result["KEY"], "null")
+	}
+}
+
+func TestFlattenJSON_BoolNotAsString(t *testing.T) {
+	cfg := JSONFlattenConfig{
+		KeyDelimiter:     "_",
+		ArrayIndexFormat: "underscore",
+		NullAsEmpty:      true,
+		NumberAsString:   true,
+		BoolAsString:     false,
+		MaxDepth:         10,
+	}
+
+	input := `{"flag": true}`
+	result, err := FlattenJSON([]byte(input), cfg)
+	if err != nil {
+		t.Fatalf("FlattenJSON() error = %v", err)
+	}
+	if result["FLAG"] != "true" {
+		t.Errorf("FLAG = %q, want %q", result["FLAG"], "true")
+	}
+}
+
+func TestFlattenJSON_NumberNotAsString(t *testing.T) {
+	cfg := JSONFlattenConfig{
+		KeyDelimiter:     "_",
+		ArrayIndexFormat: "underscore",
+		NullAsEmpty:      true,
+		NumberAsString:   false,
+		BoolAsString:     true,
+		MaxDepth:         10,
+	}
+
+	input := `{"count": 42}`
+	result, err := FlattenJSON([]byte(input), cfg)
+	if err != nil {
+		t.Fatalf("FlattenJSON() error = %v", err)
+	}
+	if result["COUNT"] != "42" {
+		t.Errorf("COUNT = %q, want %q", result["COUNT"], "42")
 	}
 }

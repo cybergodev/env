@@ -2,6 +2,7 @@ package env
 
 import (
 	"errors"
+	"fmt"
 	"reflect"
 	"strconv"
 	"strings"
@@ -202,7 +203,7 @@ func parseFloat64(s string) (float64, error) {
 //
 //	// Struct to YAML format (sorted)
 //	yamlString, _ := env.Marshal(config, env.FormatYAML)
-func Marshal(data interface{}, format ...FileFormat) (string, error) {
+func Marshal(data any, format ...FileFormat) (string, error) {
 	f := FormatEnv
 	if len(format) > 0 {
 		f = format[0]
@@ -220,7 +221,7 @@ func Marshal(data interface{}, format ...FileFormat) (string, error) {
 
 // toMap converts input data to map[string]string.
 // Supports map[string]string and struct types.
-func toMap(data interface{}) (map[string]string, error) {
+func toMap(data any) (map[string]string, error) {
 	if data == nil {
 		return nil, &ValidationError{
 			Field:   "data",
@@ -427,7 +428,7 @@ type Unmarshaler interface {
 // MarshalStruct converts a struct to environment variables.
 // Struct fields can be tagged with `env:"KEY"` to specify the env variable name.
 // Nested structs are flattened with underscore-separated keys.
-func MarshalStruct(v interface{}) (map[string]string, error) {
+func MarshalStruct(v any) (map[string]string, error) {
 	// Check for Marshaler interface
 	if m, ok := v.(Marshaler); ok {
 		data, err := m.MarshalEnv()
@@ -460,7 +461,7 @@ func MarshalStruct(v interface{}) (map[string]string, error) {
 //
 //	// JSON format
 //	_ = env.UnmarshalStruct(`{"server": {"host": "localhost"}}`, &cfg, env.FormatJSON)
-func UnmarshalStruct(data string, v interface{}, format ...FileFormat) error {
+func UnmarshalStruct(data string, v any, format ...FileFormat) error {
 	m, err := UnmarshalMap(data, format...)
 	if err != nil {
 		return err
@@ -471,7 +472,7 @@ func UnmarshalStruct(data string, v interface{}, format ...FileFormat) error {
 // UnmarshalInto populates a struct from a map[string]string.
 // Struct fields can be tagged with `env:"KEY"` to specify the env variable name.
 // Optional `envDefault:"value"` sets a default if the key is not found.
-func UnmarshalInto(data map[string]string, v interface{}) error {
+func UnmarshalInto(data map[string]string, v any) error {
 	if v == nil {
 		return &ValidationError{
 			Field:   "value",
@@ -539,11 +540,8 @@ func parseSliceElement[T sliceElement](value string) (T, error) {
 		d, e := parseDuration(trimmed)
 		return any(d).(T), e
 	default:
-		return zero, &ValidationError{
-			Field:   "slice_element",
-			Value:   MaskSensitiveInString(value),
-			Message: "unsupported slice element type",
-		}
+		var zero T
+		return zero, fmt.Errorf("parseSliceElement: unsupported type %T", zero)
 	}
 }
 

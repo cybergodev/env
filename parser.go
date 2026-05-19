@@ -53,11 +53,10 @@ func putScannerBuffer(buf *[]byte) {
 
 // parser handles secure parsing of environment files.
 type parser struct {
-	config      Config
-	validator   Validator
-	auditor     FullAuditLogger
-	lineParser  *internal.LineParser
-	factory     *ComponentFactory
+	config     Config
+	validator  Validator
+	auditor    FullAuditLogger
+	lineParser *internal.LineParser
 }
 
 // Compile-time check that parser implements EnvParser.
@@ -107,7 +106,6 @@ func (p *parser) configure(cfg Config, factory *ComponentFactory) {
 	p.validator = validator
 	p.auditor = auditor
 	p.lineParser = lp
-	p.factory = factory
 }
 
 // Parse reads and parses environment variables from an io.Reader.
@@ -227,12 +225,6 @@ func (p *parser) Parse(r io.Reader, filename string) (map[string]string, error) 
 
 	_ = p.auditor.LogWithDuration(internal.ActionParse, "", "parsed: "+filename, true, time.Since(startTime))
 	return result, nil
-}
-
-// Close releases resources held by the parser.
-// Note: The parser does not own the ComponentFactory; it is managed by the caller.
-func (p *parser) Close() error {
-	return nil
 }
 
 // parseString parses environment variables from a string.

@@ -127,10 +127,49 @@ debug := env.GetBool("DEBUG", false)
 // Duration
 timeout := env.GetDuration("TIMEOUT", 30*time.Second)
 
+// Float (returns float64)
+ratio := env.GetFloat64("RATIO", 0.5)
+
+// Unsigned integer (returns uint64)
+maxSize := env.GetUint64("MAX_SIZE", 1024)
+
 // Generic slice: string, int, int64, uint, uint64, bool, float64, time.Duration
 hosts := env.GetSlice[string]("HOSTS", []string{"localhost"})
 ports := env.GetSlice[int]("PORTS", []int{8080})
 ```
+
+### Flexible Key Lookup
+
+All `Get*` methods support **case-insensitive** and **dot-notation** key resolution, so you can access values in the style that best fits your code:
+
+```go
+// Given .env: DEEPSEEK_KEY=sk-abc123
+
+// Case-insensitive lookup (uppercase fallback)
+env.GetString("DEEPSEEK_KEY")   // "sk-abc123" — exact match
+env.GetString("deepseek_key")   // "sk-abc123" — uppercase fallback
+env.GetString("DeepSeek_Key")   // "sk-abc123" — uppercase fallback
+
+// Dot notation (dot → underscore, auto-uppercased)
+env.GetString("deepseek.key")   // "sk-abc123" — resolves to DEEPSEEK_KEY
+env.GetString("db.host")        // resolves to DB_HOST
+
+// Mixed underscores and dots
+env.GetString("test_app.key")   // resolves to TEST_APP_KEY
+
+// Works with all Get* methods
+env.GetInt("app.port")          // resolves to APP_PORT
+env.GetBool("debug.mode")       // resolves to DEBUG_MODE
+```
+
+**Resolution strategy:**
+
+| Step | Simple key (no dots) | Dot-notation key |
+|:-----|:---------------------|:-----------------|
+| 1 | Exact match | Convert dots to underscores, uppercase → lookup |
+| 2 | Uppercase fallback | (done in step 1) |
+
+**Best practice:** Use `UPPER_SNAKE_CASE` in `.env` files. This ensures all lookup styles work correctly.
 
 ### Struct Mapping
 
@@ -513,6 +552,8 @@ cfg.AuditHandler = env.NewJSONAuditHandler(os.Stdout)
 | `GetInt(key, def...)` | Get `int64` value |
 | `GetBool(key, def...)` | Get boolean value |
 | `GetDuration(key, def...)` | Get duration value |
+| `GetFloat64(key, def...)` | Get `float64` value |
+| `GetUint64(key, def...)` | Get `uint64` value |
 | `GetSlice[T](key, def...)` | Get generic slice |
 | `GetSliceFrom[T](loader, key, def...)` | Get slice from specific loader |
 | `Lookup(key)` | Get value + existence check |
@@ -533,7 +574,7 @@ cfg.AuditHandler = env.NewJSONAuditHandler(os.Stdout)
 | `New(cfg)` | Create new loader with config |
 | `NewSecureValue(string)` | Create SecureValue from string |
 | `NewSecureValueStrict(string)` | Create SecureValue with error on lock failure |
-| `ResetDefaultLoader()` | Reset singleton (for testing) |
+| `ResetDefaultLoader()` | Reset singleton for testing (returns error) |
 | `ClearBytes([]byte)` | Securely zero byte slice |
 | `SetMemoryLockEnabled(bool)` | Enable/disable memory locking |
 | `IsMemoryLockEnabled()` | Check if memory locking is enabled |
@@ -558,6 +599,8 @@ cfg.AuditHandler = env.NewJSONAuditHandler(os.Stdout)
 | `GetInt(key, def...)` | Get `int64` value |
 | `GetBool(key, def...)` | Get boolean value |
 | `GetDuration(key, def...)` | Get duration value |
+| `GetFloat64(key, def...)` | Get `float64` value |
+| `GetUint64(key, def...)` | Get `uint64` value |
 | `Lookup(key)` | Get value + existence check |
 | `GetSecure(key)` | Get `SecureValue` for sensitive data |
 | `Keys()` | Get all keys |

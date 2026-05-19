@@ -466,20 +466,6 @@ func (sm *secureMap) getShard(key string) *secureMapShard {
 	return &sm.shards[hashKey(key)]
 }
 
-// exists checks whether a key exists and is not closed, without allocating a SecureValue.
-func (sm *secureMap) exists(key string) bool {
-	shard := sm.getShard(key)
-	shard.mu.RLock()
-	sv, ok := shard.values[key]
-	if !ok {
-		shard.mu.RUnlock()
-		return false
-	}
-	closed := sv.closed.Load()
-	shard.mu.RUnlock()
-	return !closed
-}
-
 // Set stores a value securely.
 // When overwriting an existing key, updates the SecureValue in-place when possible,
 // avoiding pool Get/Put overhead and reducing allocations.

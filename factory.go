@@ -1,4 +1,4 @@
-// Package env — Component Factory.
+// Component factory for the env package.
 //
 // This file implements ComponentFactory which creates and manages shared components
 // used by Loader and Parser. It provides a clean lifecycle for validator, auditor,
@@ -30,7 +30,6 @@ type ComponentFactory struct {
 	// Cached public-facing adapters (set once during construction)
 	cachedValidator Validator
 	cachedAuditor   FullAuditLogger
-	cachedExpander  VariableExpander
 }
 
 // Compile-time check that ComponentFactory implements io.Closer.
@@ -188,7 +187,6 @@ func (c *Config) buildComponentFactoryWithFS(fs FileSystem) *ComponentFactory {
 	// Pre-compute public-facing adapters once
 	factory.cachedValidator = factory.buildValidatorAdapter()
 	factory.cachedAuditor = factory.buildAuditorAdapter()
-	factory.cachedExpander = factory.expander
 
 	return factory
 }

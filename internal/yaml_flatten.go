@@ -5,7 +5,6 @@ import (
 	"encoding/json"
 	"fmt"
 	"strconv"
-	"strings"
 )
 
 // YAMLFlattenConfig holds configuration for YAML flattening.
@@ -79,7 +78,7 @@ func flattenYAMLValue(value *Value, prefix string, cfg YAMLFlattenConfig, result
 			return nil
 		}
 		// Check for inline JSON array or object
-		scalar := strings.TrimSpace(value.Scalar)
+		scalar := TrimSpace(value.Scalar)
 		if len(scalar) >= 2 {
 			if (scalar[0] == '[' && scalar[len(scalar)-1] == ']') ||
 				(scalar[0] == '{' && scalar[len(scalar)-1] == '}') {
@@ -123,20 +122,35 @@ func flattenYAMLValue(value *Value, prefix string, cfg YAMLFlattenConfig, result
 }
 
 // convertYAMLScalar converts a YAML scalar to a string based on configuration.
+// Uses zero-allocation byte-level comparisons instead of strings.ToLower/TrimSpace.
 func convertYAMLScalar(s string, cfg YAMLFlattenConfig) string {
-	// Handle null
-	lower := strings.ToLower(strings.TrimSpace(s))
-	if lower == "null" || s == "~" || s == "" {
+	// Trim whitespace without allocation (returns original if already trimmed)
+	s = TrimSpace(s)
+
+	// Handle null/empty using case-insensitive comparison without allocation
+	if len(s) == 0 {
+		if cfg.NullAsEmpty {
+			return ""
+		}
+		return "null"
+	}
+	if s == "~" || EqualFoldASCII(s, "null") {
 		if cfg.NullAsEmpty {
 			return ""
 		}
 		return "null"
 	}
 
-	// Handle boolean
-	if lower == "true" || lower == "false" {
+	// Handle boolean using case-insensitive comparison without allocation
+	if EqualFoldASCII(s, "true") {
 		if cfg.BoolAsString {
-			return lower
+			return "true"
+		}
+		return s
+	}
+	if EqualFoldASCII(s, "false") {
+		if cfg.BoolAsString {
+			return "false"
 		}
 		return s
 	}

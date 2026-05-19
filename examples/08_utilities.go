@@ -22,6 +22,8 @@ func main() {
 	demonstrateDelete()
 
 	demonstrateMasking()
+
+	demonstrateFormatDetection()
 }
 
 func demonstrateIntrospection() {
@@ -112,5 +114,14 @@ func demonstrateMasking() {
 			fmt.Printf("  %s = %s\n", key, value)
 		}
 		count++
+	}
+}
+
+func demonstrateFormatDetection() {
+	fmt.Println("\n=== Format Detection ===")
+	// DetectFormat identifies file format by extension
+	formats := []string{".env", "config.json", "settings.yaml", "app.yml", "unknown.txt"}
+	for _, filename := range formats {
+		fmt.Printf("%s → %s\n", filename, env.DetectFormat(filename))
 	}
 }

@@ -232,3 +232,106 @@ func TestInternKeyConsistency(t *testing.T) {
 		t.Errorf("InternKey(%q) = %q, want %q", newKey, interned, newKey)
 	}
 }
+
+func TestHasUpperPrefix(t *testing.T) {
+	tests := []struct {
+		s      string
+		prefix string
+		want   bool
+	}{
+		{"password_value", "PASS", true},
+		{"PASSWORD_VALUE", "PASS", true},
+		{"PassWord", "PASS", true},
+		{"other_value", "PASS", false},
+		{"pa", "PASS", false},
+		{"", "PASS", false},
+		{"value", "", true},
+		{"secret_key", "SEC", true},
+		{"SecretKey", "SEC", true},
+		{"_underscore", "_", true},
+		{"123numeric", "123", true},
+	}
+
+	for _, tt := range tests {
+		name := tt.s + "_" + tt.prefix
+		t.Run(name, func(t *testing.T) {
+			if got := HasUpperPrefix(tt.s, tt.prefix); got != tt.want {
+				t.Errorf("HasUpperPrefix(%q, %q) = %v, want %v", tt.s, tt.prefix, got, tt.want)
+			}
+		})
+	}
+}
+
+func TestEqualFoldASCII(t *testing.T) {
+	tests := []struct {
+		a, b string
+		want bool
+	}{
+		{"hello", "HELLO", true},
+		{"Hello", "hello", true},
+		{"ABC", "ABC", true},
+		{"abc", "abc", true},
+		{"abc", "abd", false},
+		{"abc", "ab", false},
+		{"", "", true},
+		{"a", "A", true},
+	}
+
+	for _, tt := range tests {
+		name := tt.a + "_" + tt.b
+		t.Run(name, func(t *testing.T) {
+			if got := EqualFoldASCII(tt.a, tt.b); got != tt.want {
+				t.Errorf("EqualFoldASCII(%q, %q) = %v, want %v", tt.a, tt.b, got, tt.want)
+			}
+		})
+	}
+}
+
+func TestInternKey_LongKey(t *testing.T) {
+	ClearInternCache()
+	longKey := strings.Repeat("X", maxInternKeyLen+1)
+	if got := InternKey(longKey); got != longKey {
+		t.Errorf("InternKey(long) = %q, want %q", got, longKey)
+	}
+}
+
+func TestToUpperASCII(t *testing.T) {
+	tests := []struct {
+		input string
+		want  string
+	}{
+		{"", ""},
+		{"abc", "ABC"},
+		{"ABC", "ABC"},
+		{"aBc123", "ABC123"},
+		{"already_UPPER", "ALREADY_UPPER"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.input, func(t *testing.T) {
+			if got := ToUpperASCII(tt.input); got != tt.want {
+				t.Errorf("ToUpperASCII(%q) = %q, want %q", tt.input, got, tt.want)
+			}
+		})
+	}
+}
+
+func TestTrimSpaceBytes(t *testing.T) {
+	tests := []struct {
+		input string
+		want  string
+	}{
+		{"", ""},
+		{"hello", "hello"},
+		{"  hello  ", "hello"},
+		{"\thello\t", "hello"},
+		{"\nhello\n", "hello"},
+		{"   ", ""},
+	}
+	for _, tt := range tests {
+		t.Run(tt.input, func(t *testing.T) {
+			if got := TrimSpaceBytes([]byte(tt.input)); got != tt.want {
+				t.Errorf("TrimSpaceBytes(%q) = %q, want %q", tt.input, got, tt.want)
+			}
+		})
+	}
+}
