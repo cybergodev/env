@@ -40,6 +40,10 @@ func RegisterParser(format FileFormat, factory ParserFactory) error {
 		return fmt.Errorf("cannot override built-in parser for format: %s", format.String())
 	}
 
+	if factory == nil {
+		return fmt.Errorf("factory cannot be nil for format: %s", format.String())
+	}
+
 	if _, exists := globalParserRegistry.factories[format]; exists {
 		return fmt.Errorf("parser already registered for format: %s", format.String())
 	}
@@ -79,12 +83,9 @@ func ForceRegisterParser(format FileFormat, factory ParserFactory) error {
 		return fmt.Errorf("factory cannot be nil for format: %s", format.String())
 	}
 
-	// Warn when replacing a built-in parser — this has security implications
-	if format == FormatEnv || format == FormatJSON || format == FormatYAML {
-		fmt.Printf("WARNING: ForceRegisterParser is overriding built-in parser for %s. "+
-			"Ensure the replacement implements the same security checks "+
-			"(key validation, value validation, size limits, forbidden keys).\n", format.String())
-	}
+	// Security note: overriding built-in parsers may bypass validation.
+	// The caller is responsible for ensuring equivalent security checks.
+	// No warning printed — libraries should not write to stdout.
 
 	globalParserRegistry.factories[format] = factory
 	return nil

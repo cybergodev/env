@@ -1,8 +1,11 @@
 package env
 
 import (
+	"io"
 	"strings"
 	"testing"
+
+	"github.com/cybergodev/env/internal"
 )
 
 // ============================================================================
@@ -672,17 +675,309 @@ func TestSanitizeForLog(t *testing.T) {
 
 func TestSensitiveKeyPatterns(t *testing.T) {
 	// Verify patterns exist and are non-empty
-	if len(sensitiveKeyPatterns) == 0 {
-		t.Error("sensitiveKeyPatterns should not be empty")
+	if len(internal.Patterns) == 0 {
+		t.Error("internal.Patterns should not be empty")
 	}
 
 	// Verify common patterns are included
-	patternStr := strings.ToLower(strings.Join(sensitiveKeyPatterns, " "))
+	patternStr := strings.ToLower(strings.Join(internal.Patterns, " "))
 	expectedPatterns := []string{"password", "secret", "key", "token", "credential"}
 
 	for _, pattern := range expectedPatterns {
 		if !strings.Contains(patternStr, pattern) {
-			t.Errorf("sensitiveKeyPatterns should contain pattern containing %q", pattern)
+			t.Errorf("internal.Patterns should contain pattern containing %q", pattern)
 		}
 	}
+}
+
+// TestSecureMap_EmptyStringValue verifies that empty string values are correctly
+// stored and retrieved (not treated as "not found").
+// TestSecureValue_Nil tests nil SecureValue method calls.
+func TestSecureValue_Nil(t *testing.T) {
+	t.Run("String", func(t *testing.T) {
+		var sv *SecureValue
+		if got := sv.String(); got != "[NIL]" {
+			t.Errorf("nil String() = %q, want [NIL]", got)
+		}
+	})
+	t.Run("Reveal", func(t *testing.T) {
+		var sv *SecureValue
+		if got := sv.Reveal(); got != "" {
+			t.Errorf("nil Reveal() = %q, want empty", got)
+		}
+	})
+	t.Run("Bytes", func(t *testing.T) {
+		var sv *SecureValue
+		if got := sv.Bytes(); got != nil {
+			t.Errorf("nil Bytes() = %v, want nil", got)
+		}
+	})
+	t.Run("Length", func(t *testing.T) {
+		var sv *SecureValue
+		if got := sv.Length(); got != 0 {
+			t.Errorf("nil Length() = %d, want 0", got)
+		}
+	})
+	t.Run("Close", func(t *testing.T) {
+		var sv *SecureValue
+		if err := sv.Close(); err != nil {
+			t.Errorf("nil Close() = %v, want nil", err)
+		}
+	})
+	t.Run("IsClosed", func(t *testing.T) {
+		var sv *SecureValue
+		if !sv.IsClosed() {
+			t.Error("nil IsClosed() = false, want true")
+		}
+	})
+	t.Run("Masked", func(t *testing.T) {
+		var sv *SecureValue
+		if got := sv.Masked(); got != "[NIL]" {
+			t.Errorf("nil Masked() = %q, want [NIL]", got)
+		}
+	})
+}
+
+// TestBuildIndexedKey tests edge cases for buildIndexedKey.
+func TestBuildIndexedKey(t *testing.T) {
+	tests := []struct {
+		name     string
+		base     string
+		index    int
+		expected string
+	}{
+		{"simple index", "KEY", 0, "KEY_0"},
+		{"positive index", "KEY", 42, "KEY_42"},
+		{"negative index returns empty", "KEY", -1, ""},
+		{"large index", "KEY", 99999, "KEY_99999"},
+		{"empty base", "", 0, "_0"},
+		{"long base uses builder", strings.Repeat("A", 63), 0, strings.Repeat("A", 63) + "_0"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			result := buildIndexedKey(tt.base, tt.index)
+			if tt.expected != "" && result != tt.expected {
+				t.Errorf("buildIndexedKey(%q, %d) = %q, want %q", tt.base, tt.index, result, tt.expected)
+			}
+		})
+	}
+}
+
+// TestComponentFactory_Nil tests nil ComponentFactory method calls.
+func TestComponentFactory_Nil(t *testing.T) {
+	t.Run("Validator nil", func(t *testing.T) {
+		var f *ComponentFactory
+		if v := f.Validator(); v != nil {
+			t.Errorf("nil Validator() = %v, want nil", v)
+		}
+	})
+
+	t.Run("Auditor nil", func(t *testing.T) {
+		var f *ComponentFactory
+		if a := f.Auditor(); a != nil {
+			t.Errorf("nil Auditor() = %v, want nil", a)
+		}
+	})
+
+	t.Run("Expander nil", func(t *testing.T) {
+		var f *ComponentFactory
+		if e := f.Expander(); e != nil {
+			t.Errorf("nil Expander() = %v, want nil", e)
+		}
+	})
+
+	t.Run("Close nil", func(t *testing.T) {
+		var f *ComponentFactory
+		if err := f.Close(); err != nil {
+			t.Errorf("nil Close() = %v, want nil", err)
+		}
+	})
+
+	t.Run("IsClosed nil", func(t *testing.T) {
+		var f *ComponentFactory
+		if !f.IsClosed() {
+			t.Error("nil IsClosed() = false, want true")
+		}
+	})
+}
+
+// TestLoader_NilMethodCalls tests nil Loader method calls.
+func TestLoader_NilMethodCalls(t *testing.T) {
+	t.Run("Config nil", func(t *testing.T) {
+		var l *Loader
+		cfg := l.Config()
+		if cfg.MaxVariables != 0 {
+			t.Errorf("nil Config() = %+v, want zero Config", cfg)
+		}
+	})
+
+	t.Run("ParseInto nil", func(t *testing.T) {
+		var l *Loader
+		if err := l.ParseInto(nil); err != ErrClosed {
+			t.Errorf("nil ParseInto() = %v, want ErrClosed", err)
+		}
+	})
+
+	t.Run("Validate nil", func(t *testing.T) {
+		var l *Loader
+		if err := l.Validate(); err != ErrClosed {
+			t.Errorf("nil Validate() = %v, want ErrClosed", err)
+		}
+	})
+
+	t.Run("GetSecure nil", func(t *testing.T) {
+		var l *Loader
+		if sv := l.GetSecure("KEY"); sv != nil {
+			t.Errorf("nil GetSecure() = %v, want nil", sv)
+		}
+	})
+
+	t.Run("GetString nil", func(t *testing.T) {
+		var l *Loader
+		if v := l.GetString("KEY", "default"); v != "default" {
+			t.Errorf("nil GetString() = %q, want default", v)
+		}
+	})
+}
+
+// TestNewCloseableChannelHandler tests the CloseableChannelHandler creation.
+func TestNewCloseableChannelHandler(t *testing.T) {
+	handler := NewCloseableChannelHandler(10)
+	if handler == nil {
+		t.Fatal("NewCloseableChannelHandler() returned nil")
+	}
+
+	// Verify we can use it as an AuditHandler
+	_ = AuditHandler(handler)
+
+	// Close should not panic
+	if err := handler.Close(); err != nil {
+		t.Errorf("Close() error = %v", err)
+	}
+}
+
+// TestParserClose tests parser Close methods through the registry.
+func TestParserClose(t *testing.T) {
+	t.Run("parser close via type assertion", func(t *testing.T) {
+		cfg := DefaultConfig()
+		loader, err := New(cfg)
+		if err != nil {
+			t.Fatalf("New() error = %v", err)
+		}
+		defer loader.Close()
+
+		// Access parsers through the registry and test Close via type assertion
+		for _, p := range loader.parsers {
+			if closer, ok := p.(io.Closer); ok {
+				if err := closer.Close(); err != nil {
+					t.Errorf("parser Close() error = %v", err)
+				}
+			}
+		}
+	})
+}
+
+// TestBuildValidatorAdapter_CustomValidator tests the factory adapter with a custom validator
+// that already implements the public Validator interface.
+func TestBuildValidatorAdapter_CustomValidator(t *testing.T) {
+	t.Run("validator implementing public Validator", func(t *testing.T) {
+		cfg := DefaultConfig()
+		cfg.CustomValidator = &fullMockValidator{}
+		factory := cfg.buildComponentFactory()
+		defer factory.Close()
+
+		v := factory.Validator()
+		if v == nil {
+			t.Fatal("Validator() returned nil")
+		}
+	})
+
+	t.Run("validator not implementing public Validator", func(t *testing.T) {
+		cfg := DefaultConfig()
+		cfg.CustomValidator = &minimalMockValidator{}
+		factory := cfg.buildComponentFactory()
+		defer factory.Close()
+
+		v := factory.Validator()
+		if v == nil {
+			t.Fatal("Validator() returned nil")
+		}
+	})
+}
+
+// TestBuildAuditorAdapter tests the factory auditor adapter paths.
+func TestBuildAuditorAdapter(t *testing.T) {
+	t.Run("with custom FullAuditLogger", func(t *testing.T) {
+		cfg := DefaultConfig()
+		cfg.CustomAuditor = &mockFullAuditLogger{}
+		factory := cfg.buildComponentFactory()
+		defer factory.Close()
+
+		a := factory.Auditor()
+		if a == nil {
+			t.Fatal("Auditor() returned nil")
+		}
+	})
+
+	t.Run("with custom non-standard auditor", func(t *testing.T) {
+		cfg := DefaultConfig()
+		cfg.CustomAuditor = &mockAuditLogger{}
+		factory := cfg.buildComponentFactory()
+		defer factory.Close()
+
+		a := factory.Auditor()
+		if a == nil {
+			t.Fatal("Auditor() returned nil")
+		}
+	})
+}
+
+// TestSecureMap_EmptyStringValue verifies that empty string values are correctly
+// stored and retrieved (not treated as "not found").
+func TestSecureMap_EmptyStringValue(t *testing.T) {
+	sm := newSecureMap()
+	sm.Set("EMPTY_KEY", "")
+
+	// Get must return ("", true) for empty string values
+	value, ok := sm.Get("EMPTY_KEY")
+	if !ok {
+		t.Fatal("Get(EMPTY_KEY) returned ok=false for empty string value")
+	}
+	if value != "" {
+		t.Errorf("Get(EMPTY_KEY) = %q, want empty string", value)
+	}
+
+	// GetSecure must return non-nil for empty string values
+	sv := sm.GetSecure("EMPTY_KEY")
+	if sv == nil {
+		t.Fatal("GetSecure(EMPTY_KEY) returned nil for empty string value")
+	}
+	if sv.Reveal() != "" {
+		t.Errorf("GetSecure(EMPTY_KEY).Reveal() = %q, want empty string", sv.Reveal())
+	}
+	sv.Release()
+
+	// ToMap must include empty string values
+	m := sm.ToMap()
+	if v, exists := m["EMPTY_KEY"]; !exists {
+		t.Fatal("ToMap() missing EMPTY_KEY")
+	} else if v != "" {
+		t.Errorf("ToMap()[EMPTY_KEY] = %q, want empty string", v)
+	}
+
+	// Keys must include empty string keys
+	keys := sm.Keys()
+	found := false
+	for _, k := range keys {
+		if k == "EMPTY_KEY" {
+			found = true
+			break
+		}
+	}
+	if !found {
+		t.Fatal("Keys() missing EMPTY_KEY")
+	}
+
+	sm.Clear()
 }

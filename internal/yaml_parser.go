@@ -3,6 +3,7 @@ package internal
 
 import (
 	"fmt"
+	"sync"
 )
 
 // ValueType represents the type of a YAML value.
@@ -27,34 +28,50 @@ type Value struct {
 	Column int
 }
 
-// NewScalarValue creates a new scalar value.
+// valuePool pools *Value nodes to reduce allocation pressure during YAML parsing.
+var valuePool = sync.Pool{
+	New: func() any {
+		return &Value{}
+	},
+}
+
+// NewScalarValue creates a new scalar value (from pool).
 func NewScalarValue(s string, line, col int) *Value {
-	return &Value{
-		Type:   ValueTypeScalar,
-		Scalar: s,
-		Line:   line,
-		Column: col,
-	}
+	v := valuePool.Get().(*Value)
+	v.Type = ValueTypeScalar
+	v.Scalar = s
+	v.Line = line
+	v.Column = col
+	return v
 }
 
-// NewMapValue creates a new map value with pre-allocated capacity.
+// NewMapValue creates a new map value with pre-allocated capacity (from pool).
 func NewMapValue(line, col int) *Value {
-	return &Value{
-		Type:   ValueTypeMap,
-		Map:    make(map[string]*Value, 8), // Pre-allocate with reasonable capacity
-		Line:   line,
-		Column: col,
+	v := valuePool.Get().(*Value)
+	v.Type = ValueTypeMap
+	if v.Map == nil {
+		v.Map = make(map[string]*Value, 8)
+	} else {
+		// Reuse existing map after clearing
+		clear(v.Map)
 	}
+	v.Line = line
+	v.Column = col
+	return v
 }
 
-// NewArrayValue creates a new array value with pre-allocated capacity.
+// NewArrayValue creates a new array value with pre-allocated capacity (from pool).
 func NewArrayValue(line, col int) *Value {
-	return &Value{
-		Type:   ValueTypeArray,
-		Array:  make([]*Value, 0, 4), // Pre-allocate with reasonable capacity
-		Line:   line,
-		Column: col,
+	v := valuePool.Get().(*Value)
+	v.Type = ValueTypeArray
+	if v.Array == nil {
+		v.Array = make([]*Value, 0, 4)
+	} else {
+		v.Array = v.Array[:0]
 	}
+	v.Line = line
+	v.Column = col
+	return v
 }
 
 // Parser parses YAML tokens into a Value tree.
@@ -142,9 +159,6 @@ func (p *Parser) parseMap(depth, expectedIndent int) (*Value, error) {
 		if p.current().Type == TokenKey {
 			key := p.current().Value
 			p.advance()
-
-			// Skip colon and whitespace
-			p.skipColon()
 
 			// Skip newlines after colon
 			p.skipNewlines()
@@ -248,10 +262,16 @@ func (p *Parser) parseNestedValue(depth, expectedIndent int) (*Value, error) {
 		p.advance()
 	}
 
-	// Skip comments and try again
-	if p.current().Type == TokenComment {
+	// Skip comments iteratively (not recursively to avoid stack overflow
+	// on pathological input with many consecutive comments).
+	// After each comment, re-skip newlines and indents since the recursive
+	// version would re-enter the function and handle those.
+	for p.current().Type == TokenComment {
 		p.advance()
-		return p.parseNestedValue(depth, expectedIndent)
+		p.skipNewlines()
+		if p.current().Type == TokenIndent {
+			p.advance()
+		}
 	}
 
 	// Check what follows
@@ -313,9 +333,6 @@ func (p *Parser) parseArray(depth, expectedIndent int) (*Value, error) {
 		// Check for dash (array item)
 		if p.current().Type == TokenDash {
 			p.advance()
-
-			// Skip whitespace after dash
-			p.skipSpaces()
 
 			var value *Value
 			var err error
@@ -407,16 +424,6 @@ func (p *Parser) skipNewlines() {
 	}
 }
 
-// skipSpaces skips space tokens (not newlines).
-func (p *Parser) skipSpaces() {
-	// Spaces are handled in lexer, nothing to skip here
-}
-
-// skipColon skips a colon token if present.
-func (p *Parser) skipColon() {
-	// Colons are consumed during key scanning
-}
-
 // skipDocumentStarts skips document start markers.
 func (p *Parser) skipDocumentStarts() {
 	for !p.isEOF() && p.current().Type == TokenDocumentStart {
@@ -424,10 +431,37 @@ func (p *Parser) skipDocumentStarts() {
 	}
 }
 
+// ReleaseValue recursively returns a Value tree to the pool.
+// After calling this, the Value and all its children must not be accessed.
+func ReleaseValue(v *Value) {
+	if v == nil {
+		return
+	}
+	switch v.Type {
+	case ValueTypeMap:
+		for key, child := range v.Map {
+			ReleaseValue(child)
+			delete(v.Map, key)
+		}
+		v.Map = nil
+	case ValueTypeArray:
+		for _, child := range v.Array {
+			ReleaseValue(child)
+		}
+		v.Array = nil
+	}
+	v.Scalar = ""
+	v.Type = ValueTypeScalar
+	valuePool.Put(v)
+}
+
 // ParseYAML parses YAML input and returns a Value tree.
+// The caller MUST call ReleaseValue on the returned tree when done
+// to return nodes to the pool and prevent memory growth.
 func ParseYAML(data []byte, maxDepth int) (*Value, error) {
 	lexer := NewYAMLLexer(string(data))
 	tokens, err := lexer.Tokenize()
+	lexer.release()
 	if err != nil {
 		return nil, err
 	}

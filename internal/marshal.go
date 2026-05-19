@@ -38,8 +38,9 @@ func marshalStruct(v interface{}, prefix string) (map[string]string, error) {
 		}
 	}
 
-	result := make(map[string]string)
+	// Pre-allocate result map based on struct field count as a lower bound estimate
 	typ := val.Type()
+	result := make(map[string]string, val.NumField())
 
 	for i := 0; i < val.NumField(); i++ {
 		field := val.Field(i)
@@ -62,7 +63,7 @@ func marshalStruct(v interface{}, prefix string) (map[string]string, error) {
 			key = ToUpperASCII(fieldType.Name)
 		}
 		if prefix != "" {
-			key = prefix + "_" + key
+			key = buildPrefixedKey(prefix, key)
 		}
 
 		// Handle nested structs
@@ -178,14 +179,12 @@ func StructInto(data map[string]string, val reflect.Value, prefix string) error 
 		}
 
 		// For non-struct fields, add prefix if parent passed one
-		// When prefix is set (from parent's env tag), combine with field's key
-		// When prefix is empty (parent has no env tag), use field's key directly
 		if prefix != "" {
-			key = prefix + "_" + key
+			key = buildPrefixedKey(prefix, key)
 		}
 
-		// Gets value from data
-		value, ok := data[key]
+		// Gets value from data using case-insensitive and dot-notation resolution
+		value, ok := LookupInMap(data, key)
 		if !ok {
 			if defaultVal != "" {
 				value = defaultVal
@@ -406,4 +405,22 @@ func setSliceValue(field reflect.Value, value string) error {
 
 	field.Set(slice)
 	return nil
+}
+
+// buildPrefixedKey joins prefix and key with underscore.
+// Uses stack-allocated buffer for short keys to avoid heap allocation.
+func buildPrefixedKey(prefix, key string) string {
+	if prefix == "" {
+		return key
+	}
+	totalLen := len(prefix) + 1 + len(key)
+	if totalLen <= 64 {
+		var buf [64]byte
+		n := copy(buf[:], prefix)
+		buf[n] = '_'
+		n++
+		n += copy(buf[n:], key)
+		return string(buf[:n])
+	}
+	return prefix + "_" + key
 }

@@ -1,7 +1,7 @@
 # Env - High-Performance Go Environment Variable Library
 
 [![Go Reference](https://pkg.go.dev/badge/github.com/cybergodev/env.svg)](https://pkg.go.dev/github.com/cybergodev/env)
-[![Go Version](https://img.shields.io/badge/Go-1.24+-00ADD8?style=flat&logo=go)](https://go.dev/)
+[![Go Version](https://img.shields.io/badge/Go-1.25+-00ADD8?style=flat&logo=go)](https://go.dev/)
 [![License: MIT](https://img.shields.io/badge/license-MIT-green.svg)](LICENSE)
 [![Security Policy](https://img.shields.io/badge/security-policy-blue.svg)](docs/SECURITY.md)
 [![Thread Safe](https://img.shields.io/badge/thread%20safe-%E2%9C%93-brightgreen.svg)](docs/CONCURRENCY_SAFETY.md)
@@ -36,7 +36,7 @@
 go get github.com/cybergodev/env
 ```
 
-**Requirements:** Go 1.24+
+**Requirements:** Go 1.25+
 
 ---
 
@@ -127,10 +127,49 @@ debug := env.GetBool("DEBUG", false)
 // Duration
 timeout := env.GetDuration("TIMEOUT", 30*time.Second)
 
+// Float (returns float64)
+ratio := env.GetFloat64("RATIO", 0.5)
+
+// Unsigned integer (returns uint64)
+maxSize := env.GetUint64("MAX_SIZE", 1024)
+
 // Generic slice: string, int, int64, uint, uint64, bool, float64, time.Duration
 hosts := env.GetSlice[string]("HOSTS", []string{"localhost"})
 ports := env.GetSlice[int]("PORTS", []int{8080})
 ```
+
+### Flexible Key Lookup
+
+All `Get*` methods support **case-insensitive** and **dot-notation** key resolution, so you can access values in the style that best fits your code:
+
+```go
+// Given .env: DEEPSEEK_KEY=sk-abc123
+
+// Case-insensitive lookup (uppercase fallback)
+env.GetString("DEEPSEEK_KEY")   // "sk-abc123" — exact match
+env.GetString("deepseek_key")   // "sk-abc123" — uppercase fallback
+env.GetString("DeepSeek_Key")   // "sk-abc123" — uppercase fallback
+
+// Dot notation (dot → underscore, auto-uppercased)
+env.GetString("deepseek.key")   // "sk-abc123" — resolves to DEEPSEEK_KEY
+env.GetString("db.host")        // resolves to DB_HOST
+
+// Mixed underscores and dots
+env.GetString("test_app.key")   // resolves to TEST_APP_KEY
+
+// Works with all Get* methods
+env.GetInt("app.port")          // resolves to APP_PORT
+env.GetBool("debug.mode")       // resolves to DEBUG_MODE
+```
+
+**Resolution strategy:**
+
+| Step | Simple key (no dots) | Dot-notation key |
+|:-----|:---------------------|:-----------------|
+| 1 | Exact match | Convert dots to underscores, uppercase → lookup |
+| 2 | Uppercase fallback | (done in step 1) |
+
+**Best practice:** Use `UPPER_SNAKE_CASE` in `.env` files. This ensures all lookup styles work correctly.
 
 ### Struct Mapping
 
@@ -164,10 +203,14 @@ if err != nil {
 defer loader.Close()
 
 // Load additional files
-loader.LoadFiles("override.env")
+if err := loader.LoadFiles("override.env"); err != nil {
+    log.Fatal(err)
+}
 
 // Apply to os.Environ
-loader.Apply()
+if err := loader.Apply(); err != nil {
+    log.Fatal(err)
+}
 
 // Access values
 port := loader.GetInt("PORT", 8080)
@@ -281,11 +324,12 @@ sv := env.GetSecure("API_KEY")
 if sv != nil {
     defer sv.Release()
 
-    // Safe logging
+    // Safe logging (String() returns masked representation)
+    fmt.Println(sv)                // [SECURE:32 bytes]
     fmt.Println(sv.Masked())       // [SECURE:32 bytes]
 
-    // Access actual value
-    value := sv.String()
+    // Access actual value (use with caution!)
+    value := sv.Reveal()
 
     // Get bytes (caller must clean up)
     data := sv.Bytes()
@@ -308,14 +352,16 @@ defer secret.Release()
 
 | Method | Description |
 |:-------|:------------|
-| `String()` | Get string value |
+| `String()` | Get masked representation (safe for `fmt.Printf`, logging) |
+| `Reveal()` | Get plaintext value (**use with caution!**) |
 | `Bytes()` | Get byte slice copy (caller must clean up) |
-| `Length()` | Get value length |
+| `Length()` | Get value length without exposing it |
 | `Masked()` | Get masked representation for logging |
 | `Close()` | Zero memory, don't return to pool |
 | `Release()` | Zero memory and return to pool |
 | `IsClosed()` | Check if closed |
 | `IsMemoryLocked()` | Check if memory is protected from swap |
+| `MemoryLockError()` | Get error from memory locking attempt |
 
 ---
 
@@ -333,10 +379,11 @@ loader, _ := env.New(cfg)
 **Built-in Handlers:**
 
 ```go
-env.NewJSONAuditHandler(w)      // JSON format → io.Writer
-env.NewLogAuditHandler(logger)  // Standard log.Logger
-env.NewChannelAuditHandler(ch)  // Channel (external processing)
-env.NewNopAuditHandler()        // No-op (discard)
+env.NewJSONAuditHandler(w)              // JSON format → io.Writer
+env.NewLogAuditHandler(logger)          // Standard log.Logger
+env.NewChannelAuditHandler(ch)          // Channel (external processing)
+env.NewCloseableChannelHandler(size)    // Owned buffered channel with lifecycle
+env.NewNopAuditHandler()                // No-op (discard)
 ```
 
 ---
@@ -429,40 +476,56 @@ env.ProductionConfig()  // Strict security + audit
 ```go
 cfg := env.DefaultConfig()
 
-// === File Handling ===
+// === File Handling (FileConfig) ===
 cfg.Filenames         = []string{".env"}
 cfg.FailOnMissingFile = false
 cfg.OverwriteExisting = true
 cfg.AutoApply         = true
 
-// === Validation ===
+// === Validation (ValidationConfig) ===
 cfg.RequiredKeys   = []string{"DB_URL"}
 cfg.AllowedKeys    = []string{"PORT", "DEBUG"}  // Empty = allow all
 cfg.ForbiddenKeys  = []string{"PATH"}           // Block dangerous keys
-
-// === Security Limits ===
-cfg.MaxFileSize    = 2 << 20   // 2 MB
-cfg.MaxVariables   = 500
 cfg.ValidateValues = true
+cfg.ValidateUTF8   = true
 
-// === Parsing Options ===
+// === Security Limits (LimitsConfig) ===
+cfg.MaxFileSize       = 2 << 20   // 2 MB
+cfg.MaxVariables      = 500
 cfg.MaxLineLength     = 1024
 cfg.MaxKeyLength      = 64
 cfg.MaxValueLength    = 4096
 cfg.MaxExpansionDepth = 5
 
-// === JSON/YAML Options ===
-cfg.JSONNullAsEmpty = true
-cfg.YAMLNullAsEmpty = true
+// === Parsing (ParsingConfig) ===
+cfg.AllowExportPrefix = true    // Allow "export KEY=value"
+cfg.AllowYamlSyntax   = false   // YAML-style values in .env
+cfg.ExpandVariables   = true    // Expand ${VAR} references
 
-// === Advanced Options ===
+// === JSON Options (JSONConfig) ===
+cfg.JSONNullAsEmpty    = true
+cfg.JSONNumberAsString = true
+cfg.JSONBoolAsString   = true
+cfg.JSONMaxDepth       = 10
+
+// === YAML Options (YAMLConfig) ===
+cfg.YAMLNullAsEmpty    = true
+cfg.YAMLNumberAsString = true
+cfg.YAMLBoolAsString   = true
+cfg.YAMLMaxDepth       = 10
+
+// === Advanced (ComponentConfig) ===
 cfg.Prefix     = "APP_"      // Only load keys with prefix
 cfg.FileSystem = nil         // nil = OS filesystem
 
-// === Audit Logging ===
+// === Audit Logging (ComponentConfig) ===
 cfg.AuditEnabled = true
 cfg.AuditHandler = env.NewJSONAuditHandler(os.Stdout)
 ```
+
+> **Note:** Config uses nested structs (`FileConfig`, `ValidationConfig`, `LimitsConfig`,
+> `JSONConfig`, `YAMLConfig`, `ParsingConfig`, `ComponentConfig`) with field promotion.
+> You can access fields directly (`cfg.Filenames`) or explicitly (`cfg.FileConfig.Filenames`).
 
 ### Default Limits
 
@@ -489,6 +552,8 @@ cfg.AuditHandler = env.NewJSONAuditHandler(os.Stdout)
 | `GetInt(key, def...)` | Get `int64` value |
 | `GetBool(key, def...)` | Get boolean value |
 | `GetDuration(key, def...)` | Get duration value |
+| `GetFloat64(key, def...)` | Get `float64` value |
+| `GetUint64(key, def...)` | Get `uint64` value |
 | `GetSlice[T](key, def...)` | Get generic slice |
 | `GetSliceFrom[T](loader, key, def...)` | Get slice from specific loader |
 | `Lookup(key)` | Get value + existence check |
@@ -505,10 +570,11 @@ cfg.AuditHandler = env.NewJSONAuditHandler(os.Stdout)
 | `UnmarshalStruct(string, &struct, format?)` | Parse string to struct |
 | `UnmarshalInto(map, &struct)` | Populate struct from map |
 | `MarshalStruct(struct)` | Convert struct to map |
+| `IsMarshalError(err)` | Check if error is a marshal error |
 | `New(cfg)` | Create new loader with config |
 | `NewSecureValue(string)` | Create SecureValue from string |
 | `NewSecureValueStrict(string)` | Create SecureValue with error on lock failure |
-| `ResetDefaultLoader()` | Reset singleton (for testing) |
+| `ResetDefaultLoader()` | Reset singleton for testing (returns error) |
 | `ClearBytes([]byte)` | Securely zero byte slice |
 | `SetMemoryLockEnabled(bool)` | Enable/disable memory locking |
 | `IsMemoryLockEnabled()` | Check if memory locking is enabled |
@@ -517,20 +583,43 @@ cfg.AuditHandler = env.NewJSONAuditHandler(os.Stdout)
 | `IsMemoryLockSupported()` | Check if platform supports memory locking |
 | `RegisterParser(format, factory)` | Register custom parser |
 | `ForceRegisterParser(format, factory)` | Override built-in parser |
-| `MaskSensitiveInString(string)` | Mask sensitive content in string |
+| `DetectFormat(filename)` | Detect file format from extension |
+| `IsSensitiveKey(key)` | Check if key suggests sensitive data |
+| `MaskValue(key, value)` | Mask value based on key sensitivity |
+| `MaskKey(key)` | Mask key name for logging |
+| `SanitizeForLog(s)` | Remove sensitive info from string |
+| `MaskSensitiveInString(s)` | Mask sensitive content in string |
 
 ### Loader Methods
 
 | Method | Description |
 |:-------|:------------|
-| `LoadFiles(files...)` | Load files into loader |
-| `Apply()` | Apply to `os.Environ` |
-| `Validate()` | Validate required keys |
+| **Access** | |
+| `GetString(key, def...)` | Get string value |
+| `GetInt(key, def...)` | Get `int64` value |
+| `GetBool(key, def...)` | Get boolean value |
+| `GetDuration(key, def...)` | Get duration value |
+| `GetFloat64(key, def...)` | Get `float64` value |
+| `GetUint64(key, def...)` | Get `uint64` value |
+| `Lookup(key)` | Get value + existence check |
+| `GetSecure(key)` | Get `SecureValue` for sensitive data |
+| `Keys()` | Get all keys |
+| `All()` | Get all variables as map |
+| `Len()` | Get variable count |
+| **Mutation** | |
+| `Set(key, value)` | Set value (returns error) |
+| `Delete(key)` | Delete key (returns error) |
+| **File & Lifecycle** | |
+| `LoadFiles(files...)` | Load files into loader (returns error) |
+| `Apply()` | Apply to `os.Environ` (returns error) |
+| `ParseInto(&struct)` | Populate struct from env vars |
+| `Validate()` | Validate required keys (returns error) |
 | `Close()` | Close and cleanup resources |
+| **Status** | |
 | `IsApplied()` | Check if applied to os.Environ |
 | `IsClosed()` | Check if closed |
 | `LoadTime()` | Get last load time |
-| `Config()` | Get loader configuration |
+| `Config()` | Get loader configuration (read-only) |
 
 ---
 

@@ -70,6 +70,11 @@ var defaultForbiddenKeys = map[string]bool{
 	"PYTHONPATH":            true,
 	"RUBYLIB":               true,
 	"NODE_PATH":             true,
+	// Windows-specific injection vectors
+	"COMSPEC":               true,
+	"PATHEXT":               true,
+	"SYSTEMROOT":            true,
+	"WINDIR":                true,
 }
 
 // defaultForbiddenKeysSlice is a pre-computed slice of defaultForbiddenKeys.

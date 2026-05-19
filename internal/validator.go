@@ -202,7 +202,9 @@ func stringToBytesSafe(s string) []byte {
 // Index 0-31: control characters (0x00-0x1F)
 // Index 127: DEL character (0x7F)
 // Allowed characters are marked as 0, invalid as 1.
-// Allowed control chars: \t (9), \n (10), \r (13)
+// badCharTable[i] == 1 means byte i is disallowed in values.
+// Entries 0x00-0x08, 0x0B-0x0C, 0x0E-0x1F, 0x7F are set to 1 (disallowed).
+// All other entries are 0 (allowed) by Go's zero-initialization.
 var badCharTable = [256]byte{
 	// 0x00-0x08: control chars (invalid)
 	1, 1, 1, 1, 1, 1, 1, 1, 1,
@@ -216,17 +218,8 @@ var badCharTable = [256]byte{
 	0,
 	// 0x0E-0x1F: control chars (invalid)
 	1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1,
-	// 0x20-0x7E: printable ASCII (95 chars, all allowed - zeros by default)
-	// Note: We explicitly list these for clarity, though Go would zero-initialize them
-	0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, // 0x20-0x2F
-	0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, // 0x30-0x3F
-	0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, // 0x40-0x4F
-	0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, // 0x50-0x5F
-	0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, // 0x60-0x6F
-	0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, // 0x70-0x7E
 	// 0x7F: DEL (invalid)
-	1,
-	// 0x80-0xFF: high bytes (zeros by default, not validated)
+	127: 1,
 }
 
 // validateValueChars checks for invalid characters using a lookup table.
@@ -334,7 +327,7 @@ func (v *Validator) ValidateRequired(keys map[string]bool) error {
 		return nil
 	}
 
-	missing := make([]string, 0)
+	missing := make([]string, 0, len(v.requiredKeys))
 	for reqKey := range v.requiredKeys {
 		if !keys[reqKey] {
 			missing = append(missing, reqKey)
@@ -366,10 +359,10 @@ func (v *Validator) ShouldMask(key string) bool {
 // MaskValue masks a value for logging purposes.
 func (v *Validator) MaskValue(key, value string) string {
 	if !v.ShouldMask(key) {
-		if len(value) <= 20 {
+		if len(value) <= maxValueDisplayLen {
 			return value
 		}
-		return value[:17] + "..."
+		return value[:maxValueDisplayLen-3] + "..."
 	}
 	// For sensitive values, show only length
 	return fmt.Sprintf("[MASKED:%d chars]", len(value))

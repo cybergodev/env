@@ -4,7 +4,6 @@ import (
 	"bytes"
 	"fmt"
 	"os"
-	"path/filepath"
 	"strings"
 	"testing"
 
@@ -41,17 +40,6 @@ func generateEnvContentWithExpansion(numVars int) string {
 		}
 	}
 	return sb.String()
-}
-
-// createTempEnvFile creates a temporary .env file and returns its path.
-func createTempEnvFile(b *testing.B, content string) string {
-	b.Helper()
-	tmpDir := b.TempDir()
-	path := filepath.Join(tmpDir, ".env")
-	if err := os.WriteFile(path, []byte(content), 0600); err != nil {
-		b.Fatalf("Failed to create temp file: %v", err)
-	}
-	return path
 }
 
 // ============================================================================
@@ -149,17 +137,19 @@ func BenchmarkLoader_LoadFiles_Small(b *testing.B) {
 	content := generateEnvContent(10)
 	cfg := DefaultConfig()
 
+	const benchFile = "bench_loader_small.env"
+	if err := os.WriteFile(benchFile, []byte(content), 0600); err != nil {
+		b.Fatal(err)
+	}
+	defer os.Remove(benchFile)
+
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
-		b.StopTimer()
-		path := createTempEnvFile(b, content)
 		loader, err := New(cfg)
 		if err != nil {
 			b.Fatal(err)
 		}
-		b.StartTimer()
-
-		if err := loader.LoadFiles(path); err != nil {
+		if err := loader.LoadFiles(benchFile); err != nil {
 			b.Fatal(err)
 		}
 		loader.Close()
@@ -169,18 +159,21 @@ func BenchmarkLoader_LoadFiles_Small(b *testing.B) {
 func BenchmarkLoader_LoadFiles_Medium(b *testing.B) {
 	content := generateEnvContent(100)
 	cfg := DefaultConfig()
+	cfg.MaxVariables = 200
+
+	const benchFile = "bench_loader_medium.env"
+	if err := os.WriteFile(benchFile, []byte(content), 0600); err != nil {
+		b.Fatal(err)
+	}
+	defer os.Remove(benchFile)
 
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
-		b.StopTimer()
-		path := createTempEnvFile(b, content)
 		loader, err := New(cfg)
 		if err != nil {
 			b.Fatal(err)
 		}
-		b.StartTimer()
-
-		if err := loader.LoadFiles(path); err != nil {
+		if err := loader.LoadFiles(benchFile); err != nil {
 			b.Fatal(err)
 		}
 		loader.Close()
@@ -195,15 +188,16 @@ func BenchmarkLoader_Get(b *testing.B) {
 	}
 	defer loader.Close()
 
-	// Pre-populate with 100 variables
+	// Pre-populate with 100 variables and pre-compute keys
+	keys := make([]string, 100)
 	for i := 0; i < 100; i++ {
-		loader.Set(fmt.Sprintf("VAR_%d", i), fmt.Sprintf("value_%d", i))
+		keys[i] = fmt.Sprintf("VAR_%d", i)
+		loader.Set(keys[i], fmt.Sprintf("value_%d", i))
 	}
 
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
-		key := fmt.Sprintf("VAR_%d", i%100)
-		_ = loader.GetString(key)
+		_ = loader.GetString(keys[i%100])
 	}
 }
 
@@ -215,15 +209,16 @@ func BenchmarkLoader_Lookup(b *testing.B) {
 	}
 	defer loader.Close()
 
-	// Pre-populate with 100 variables
+	// Pre-populate with 100 variables and pre-compute keys
+	keys := make([]string, 100)
 	for i := 0; i < 100; i++ {
-		loader.Set(fmt.Sprintf("VAR_%d", i), fmt.Sprintf("value_%d", i))
+		keys[i] = fmt.Sprintf("VAR_%d", i)
+		loader.Set(keys[i], fmt.Sprintf("value_%d", i))
 	}
 
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
-		key := fmt.Sprintf("VAR_%d", i%100)
-		_, _ = loader.Lookup(key)
+		_, _ = loader.Lookup(keys[i%100])
 	}
 }
 
@@ -236,10 +231,18 @@ func BenchmarkLoader_Set(b *testing.B) {
 	}
 	defer loader.Close()
 
+	// Pre-populate and pre-compute keys
+	keys := make([]string, 100)
+	values := make([]string, 100)
+	for i := 0; i < 100; i++ {
+		keys[i] = fmt.Sprintf("VAR_%d", i)
+		values[i] = fmt.Sprintf("value_%d", i)
+		loader.Set(keys[i], values[i])
+	}
+
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
-		key := fmt.Sprintf("VAR_%d", i%100)
-		loader.Set(key, fmt.Sprintf("value_%d", i))
+		loader.Set(keys[i%100], values[i%100])
 	}
 }
 
@@ -432,10 +435,17 @@ func BenchmarkSecureMap_Set(b *testing.B) {
 	sm := newSecureMap()
 	defer sm.Clear()
 
+	// Pre-compute keys and values
+	keys := make([]string, 100)
+	values := make([]string, 100)
+	for i := 0; i < 100; i++ {
+		keys[i] = fmt.Sprintf("KEY_%d", i)
+		values[i] = fmt.Sprintf("value_%d", i)
+	}
+
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
-		key := fmt.Sprintf("KEY_%d", i%100)
-		sm.Set(key, fmt.Sprintf("value_%d", i))
+		sm.Set(keys[i%100], values[i%100])
 	}
 }
 
@@ -443,15 +453,16 @@ func BenchmarkSecureMap_Get(b *testing.B) {
 	sm := newSecureMap()
 	defer sm.Clear()
 
-	// Pre-populate
+	// Pre-populate and pre-compute keys
+	keys := make([]string, 100)
 	for i := 0; i < 100; i++ {
-		sm.Set(fmt.Sprintf("KEY_%d", i), fmt.Sprintf("value_%d", i))
+		keys[i] = fmt.Sprintf("KEY_%d", i)
+		sm.Set(keys[i], fmt.Sprintf("value_%d", i))
 	}
 
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
-		key := fmt.Sprintf("KEY_%d", i%100)
-		sm.Get(key)
+		sm.Get(keys[i%100])
 	}
 }
 
@@ -740,4 +751,111 @@ func BenchmarkLoader_ConcurrentSet(b *testing.B) {
 			i++
 		}
 	})
+}
+
+// ============================================================================
+// Targeted Optimization Benchmarks
+// ============================================================================
+
+// BenchmarkExpander_SingleVariable_Leaf benchmarks the fast path for single
+// variable expansion where the resolved value has no further $ references.
+func BenchmarkExpander_SingleVariable_Leaf(b *testing.B) {
+	input := "$VAR"
+	expander := internal.NewExpander(internal.ExpanderConfig{
+		MaxDepth: 5,
+		Lookup:   func(key string) (string, bool) { return "simple_value", true },
+		Mode:     internal.ModeEnv,
+	})
+
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		expander.Expand(input)
+	}
+}
+
+// BenchmarkExpander_BracedVariable_Leaf benchmarks the fast path for braced
+// variable expansion with a leaf value.
+func BenchmarkExpander_BracedVariable_Leaf(b *testing.B) {
+	input := "${VAR}"
+	expander := internal.NewExpander(internal.ExpanderConfig{
+		MaxDepth: 5,
+		Lookup:   func(key string) (string, bool) { return "simple_value", true },
+		Mode:     internal.ModeEnv,
+	})
+
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		expander.Expand(input)
+	}
+}
+
+// BenchmarkHasUpperPrefix benchmarks the case-insensitive prefix check.
+func BenchmarkHasUpperPrefix(b *testing.B) {
+	b.Run("match", func(b *testing.B) {
+		for i := 0; i < b.N; i++ {
+			internal.HasUpperPrefix("APP_DATABASE_HOST", "APP_")
+		}
+	})
+	b.Run("no_match", func(b *testing.B) {
+		for i := 0; i < b.N; i++ {
+			internal.HasUpperPrefix("DATABASE_HOST", "APP_")
+		}
+	})
+	b.Run("lowercase_match", func(b *testing.B) {
+		for i := 0; i < b.N; i++ {
+			internal.HasUpperPrefix("app_database_host", "APP_")
+		}
+	})
+}
+
+// BenchmarkEqualFoldASCII benchmarks the case-insensitive string comparison.
+func BenchmarkEqualFoldASCII(b *testing.B) {
+	inputs := []struct {
+		name string
+		a, b string
+	}{
+		{"null", "NULL", "null"},
+		{"true", "True", "true"},
+		{"false", "FALSE", "false"},
+		{"mismatch", "hello", "world"},
+	}
+	for _, tt := range inputs {
+		b.Run(tt.name, func(b *testing.B) {
+			for i := 0; i < b.N; i++ {
+				internal.EqualFoldASCII(tt.a, tt.b)
+			}
+		})
+	}
+}
+
+// BenchmarkYAMLConvertScalar benchmarks the YAML scalar conversion path.
+func BenchmarkYAMLConvertScalar(b *testing.B) {
+	// This tests the internal path that was optimized to avoid allocations
+	cfg := internal.YAMLFlattenConfig{
+		NullAsEmpty:    true,
+		NumberAsString: true,
+		BoolAsString:   true,
+	}
+	scalars := []struct {
+		name  string
+		value string
+	}{
+		{"null", "null"},
+		{"true", "true"},
+		{"false", "False"},
+		{"number", "42"},
+		{"string", "hello_world"},
+		{"tilde", "~"},
+	}
+	for _, tt := range scalars {
+		b.Run(tt.name, func(b *testing.B) {
+			// Access internal FlattenYAML to test the full path including convertYAMLScalar
+			for i := 0; i < b.N; i++ {
+				internal.FlattenYAML(
+					internal.NewScalarValue(tt.value, 1, 1),
+					cfg,
+				)
+			}
+		})
+	}
 }

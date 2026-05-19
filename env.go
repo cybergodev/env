@@ -1,4 +1,4 @@
-// Package env provides a high-security environment variable library for Go 1.24+.
+// Package env provides a high-security environment variable library for Go 1.25+.
 // It is designed for applications where security, concurrent access, and production-grade
 // features are critical.
 //
@@ -130,9 +130,6 @@ type Loader struct {
 	config      Config
 	factory     *ComponentFactory
 	ownsFactory bool
-	validator   Validator
-	auditor     FullAuditLogger
-	expander    VariableExpander
 	parsers     map[FileFormat]EnvParser
 	fs          FileSystem
 
@@ -149,6 +146,53 @@ var _ EnvLoader = (*Loader)(nil)
 // Compile-time check that Loader implements io.Closer.
 var _ io.Closer = (*Loader)(nil)
 
+// enterRead acquires the read lock and validates loader state.
+// Returns ErrClosed if the loader is nil or closed.
+// Caller must call exitRead() when done.
+func (l *Loader) enterRead() error {
+	if l == nil {
+		return ErrClosed
+	}
+	l.mu.RLock()
+	if l.closed {
+		l.mu.RUnlock()
+		return ErrClosed
+	}
+	return nil
+}
+
+// exitRead releases the read lock.
+func (l *Loader) exitRead() { l.mu.RUnlock() }
+
+// enterWrite acquires the write lock and validates loader state.
+// Returns ErrClosed if the loader is nil or closed.
+// Caller must call exitWrite() when done.
+func (l *Loader) enterWrite() error {
+	if l == nil {
+		return ErrClosed
+	}
+	l.mu.Lock()
+	if l.closed {
+		l.mu.Unlock()
+		return ErrClosed
+	}
+	return nil
+}
+
+// exitWrite releases the write lock.
+func (l *Loader) exitWrite() { l.mu.Unlock() }
+
+// cleanupOnError closes the loader if cleanup is true, logging any close error.
+// Returns the original error regardless of cleanup outcome.
+func (l *Loader) cleanupOnError(err error, cleanup bool) error {
+	if !cleanup {
+		return err
+	}
+	if closeErr := l.Close(); closeErr != nil {
+		_ = l.factory.Auditor().LogError(internal.ActionError, "", "cleanup failed: "+closeErr.Error())
+	}
+	return err
+}
 // New creates a new Loader with the given configuration.
 //
 // BEHAVIOR:
@@ -219,9 +263,6 @@ func New(cfg ...Config) (*Loader, error) {
 		config:      c,
 		factory:     factory,
 		ownsFactory: true,
-		validator:   factory.Validator(),
-		auditor:     factory.Auditor(),
-		expander:    factory.Expander(),
 		parsers:     parsers,
 		fs:          fs,
 		vars:        newSecureMap(),
@@ -241,6 +282,13 @@ func New(cfg ...Config) (*Loader, error) {
 // If no filenames are provided, defaults to ".env".
 // Files are loaded sequentially; later files can override values from earlier files.
 //
+// Returns:
+//   - ErrClosed: if the loader is nil or has been closed
+//   - ErrFileNotFound: if a file does not exist and FailOnMissingFile is true
+//   - ParseError: if a file contains invalid syntax
+//   - SecurityError: if a file path fails security validation
+//   - ErrFileTooLarge: if a file exceeds MaxFileSize
+//
 // Example:
 //
 //	// Load default .env file
@@ -249,12 +297,10 @@ func New(cfg ...Config) (*Loader, error) {
 //	// Load specific files
 //	err := loader.LoadFiles(".env", ".env.local")
 func (l *Loader) LoadFiles(filenames ...string) error {
-	l.mu.Lock()
-	defer l.mu.Unlock()
-
-	if l.closed {
-		return ErrClosed
+	if err := l.enterWrite(); err != nil {
+		return err
 	}
+	defer l.exitWrite()
 
 	// Default to .env if no files specified
 	if len(filenames) == 0 {
@@ -275,29 +321,19 @@ func (l *Loader) loadFilesInternal(filenames []string, cleanupOnErr bool) error 
 	for _, filename := range filenames {
 		if err := l.loadFileLocked(filename); err != nil {
 			if errors.Is(err, ErrFileNotFound) && !l.config.FailOnMissingFile {
-				_ = l.auditor.LogWithFile(internal.ActionLoad, "", filename, "file not found, skipping", true)
+				_ = l.factory.Auditor().LogWithFile(internal.ActionLoad, "", filename, "file not found, skipping", true)
 				continue
 			}
-			if cleanupOnErr {
-				if closeErr := l.Close(); closeErr != nil {
-					_ = l.auditor.LogError(internal.ActionError, "", "cleanup failed: "+closeErr.Error())
-				}
-			}
-			return err
+			return l.cleanupOnError(err, cleanupOnErr)
 		}
 	}
 
 	l.loadTime = time.Now()
-	_ = l.auditor.LogWithDuration(internal.ActionLoad, "", "loaded files", true, time.Since(start))
+	_ = l.factory.Auditor().LogWithDuration(internal.ActionLoad, "", "loaded files", true, time.Since(start))
 
 	if l.config.AutoApply {
 		if err := l.applyLocked(); err != nil {
-			if cleanupOnErr {
-				if closeErr := l.Close(); closeErr != nil {
-					_ = l.auditor.LogError(internal.ActionError, "", "cleanup failed: "+closeErr.Error())
-				}
-			}
-			return err
+			return l.cleanupOnError(err, cleanupOnErr)
 		}
 	}
 
@@ -321,7 +357,7 @@ func (l *Loader) loadFileLocked(filename string) error {
 
 	// SECURITY: Validate file path to prevent path traversal attacks
 	if err := validateFilePath(filename); err != nil {
-		_ = l.auditor.LogError(internal.ActionSecurity, "", "path validation failed: "+err.Error())
+		_ = l.factory.Auditor().LogError(internal.ActionSecurity, "", "path validation failed: "+err.Error())
 		return err
 	}
 
@@ -360,6 +396,10 @@ func (l *Loader) loadFileLocked(filename string) error {
 		parser = l.parsers[FormatEnv]
 	}
 
+	if parser == nil {
+		return newFileError(filename, "parse", fmt.Errorf("no parser registered for format %v", format))
+	}
+
 	vars, err := parser.Parse(file, filename)
 	if err != nil {
 		return err
@@ -370,47 +410,54 @@ func (l *Loader) loadFileLocked(filename string) error {
 		// SECURITY: Log sensitive key operations even in fast path for audit trail
 		for key := range vars {
 			if IsSensitiveKey(key) {
-				_ = l.auditor.Log(internal.ActionSet, key, "loaded (sensitive)", true)
+				_ = l.factory.Auditor().Log(internal.ActionSet, key, "loaded (sensitive)", true)
 			}
 		}
 		l.vars.SetAll(vars)
-		_ = l.auditor.LogWithDuration(internal.ActionFileAccess, "", "file loaded: "+filename, true, time.Since(start))
+		_ = l.factory.Auditor().LogWithDuration(internal.ActionFileAccess, "", "file loaded: "+filename, true, time.Since(start))
 		return nil
 	}
 
 	// Filter and prepare variables for batch set
 	toSet := make(map[string]string, len(vars))
+
+	// Pre-compute uppercase prefix once outside the loop
+	upperPrefix := internal.ToUpperASCII(l.config.Prefix)
+
 	for key, value := range vars {
-		// Check prefix if configured
-		if l.config.Prefix != "" && !strings.HasPrefix(key, l.config.Prefix) {
+		// Check prefix if configured (case-insensitive, zero-allocation)
+		if l.config.Prefix != "" && !internal.HasUpperPrefix(key, upperPrefix) {
 			continue
 		}
 
 		// Check overwrite policy
 		if _, exists := l.vars.Get(key); exists && !l.config.OverwriteExisting {
-			_ = l.auditor.Log(internal.ActionSet, key, "skipped (no overwrite)", false)
+			_ = l.factory.Auditor().Log(internal.ActionSet, key, "skipped (no overwrite)", false)
 			continue
 		}
 
 		toSet[key] = value
-		_ = l.auditor.Log(internal.ActionSet, key, "loaded", true)
+		_ = l.factory.Auditor().Log(internal.ActionSet, key, "loaded", true)
 	}
 
 	// Use batch set for better performance
 	l.vars.SetAll(toSet)
 
-	_ = l.auditor.LogWithDuration(internal.ActionFileAccess, "", "file loaded: "+filename, true, time.Since(start))
+	_ = l.factory.Auditor().LogWithDuration(internal.ActionFileAccess, "", "file loaded: "+filename, true, time.Since(start))
 	return nil
 }
 
 // Apply applies all loaded variables to the process environment.
+// Only sets variables that do not already exist unless OverwriteExisting is true.
+//
+// Returns:
+//   - ErrClosed: if the loader is nil or has been closed
+//   - Wrapped os errors: if setting an environment variable fails
 func (l *Loader) Apply() error {
-	l.mu.Lock()
-	defer l.mu.Unlock()
-
-	if l.closed {
-		return ErrClosed
+	if err := l.enterWrite(); err != nil {
+		return err
 	}
+	defer l.exitWrite()
 
 	return l.applyLocked()
 }
@@ -429,16 +476,16 @@ func (l *Loader) applyLocked() error {
 		// "not set" and "empty string". This correctly handles the case where
 		// an environment variable is explicitly set to empty string.
 		if _, exists := l.fs.LookupEnv(key); exists && !l.config.OverwriteExisting {
-			_ = l.auditor.Log(internal.ActionSet, key, "skipped (existing)", false)
+			_ = l.factory.Auditor().Log(internal.ActionSet, key, "skipped (existing)", false)
 			continue
 		}
 
 		if err := l.fs.Setenv(key, value); err != nil {
-			_ = l.auditor.LogError(internal.ActionSet, key, err.Error())
+			_ = l.factory.Auditor().LogError(internal.ActionSet, key, err.Error())
 			return fmt.Errorf("failed to set %s: %w", MaskKey(key), err)
 		}
 
-		_ = l.auditor.Log(internal.ActionSet, key, "applied", true)
+		_ = l.factory.Auditor().Log(internal.ActionSet, key, "applied", true)
 	}
 
 	l.applied = true
@@ -465,15 +512,25 @@ func (l *Loader) GetString(key string, defaultValue ...string) string {
 }
 
 // GetSecure retrieves a SecureValue by key.
+// Uses the same key resolution strategy as Lookup (exact match, uppercase fallback,
+// dot-notation) via internal.ResolveKeyName to ensure consistency.
 func (l *Loader) GetSecure(key string) *SecureValue {
-	l.mu.RLock()
-	defer l.mu.RUnlock()
-
-	if l.closed {
+	if err := l.enterRead(); err != nil {
 		return nil
 	}
+	defer l.exitRead()
 
-	return l.vars.GetSecure(key)
+	// Single-pass resolution: find key and allocate SecureValue atomically
+	// to avoid TOCTOU race between exists() and GetSecure().
+	var result *SecureValue
+	internal.ResolveKeyName(key, func(k string) bool {
+		if sv := l.vars.GetSecure(k); sv != nil {
+			result = sv
+			return true
+		}
+		return false
+	})
+	return result
 }
 
 // Lookup retrieves a value by key and reports whether it exists.
@@ -482,80 +539,12 @@ func (l *Loader) GetSecure(key string) *SecureValue {
 // if indexed key is not found.
 // Returns the value with leading and trailing whitespace trimmed.
 func (l *Loader) Lookup(key string) (string, bool) {
-	l.mu.RLock()
-	defer l.mu.RUnlock()
-
-	if l.closed {
+	if err := l.enterRead(); err != nil {
 		return "", false
 	}
+	defer l.exitRead()
 
-	// Fast path for simple keys (no dots) - skip ResolvePath allocation
-	// This is the most common case and avoids creating candidate slices
-	if strings.IndexByte(key, '.') == -1 {
-		// Try exact key first
-		if value, ok := l.vars.Get(key); ok {
-			return internal.TrimSpace(value), true
-		}
-		// Try uppercase version if different
-		upper := internal.ToUpperASCII(key)
-		if upper != key {
-			if value, ok := l.vars.Get(upper); ok {
-				return internal.TrimSpace(value), true
-			}
-		}
-		return "", false
-	}
-
-	// Slow path for dot-notation keys - use path resolver
-	candidates := internal.ResolvePath(key)
-
-	// Try each candidate in priority order
-	for _, candidate := range candidates {
-		if value, ok := l.vars.Get(candidate); ok {
-			return internal.TrimSpace(value), true
-		}
-	}
-
-	// Fallback to comma-separated values for indexed access
-	if basePath, index, hasIndex := internal.ExtractNumericIndex(key); hasIndex {
-		baseCandidates := internal.ResolvePath(basePath)
-		for _, baseCandidate := range baseCandidates {
-			if value, ok := l.vars.Get(baseCandidate); ok {
-				if elem, found := splitAndTrimAt(value, index); found {
-					return elem, true
-				}
-			}
-		}
-	}
-
-	return "", false
-}
-
-// splitAndTrimAt returns the element at the given index from a comma-separated string.
-// It iterates without allocation, returning the trimmed element at the specified index.
-// Returns empty string and false if the index is out of bounds or negative.
-func splitAndTrimAt(s string, index int) (string, bool) {
-	// SECURITY: Defensive check for negative index
-	if index < 0 {
-		return "", false
-	}
-	currentIdx := 0
-	start := 0
-	for i := 0; i <= len(s); i++ {
-		if i == len(s) || s[i] == ',' {
-			if i > start {
-				trimmed := internal.TrimSpace(s[start:i])
-				if trimmed != "" {
-					if currentIdx == index {
-						return trimmed, true
-					}
-					currentIdx++
-				}
-			}
-			start = i + 1
-		}
-	}
-	return "", false
+	return internal.ResolveKey(key, l.vars.Get)
 }
 
 // buildIndexedKey efficiently constructs an indexed key (e.g., "KEY_0", "KEY_1").
@@ -605,37 +594,29 @@ func buildIndexedKey(baseKey string, index int) string {
 	return sb.String()
 }
 
-// splitAndTrimComma splits by comma and trims whitespace.
-func splitAndTrimComma(s string) []string {
-	parts := strings.Split(s, ",")
-	result := make([]string, 0, len(parts))
-	for _, part := range parts {
-		if trimmed := internal.TrimSpace(part); trimmed != "" {
-			result = append(result, trimmed)
-		}
-	}
-	return result
-}
-
 // Set sets a value for a key.
+// If OverwriteExisting is false and the key already exists, the call is silently skipped.
+//
+// Returns:
+//   - ErrClosed: if the loader is nil or has been closed
+//   - ErrInvalidKey: if the key fails validation
+//   - ErrInvalidValue: if ValidateValues is true and the value fails validation
 func (l *Loader) Set(key, value string) error {
-	l.mu.Lock()
-	defer l.mu.Unlock()
-
-	if l.closed {
-		return ErrClosed
+	if err := l.enterWrite(); err != nil {
+		return err
 	}
+	defer l.exitWrite()
 
 	// Validate key
-	if err := l.validator.ValidateKey(key); err != nil {
-		_ = l.auditor.LogError(internal.ActionSet, key, err.Error())
+	if err := l.factory.Validator().ValidateKey(key); err != nil {
+		_ = l.factory.Auditor().LogError(internal.ActionSet, key, err.Error())
 		return err
 	}
 
 	// Validate value
 	if l.config.ValidateValues {
-		if err := l.validator.ValidateValue(value); err != nil {
-			_ = l.auditor.LogError(internal.ActionSet, key, err.Error())
+		if err := l.factory.Validator().ValidateValue(value); err != nil {
+			_ = l.factory.Auditor().LogError(internal.ActionSet, key, err.Error())
 			return err
 		}
 	}
@@ -645,13 +626,13 @@ func (l *Loader) Set(key, value string) error {
 	// When OverwriteExisting=true, skip the Get entirely to avoid unnecessary allocation.
 	if !l.config.OverwriteExisting {
 		if _, exists := l.vars.Get(key); exists {
-			_ = l.auditor.Log(internal.ActionSet, key, "skipped (no overwrite)", false)
+			_ = l.factory.Auditor().Log(internal.ActionSet, key, "skipped (no overwrite)", false)
 			return nil
 		}
 	}
 
 	l.vars.Set(key, value)
-	_ = l.auditor.Log(internal.ActionSet, key, "set", true)
+	_ = l.factory.Auditor().Log(internal.ActionSet, key, "set", true)
 
 	// Apply to environment if auto-apply is enabled
 	if l.config.AutoApply {
@@ -663,22 +644,24 @@ func (l *Loader) Set(key, value string) error {
 	return nil
 }
 
-// Delete removes a key.
+// Delete removes a key from the loaded environment.
+// This only affects the in-memory store; it does not unset process environment variables.
+//
+// Returns:
+//   - ErrClosed: if the loader is nil or has been closed
 func (l *Loader) Delete(key string) error {
-	l.mu.Lock()
-	defer l.mu.Unlock()
-
-	if l.closed {
-		return ErrClosed
+	if err := l.enterWrite(); err != nil {
+		return err
 	}
+	defer l.exitWrite()
 
 	l.vars.Delete(key)
-	_ = l.auditor.Log(internal.ActionDelete, key, "deleted", true)
+	_ = l.factory.Auditor().Log(internal.ActionDelete, key, "deleted", true)
 
 	// Remove from environment if applied
 	if l.applied {
 		if err := l.fs.Unsetenv(key); err != nil {
-			_ = l.auditor.LogError(internal.ActionDelete, key, err.Error())
+			_ = l.factory.Auditor().LogError(internal.ActionDelete, key, err.Error())
 		}
 	}
 
@@ -687,63 +670,59 @@ func (l *Loader) Delete(key string) error {
 
 // Keys returns all keys.
 func (l *Loader) Keys() []string {
-	l.mu.RLock()
-	defer l.mu.RUnlock()
-
-	if l.closed {
+	if err := l.enterRead(); err != nil {
 		return nil
 	}
+	defer l.exitRead()
 
 	return l.vars.Keys()
 }
 
 // All returns all environment variables as a map.
 func (l *Loader) All() map[string]string {
-	l.mu.RLock()
-	defer l.mu.RUnlock()
-
-	if l.closed {
+	if err := l.enterRead(); err != nil {
 		return nil
 	}
+	defer l.exitRead()
 
 	return l.vars.ToMap()
 }
 
 // Len returns the number of loaded variables.
 func (l *Loader) Len() int {
-	l.mu.RLock()
-	defer l.mu.RUnlock()
-
-	if l.closed {
+	if err := l.enterRead(); err != nil {
 		return 0
 	}
+	defer l.exitRead()
 
 	return l.vars.Len()
 }
 
 // IsApplied returns true if the variables have been applied to os.Environ.
 func (l *Loader) IsApplied() bool {
-	l.mu.RLock()
-	defer l.mu.RUnlock()
+	if err := l.enterRead(); err != nil {
+		return false
+	}
+	defer l.exitRead()
 	return l.applied
 }
 
 // LoadTime returns the time when variables were last loaded.
 func (l *Loader) LoadTime() time.Time {
-	l.mu.RLock()
-	defer l.mu.RUnlock()
+	if err := l.enterRead(); err != nil {
+		return time.Time{}
+	}
+	defer l.exitRead()
 	return l.loadTime
 }
 
 // Close closes the loader and securely clears all stored values.
 // If the loader owns its ComponentFactory, it will also close the factory.
 func (l *Loader) Close() error {
-	l.mu.Lock()
-	defer l.mu.Unlock()
-
-	if l.closed {
-		return nil
+	if err := l.enterWrite(); err != nil {
+		return nil // Close on nil/closed is not an error
 	}
+	defer l.exitWrite()
 
 	l.vars.Clear()
 
@@ -761,6 +740,9 @@ func (l *Loader) Close() error {
 
 // IsClosed returns true if the loader has been closed.
 func (l *Loader) IsClosed() bool {
+	if l == nil {
+		return true
+	}
 	l.mu.RLock()
 	defer l.mu.RUnlock()
 	return l.closed
@@ -771,6 +753,9 @@ func (l *Loader) IsClosed() bool {
 // a default value if the key is not found or parsing fails.
 // Parse failures are logged to the auditor for debugging purposes.
 func getWithDefault[T any](loader *Loader, key string, parse func(string) (T, error), defaultValue ...T) T {
+	if loader == nil {
+		return firstOrZero(defaultValue...)
+	}
 	value, ok := loader.Lookup(key)
 	if !ok {
 		return firstOrZero(defaultValue...)
@@ -778,7 +763,7 @@ func getWithDefault[T any](loader *Loader, key string, parse func(string) (T, er
 	result, err := parse(value)
 	if err != nil {
 		// Log parse failure for debugging
-		_ = loader.auditor.LogError(internal.ActionGet, key, fmt.Sprintf("parse failed: %v", err))
+		_ = loader.factory.Auditor().LogError(internal.ActionGet, key, fmt.Sprintf("parse failed: %v", err))
 		return firstOrZero(defaultValue...)
 	}
 	return result
@@ -790,6 +775,9 @@ func getWithDefault[T any](loader *Loader, key string, parse func(string) (T, er
 // LimitsConfig, or ComponentConfig fields may affect the loader's behavior.
 // For a safe mutable copy, manually copy the necessary fields.
 func (l *Loader) Config() Config {
+	if l == nil {
+		return Config{}
+	}
 	return l.config
 }
 
@@ -804,6 +792,30 @@ func (l *Loader) GetInt(key string, defaultValue ...int64) int64 {
 	return getWithDefault(l, key, func(s string) (int64, error) {
 		return parseInt(s, 64)
 	}, defaultValue...)
+}
+
+// GetUint64 retrieves an unsigned integer value with optional default.
+// If the key is not found and no default is provided, returns 0.
+//
+// Example:
+//
+//	port := loader.GetUint64("PORT")           // Returns 0 if not found
+//	port := loader.GetUint64("PORT", 8080)     // Returns 8080 if not found
+func (l *Loader) GetUint64(key string, defaultValue ...uint64) uint64 {
+	return getWithDefault(l, key, func(s string) (uint64, error) {
+		return parseUint(s, 64)
+	}, defaultValue...)
+}
+
+// GetFloat64 retrieves a floating-point value with optional default.
+// If the key is not found and no default is provided, returns 0.
+//
+// Example:
+//
+//	rate := loader.GetFloat64("RATE")           // Returns 0 if not found
+//	rate := loader.GetFloat64("RATE", 0.5)      // Returns 0.5 if not found
+func (l *Loader) GetFloat64(key string, defaultValue ...float64) float64 {
+	return getWithDefault(l, key, parseFloat64, defaultValue...)
 }
 
 // GetBool retrieves a boolean value with optional default.
@@ -834,6 +846,8 @@ func (l *Loader) GetDuration(key string, defaultValue ...time.Duration) time.Dur
 //
 // Indexed keys are searched in format: KEY_0, KEY_1, KEY_2, etc.
 // Also supports comma-separated values as fallback for .env files.
+//
+// Type parameter T is constrained to: string, int, int64, uint, uint64, bool, float64, time.Duration.
 //
 // # Why a Function Instead of a Method?
 //
@@ -889,7 +903,7 @@ func getSliceFromIndexedKeys[T sliceElement](loader *Loader, baseKey string, def
 	const maxSliceSize = 10000
 
 	var result []T
-	for i := 0; i < maxSliceSize; i++ {
+	for i := range maxSliceSize {
 		indexedKey := buildIndexedKey(baseKey, i)
 		value, ok := loader.vars.Get(indexedKey)
 		if !ok {
@@ -899,7 +913,7 @@ func getSliceFromIndexedKeys[T sliceElement](loader *Loader, baseKey string, def
 		parsed, err := parseSliceElement[T](value)
 		if err != nil {
 			// Log parse failure for debugging and skip this element
-			_ = loader.auditor.LogError(internal.ActionGet, indexedKey,
+			_ = loader.factory.Auditor().LogError(internal.ActionGet, indexedKey,
 				fmt.Sprintf("slice element parse failed: %v", err))
 			continue
 		}
@@ -908,7 +922,7 @@ func getSliceFromIndexedKeys[T sliceElement](loader *Loader, baseKey string, def
 
 	// SECURITY: Log if we hit the slice size limit (potential DoS attempt)
 	if len(result) >= maxSliceSize {
-		_ = loader.auditor.LogError(internal.ActionGet, baseKey,
+		_ = loader.factory.Auditor().LogError(internal.ActionGet, baseKey,
 			fmt.Sprintf("slice size limit reached (%d elements)", maxSliceSize))
 	}
 
@@ -930,13 +944,29 @@ func getSliceFromIndexedKeys[T sliceElement](loader *Loader, baseKey string, def
 // ParseInto populates a struct from loaded environment variables.
 // Struct fields can be tagged with `env:"KEY"` to specify the env variable name.
 // Optional `envDefault:"value"` sets a default if the key is not found.
-func (l *Loader) ParseInto(v interface{}) error {
+//
+// Returns:
+//   - ErrClosed: if the loader is nil or has been closed
+//   - MarshalError: if struct tag parsing or type conversion fails
+func (l *Loader) ParseInto(v any) error {
+	if l == nil {
+		return ErrClosed
+	}
 	return UnmarshalInto(l.All(), v)
 }
 
 // Validate validates the loaded environment against required and allowed keys.
+// Checks that all RequiredKeys are present and that no ForbiddenKeys are set.
+//
+// Returns:
+//   - ErrClosed: if the loader is nil or has been closed
+//   - ErrMissingRequired: if a required key is not present
+//   - ErrForbiddenKey: if a forbidden key is set
 func (l *Loader) Validate() error {
-	return l.validator.ValidateRequired(l.keysToUpper())
+	if l == nil {
+		return ErrClosed
+	}
+	return l.factory.Validator().ValidateRequired(l.keysToUpper())
 }
 
 // keysToUpper returns all keys as uppercase for comparison.

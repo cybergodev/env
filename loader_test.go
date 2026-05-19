@@ -423,6 +423,35 @@ func TestLoader_LoadFiles(t *testing.T) {
 		}
 	})
 
+		t.Run("prefix filter case-insensitive", func(t *testing.T) {
+			fs := newTestFileSystem()
+			fs.files[".env"] = "APP_KEY=value\napp_secret=secret\nOTHER_KEY=other"
+
+			cfg := DefaultConfig()
+			cfg.FileSystem = fs
+			cfg.Prefix = "app_"
+			loader, err := New(cfg)
+			if err != nil {
+				t.Fatalf("New() error = %v", err)
+			}
+			defer loader.Close()
+
+			if err := loader.LoadFiles(".env"); err != nil {
+				t.Fatalf("LoadFiles() error = %v", err)
+			}
+
+			// Both APP_KEY and app_secret should match the "app_" prefix case-insensitively
+			if loader.GetString("APP_KEY") != "value" {
+				t.Errorf("GetString(\"APP_KEY\") = %q, want %q", loader.GetString("APP_KEY"), "value")
+			}
+			if loader.GetString("app_secret") != "secret" {
+				t.Errorf("GetString(\"app_secret\") = %q, want %q", loader.GetString("app_secret"), "secret")
+			}
+			if _, ok := loader.Lookup("OTHER_KEY"); ok {
+				t.Error("OTHER_KEY should not be loaded with app_ prefix")
+			}
+		})
+
 }
 
 // ============================================================================
@@ -572,6 +601,71 @@ func TestLoader_GetSecure(t *testing.T) {
 	}
 }
 
+func TestLoader_GetSecure_CaseInsensitiveAndDotNotation(t *testing.T) {
+	t.Run("lowercase key finds uppercase storage", func(t *testing.T) {
+		loader, err := New(DefaultConfig())
+		if err != nil {
+			t.Fatalf("New() error = %v", err)
+		}
+		defer loader.Close()
+
+		if err := loader.Set("API_KEY", "sk-secret"); err != nil {
+			t.Fatalf("Set() error = %v", err)
+		}
+
+		sv := loader.GetSecure("api_key")
+		if sv == nil {
+			t.Fatal("GetSecure(\"api_key\") returned nil, expected to find API_KEY")
+		}
+		if sv.Reveal() != "sk-secret" {
+			t.Errorf("GetSecure(\"api_key\").Reveal() = %q, want %q", sv.Reveal(), "sk-secret")
+		}
+		sv.Release()
+	})
+
+	t.Run("dot-notation key resolves", func(t *testing.T) {
+		loader, err := New(DefaultConfig())
+		if err != nil {
+			t.Fatalf("New() error = %v", err)
+		}
+		defer loader.Close()
+
+		if err := loader.Set("DATABASE_PASSWORD", "db-secret"); err != nil {
+			t.Fatalf("Set() error = %v", err)
+		}
+
+		sv := loader.GetSecure("database.password")
+		if sv == nil {
+			t.Fatal("GetSecure(\"database.password\") returned nil, expected to find DATABASE_PASSWORD")
+		}
+		if sv.Reveal() != "db-secret" {
+			t.Errorf("GetSecure(\"database.password\").Reveal() = %q, want %q", sv.Reveal(), "db-secret")
+		}
+		sv.Release()
+	})
+
+	t.Run("exact match preferred over uppercase fallback", func(t *testing.T) {
+		loader, err := New(DefaultConfig())
+		if err != nil {
+			t.Fatalf("New() error = %v", err)
+		}
+		defer loader.Close()
+
+		if err := loader.Set("MY_KEY", "uppercase-value"); err != nil {
+			t.Fatalf("Set() error = %v", err)
+		}
+
+		sv := loader.GetSecure("MY_KEY")
+		if sv == nil {
+			t.Fatal("GetSecure(\"MY_KEY\") returned nil")
+		}
+		if sv.Reveal() != "uppercase-value" {
+			t.Errorf("Reveal() = %q, want %q", sv.Reveal(), "uppercase-value")
+		}
+		sv.Release()
+	})
+}
+
 func TestLoader_Lookup(t *testing.T) {
 	tests := []struct {
 		name      string
@@ -582,7 +676,7 @@ func TestLoader_Lookup(t *testing.T) {
 	}{
 		{"existing key", "KEY", "value", true, "value"},
 		{"missing key", "MISSING", "", false, ""},
-		{"trims whitespace", "KEY", "  value  ", true, "value"},
+		{"preserves whitespace", "KEY", "  value  ", true, "  value  "},
 	}
 
 	for _, tt := range tests {
@@ -1152,6 +1246,95 @@ func TestLoader_GetInt(t *testing.T) {
 	}
 }
 
+func TestLoader_GetUint64(t *testing.T) {
+	tests := []struct {
+		name       string
+		key        string
+		value      string
+		defaultVal uint64
+		useDefault bool
+		wantValue  uint64
+	}{
+		{"existing key", "PORT", "8080", 0, false, 8080},
+		{"large value", "MAX_CONN", "18446744073709551615", 0, false, 18446744073709551615},
+		{"missing key with default", "MISSING", "", 3000, true, 3000},
+		{"missing key without default", "MISSING", "", 0, false, 0},
+		{"invalid value", "PORT", "abc", 42, true, 42},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			loader, err := New(DefaultConfig())
+			if err != nil {
+				t.Fatalf("New() error = %v", err)
+			}
+			defer loader.Close()
+
+			if tt.value != "" {
+				if err := loader.Set(tt.key, tt.value); err != nil {
+					t.Fatalf("Set() error = %v", err)
+				}
+			}
+
+			var got uint64
+			if tt.useDefault {
+				got = loader.GetUint64(tt.key, tt.defaultVal)
+			} else {
+				got = loader.GetUint64(tt.key)
+			}
+
+			if got != tt.wantValue {
+				t.Errorf("GetUint64() = %d, want %d", got, tt.wantValue)
+			}
+		})
+	}
+}
+
+func TestLoader_GetFloat64(t *testing.T) {
+	tests := []struct {
+		name       string
+		key        string
+		value      string
+		defaultVal float64
+		useDefault bool
+		wantValue  float64
+	}{
+		{"existing key", "RATE", "3.14", 0, false, 3.14},
+		{"negative value", "OFFSET", "-0.5", 0, false, -0.5},
+		{"scientific notation", "FACTOR", "1.5e3", 0, false, 1500.0},
+		{"missing key with default", "MISSING", "", 0.5, true, 0.5},
+		{"missing key without default", "MISSING", "", 0, false, 0},
+		{"invalid value", "RATE", "abc", 1.0, true, 1.0},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			loader, err := New(DefaultConfig())
+			if err != nil {
+				t.Fatalf("New() error = %v", err)
+			}
+			defer loader.Close()
+
+			if tt.value != "" {
+				if err := loader.Set(tt.key, tt.value); err != nil {
+					t.Fatalf("Set() error = %v", err)
+				}
+			}
+
+			var got float64
+			if tt.useDefault {
+				got = loader.GetFloat64(tt.key, tt.defaultVal)
+			} else {
+				got = loader.GetFloat64(tt.key)
+			}
+
+			if got != tt.wantValue {
+				t.Errorf("GetFloat64() = %f, want %f", got, tt.wantValue)
+			}
+		})
+	}
+}
+
 func TestLoader_GetBool(t *testing.T) {
 	tests := []struct {
 		name       string
@@ -1317,39 +1500,6 @@ func TestLoader_Validate(t *testing.T) {
 			t.Error("Validate() should fail with missing required key")
 		}
 	})
-}
-
-// ============================================================================
-// splitAndTrimComma Tests (internal)
-// ============================================================================
-
-func TestSplitAndTrimComma(t *testing.T) {
-	tests := []struct {
-		input    string
-		expected []string
-	}{
-		{"a,b,c", []string{"a", "b", "c"}},
-		{"  a  ,  b  ,  c  ", []string{"a", "b", "c"}},
-		{"a,,b,,,c", []string{"a", "b", "c"}},
-		{"", nil},
-		{"   ", nil},
-		{",,,", nil},
-	}
-
-	for _, tt := range tests {
-		t.Run(tt.input, func(t *testing.T) {
-			result := splitAndTrimComma(tt.input)
-			if len(result) != len(tt.expected) {
-				t.Errorf("splitAndTrimComma(%q) = %v, want %v", tt.input, result, tt.expected)
-				return
-			}
-			for i, v := range result {
-				if v != tt.expected[i] {
-					t.Errorf("splitAndTrimComma(%q)[%d] = %q, want %q", tt.input, i, v, tt.expected[i])
-				}
-			}
-		})
-	}
 }
 
 // ============================================================================

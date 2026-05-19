@@ -15,28 +15,28 @@ import (
 // Use these constants with AuditLogger.Log() to record security-relevant events.
 type AuditAction = internal.Action
 
-// Audit constants for common actions.
-// These are used with AuditLogger methods to categorize audit events:
-//   - ActionLoad: File loading operations
-//   - ActionParse: Parsing operations for env, JSON, YAML files
-//   - ActionGet: Variable retrieval operations
-//   - ActionSet: Variable assignment operations
-//   - ActionDelete: Variable deletion operations
-//   - ActionValidate: Validation operations
-//   - ActionExpand: Variable expansion operations
-//   - ActionSecurity: Security-related events (path validation, forbidden keys)
-//   - ActionError: Error conditions
-//   - ActionFileAccess: File system access operations
+// Audit action constants categorize events for audit logging.
+// Use with AuditLogger methods to record security-relevant operations.
 const (
-	ActionLoad       AuditAction = internal.ActionLoad
-	ActionParse      AuditAction = internal.ActionParse
-	ActionGet        AuditAction = internal.ActionGet
-	ActionSet        AuditAction = internal.ActionSet
-	ActionDelete     AuditAction = internal.ActionDelete
-	ActionValidate   AuditAction = internal.ActionValidate
-	ActionExpand     AuditAction = internal.ActionExpand
-	ActionSecurity   AuditAction = internal.ActionSecurity
-	ActionError      AuditAction = internal.ActionError
+	// ActionLoad represents file loading operations.
+	ActionLoad AuditAction = internal.ActionLoad
+	// ActionParse represents parsing operations for env, JSON, YAML files.
+	ActionParse AuditAction = internal.ActionParse
+	// ActionGet represents variable retrieval operations.
+	ActionGet AuditAction = internal.ActionGet
+	// ActionSet represents variable assignment operations.
+	ActionSet AuditAction = internal.ActionSet
+	// ActionDelete represents variable deletion operations.
+	ActionDelete AuditAction = internal.ActionDelete
+	// ActionValidate represents validation operations.
+	ActionValidate AuditAction = internal.ActionValidate
+	// ActionExpand represents variable expansion operations.
+	ActionExpand AuditAction = internal.ActionExpand
+	// ActionSecurity represents security-related events (path validation, forbidden keys).
+	ActionSecurity AuditAction = internal.ActionSecurity
+	// ActionError represents error conditions.
+	ActionError AuditAction = internal.ActionError
+	// ActionFileAccess represents file system access operations.
 	ActionFileAccess AuditAction = internal.ActionFileAccess
 )
 
@@ -49,7 +49,16 @@ type AuditHandler = internal.Handler
 // JSONAuditHandler writes audit events as JSON to an io.Writer.
 type JSONAuditHandler = internal.JSONHandler
 
-// NewJSONAuditHandler creates a new JSONAuditHandler.
+// NewJSONAuditHandler creates a new JSONAuditHandler that writes audit events
+// as JSON lines to the provided writer.
+//
+// Example:
+//
+//	handler := env.NewJSONAuditHandler(os.Stdout)
+//	cfg := env.DefaultConfig()
+//	cfg.ComponentConfig.AuditHandler = handler
+//	cfg.ComponentConfig.AuditEnabled = true
+//	loader, _ := env.New(cfg)
 func NewJSONAuditHandler(w io.Writer) *JSONAuditHandler {
 	return internal.NewJSONHandler(w)
 }
@@ -57,7 +66,14 @@ func NewJSONAuditHandler(w io.Writer) *JSONAuditHandler {
 // LogAuditHandler writes audit events using the standard log package.
 type LogAuditHandler = internal.LogHandler
 
-// NewLogAuditHandler creates a new LogAuditHandler.
+// NewLogAuditHandler creates a new LogAuditHandler that writes audit events
+// using the standard log package.
+//
+// Example:
+//
+//	logger := log.New(os.Stderr, "[AUDIT] ", log.LstdFlags)
+//	handler := env.NewLogAuditHandler(logger)
+//	cfg.ComponentConfig.AuditHandler = handler
 func NewLogAuditHandler(logger *log.Logger) *LogAuditHandler {
 	return internal.NewLogHandler(logger)
 }
@@ -65,7 +81,18 @@ func NewLogAuditHandler(logger *log.Logger) *LogAuditHandler {
 // ChannelAuditHandler sends audit events to a channel.
 type ChannelAuditHandler = internal.ChannelHandler
 
-// NewChannelAuditHandler creates a new ChannelAuditHandler.
+// NewChannelAuditHandler creates a new ChannelAuditHandler that sends audit events
+// to the provided channel. The caller is responsible for managing the channel lifecycle.
+//
+// Example:
+//
+//	ch := make(chan env.AuditEvent, 100)
+//	handler := env.NewChannelAuditHandler(ch)
+//	go func() {
+//	    for event := range ch {
+//	        fmt.Println(event)
+//	    }
+//	}()
 func NewChannelAuditHandler(ch chan<- AuditEvent) *ChannelAuditHandler {
 	return internal.NewChannelHandler(ch)
 }
@@ -79,6 +106,16 @@ type CloseableChannelHandler = internal.CloseableChannelHandler
 // NewCloseableChannelHandler creates a new CloseableChannelHandler with a buffered
 // channel of the specified size. The handler owns the channel and will close it
 // when Close() is called.
+//
+// Example:
+//
+//	handler := env.NewCloseableChannelHandler(64)
+//	defer handler.Close()
+//	go func() {
+//	    for event := range handler.Channel() {
+//	        fmt.Println(event)
+//	    }
+//	}()
 func NewCloseableChannelHandler(bufferSize int) *CloseableChannelHandler {
 	return internal.NewCloseableChannelHandler(bufferSize)
 }

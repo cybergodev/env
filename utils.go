@@ -2,6 +2,7 @@ package env
 
 import (
 	"errors"
+	"fmt"
 	"reflect"
 	"strconv"
 	"strings"
@@ -13,6 +14,10 @@ import (
 // ============================================================================
 // Type Constraints
 // ============================================================================
+
+// defaultUnmarshalDepth is the default nesting depth used by UnmarshalMap
+// when no Config is available. Matches the DefaultConfig depth of 10.
+const defaultUnmarshalDepth = 10
 
 // sliceElement is a type constraint for supported slice element types.
 // This constraint is used by GetSlice and GetSliceFrom functions to ensure
@@ -148,6 +153,32 @@ func parseInt(s string, bits int) (int64, error) {
 	return n, nil
 }
 
+// parseUint parses an unsigned integer string with bounds checking.
+func parseUint(s string, bits int) (uint64, error) {
+	n, err := strconv.ParseUint(internal.TrimSpace(s), 10, bits)
+	if err != nil {
+		return 0, &ValidationError{
+			Field:   "uint",
+			Value:   MaskSensitiveInString(s),
+			Message: "invalid unsigned integer value",
+		}
+	}
+	return n, nil
+}
+
+// parseFloat64 parses a floating-point string with bounds checking.
+func parseFloat64(s string) (float64, error) {
+	n, err := strconv.ParseFloat(internal.TrimSpace(s), 64)
+	if err != nil {
+		return 0, &ValidationError{
+			Field:   "float",
+			Value:   MaskSensitiveInString(s),
+			Message: "invalid float value",
+		}
+	}
+	return n, nil
+}
+
 // ============================================================================
 // Marshal/Unmarshal Utilities
 // ============================================================================
@@ -172,7 +203,7 @@ func parseInt(s string, bits int) (int64, error) {
 //
 //	// Struct to YAML format (sorted)
 //	yamlString, _ := env.Marshal(config, env.FormatYAML)
-func Marshal(data interface{}, format ...FileFormat) (string, error) {
+func Marshal(data any, format ...FileFormat) (string, error) {
 	f := FormatEnv
 	if len(format) > 0 {
 		f = format[0]
@@ -190,7 +221,7 @@ func Marshal(data interface{}, format ...FileFormat) (string, error) {
 
 // toMap converts input data to map[string]string.
 // Supports map[string]string and struct types.
-func toMap(data interface{}) (map[string]string, error) {
+func toMap(data any) (map[string]string, error) {
 	if data == nil {
 		return nil, &ValidationError{
 			Field:   "data",
@@ -269,13 +300,13 @@ func detectDataFormat(data string) FileFormat {
 			return FormatYAML
 		}
 
-		// YAML pattern: key: value (with space after colon)
-		// .env pattern: KEY=value
-		if strings.Contains(line, ": ") && !strings.Contains(line, "=") {
+		// YAML pattern: key: value (colon+space takes precedence over equals)
+		// Correctly handles YAML values containing "=" like: connection: host=db port=5432
+		if strings.Contains(line, ": ") {
 			return FormatYAML
 		}
 
-		// .env pattern: contains = but not ": "
+		// .env pattern: contains = (only when no ": " pattern found)
 		if strings.Contains(line, "=") {
 			return FormatEnv
 		}
@@ -335,7 +366,7 @@ func unmarshalJSON(data string) (map[string]string, error) {
 		NullAsEmpty:      true,
 		NumberAsString:   true,
 		BoolAsString:     true,
-		MaxDepth:         10,
+		MaxDepth:         defaultUnmarshalDepth,
 	}
 
 	result, err := internal.FlattenJSON([]byte(data), cfg)
@@ -358,7 +389,7 @@ func unmarshalYAML(data string) (map[string]string, error) {
 		NullAsEmpty:      true,
 		NumberAsString:   true,
 		BoolAsString:     true,
-		MaxDepth:         10,
+		MaxDepth:         defaultUnmarshalDepth,
 	}
 
 	value, err := internal.ParseYAML([]byte(data), cfg.MaxDepth)
@@ -397,7 +428,7 @@ type Unmarshaler interface {
 // MarshalStruct converts a struct to environment variables.
 // Struct fields can be tagged with `env:"KEY"` to specify the env variable name.
 // Nested structs are flattened with underscore-separated keys.
-func MarshalStruct(v interface{}) (map[string]string, error) {
+func MarshalStruct(v any) (map[string]string, error) {
 	// Check for Marshaler interface
 	if m, ok := v.(Marshaler); ok {
 		data, err := m.MarshalEnv()
@@ -430,7 +461,7 @@ func MarshalStruct(v interface{}) (map[string]string, error) {
 //
 //	// JSON format
 //	_ = env.UnmarshalStruct(`{"server": {"host": "localhost"}}`, &cfg, env.FormatJSON)
-func UnmarshalStruct(data string, v interface{}, format ...FileFormat) error {
+func UnmarshalStruct(data string, v any, format ...FileFormat) error {
 	m, err := UnmarshalMap(data, format...)
 	if err != nil {
 		return err
@@ -441,7 +472,7 @@ func UnmarshalStruct(data string, v interface{}, format ...FileFormat) error {
 // UnmarshalInto populates a struct from a map[string]string.
 // Struct fields can be tagged with `env:"KEY"` to specify the env variable name.
 // Optional `envDefault:"value"` sets a default if the key is not found.
-func UnmarshalInto(data map[string]string, v interface{}) error {
+func UnmarshalInto(data map[string]string, v any) error {
 	if v == nil {
 		return &ValidationError{
 			Field:   "value",
@@ -509,11 +540,8 @@ func parseSliceElement[T sliceElement](value string) (T, error) {
 		d, e := parseDuration(trimmed)
 		return any(d).(T), e
 	default:
-		return zero, &ValidationError{
-			Field:   "slice_element",
-			Value:   MaskSensitiveInString(value),
-			Message: "unsupported slice element type",
-		}
+		var zero T
+		return zero, fmt.Errorf("parseSliceElement: unsupported type %T", zero)
 	}
 }
 

@@ -53,12 +53,10 @@ func putScannerBuffer(buf *[]byte) {
 
 // parser handles secure parsing of environment files.
 type parser struct {
-	config      Config
-	validator   Validator
-	auditor     FullAuditLogger
-	lineParser  *internal.LineParser
-	factory     *ComponentFactory
-	ownsFactory bool
+	config     Config
+	validator  Validator
+	auditor    FullAuditLogger
+	lineParser *internal.LineParser
 }
 
 // Compile-time check that parser implements EnvParser.
@@ -74,13 +72,13 @@ func newParserWithFactory(cfg Config, factory *ComponentFactory) (*parser, error
 	}
 
 	p := &parser{}
-	p.configure(cfg, factory, false)
+	p.configure(cfg, factory)
 	return p, nil
 }
 
 // configure sets up the parser with the given configuration and factory.
 // This is the shared initialization logic used by both newParserWithFactory and reset.
-func (p *parser) configure(cfg Config, factory *ComponentFactory, ownsFactory bool) {
+func (p *parser) configure(cfg Config, factory *ComponentFactory) {
 	validator := factory.Validator()
 	auditor := factory.Auditor()
 
@@ -95,9 +93,9 @@ func (p *parser) configure(cfg Config, factory *ComponentFactory, ownsFactory bo
 	// Create LineParser with interfaces instead of concrete types.
 	// The factory provides adapter methods that return internal interfaces.
 	lp := internal.NewLineParser(lineParserCfg,
-		factory.LineParserValidator(),
-		factory.LineParserAuditor(),
-		factory.LineParserExpander(),
+		factory.lineParserValidator(),
+		factory.lineParserAuditor(),
+		factory.lineParserExpander(),
 	)
 	// Set value validator if the validator also implements LineValueValidator
 	if vv, ok := validator.(internal.LineValueValidator); ok {
@@ -108,8 +106,6 @@ func (p *parser) configure(cfg Config, factory *ComponentFactory, ownsFactory bo
 	p.validator = validator
 	p.auditor = auditor
 	p.lineParser = lp
-	p.factory = factory
-	p.ownsFactory = ownsFactory
 }
 
 // Parse reads and parses environment variables from an io.Reader.
@@ -231,18 +227,11 @@ func (p *parser) Parse(r io.Reader, filename string) (map[string]string, error) 
 	return result, nil
 }
 
-// Close releases resources held by the parser.
-// If the parser owns its ComponentFactory, it will also close the factory.
-func (p *parser) Close() error {
-	if p.ownsFactory && p.factory != nil {
-		return p.factory.Close()
-	}
-	return nil
-}
-
 // parseString parses environment variables from a string.
 // This is an internal function used by UnmarshalMap.
 // Uses a shared ComponentFactory to avoid per-call allocation overhead.
+// NOTE: Always uses DefaultConfig — custom key patterns, validators, and limits
+// from user Config are NOT applied. For custom parsing, create a Loader with New().
 func parseString(s string) (map[string]string, error) {
 	cfg := DefaultConfig()
 	factory := getSharedParseFactory()

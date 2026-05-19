@@ -35,12 +35,6 @@ var (
 	// ErrMaxVariables indicates the maximum number of variables has been reached.
 	ErrMaxVariables = errors.New("maximum number of variables exceeded")
 
-	// ErrNullByte indicates a null byte was detected in the input.
-	ErrNullByte = errors.New("null byte detected in input")
-
-	// ErrControlChar indicates a control character was detected in the input.
-	ErrControlChar = errors.New("control character detected in input")
-
 	// ErrInvalidValue indicates the value contains invalid content.
 	// Re-exported from internal/errors for backward compatibility.
 	ErrInvalidValue = ierrors.ErrInvalidValue

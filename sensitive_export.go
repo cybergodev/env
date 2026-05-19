@@ -8,11 +8,6 @@ import (
 // Masking Utilities (re-exported from internal/sensitive)
 // ============================================================================
 
-// sensitiveKeyPatterns defines patterns that indicate sensitive data.
-// This is the single source of truth for sensitive key detection.
-// Keys containing these patterns (case-insensitive) will be masked in logs and errors.
-var sensitiveKeyPatterns = internal.Patterns
-
 // IsSensitiveKey determines if a key likely contains sensitive data.
 func IsSensitiveKey(key string) bool {
 	return internal.IsKey(key)

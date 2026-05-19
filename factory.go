@@ -1,6 +1,4 @@
-// Package env provides environment variable loading and management.
-//
-// # Component Factory
+// Component factory for the env package.
 //
 // This file implements ComponentFactory which creates and manages shared components
 // used by Loader and Parser. It provides a clean lifecycle for validator, auditor,
@@ -28,6 +26,10 @@ type ComponentFactory struct {
 	expander  internal.LineExpander
 	closed    atomic.Bool
 	mu        sync.Mutex // Protects Close()
+
+	// Cached public-facing adapters (set once during construction)
+	cachedValidator Validator
+	cachedAuditor   FullAuditLogger
 }
 
 // Compile-time check that ComponentFactory implements io.Closer.
@@ -35,24 +37,18 @@ var _ io.Closer = (*ComponentFactory)(nil)
 
 // Validator returns the validator component as a Validator interface.
 func (f *ComponentFactory) Validator() Validator {
-	switch v := f.validator.(type) {
-	case Validator:
-		return v
-	default:
-		return &validatorInterfaceWrapper{v}
+	if f == nil {
+		return nil
 	}
+	return f.cachedValidator
 }
 
 // Auditor returns the audit logger component as FullAuditLogger.
 func (f *ComponentFactory) Auditor() FullAuditLogger {
-	switch a := f.auditor.(type) {
-	case *internal.Auditor:
-		return newAuditorAdapter(a)
-	case FullAuditLogger:
-		return a
-	default:
-		return &auditorInterfaceWrapper{a}
+	if f == nil {
+		return nil
 	}
+	return f.cachedAuditor
 }
 
 // Close releases resources held by the factory.
@@ -60,6 +56,9 @@ func (f *ComponentFactory) Auditor() FullAuditLogger {
 // Safe to call multiple times; subsequent calls return nil.
 // This method is safe for concurrent use.
 func (f *ComponentFactory) Close() error {
+	if f == nil {
+		return nil
+	}
 	// Use CompareAndSwap for atomic transition from open to closed state.
 	if !f.closed.CompareAndSwap(false, true) {
 		return nil // Already closed
@@ -78,26 +77,32 @@ func (f *ComponentFactory) Close() error {
 // IsClosed returns true if the factory has been closed.
 // This method is safe for concurrent use.
 func (f *ComponentFactory) IsClosed() bool {
+	if f == nil {
+		return true
+	}
 	return f.closed.Load()
 }
 
-// LineParserValidator returns the validator as internal.LineKeyValidator interface.
-func (f *ComponentFactory) LineParserValidator() internal.LineKeyValidator {
+// lineParserValidator returns the validator as internal.LineKeyValidator interface.
+func (f *ComponentFactory) lineParserValidator() internal.LineKeyValidator {
 	return f.validator
 }
 
-// LineParserAuditor returns the auditor as internal.LineAuditLogger interface.
-func (f *ComponentFactory) LineParserAuditor() internal.LineAuditLogger {
+// lineParserAuditor returns the auditor as internal.LineAuditLogger interface.
+func (f *ComponentFactory) lineParserAuditor() internal.LineAuditLogger {
 	return f.auditor
 }
 
-// LineParserExpander returns the expander as internal.LineExpander interface.
-func (f *ComponentFactory) LineParserExpander() internal.LineExpander {
+// lineParserExpander returns the expander as internal.LineExpander interface.
+func (f *ComponentFactory) lineParserExpander() internal.LineExpander {
 	return f.expander
 }
 
 // Expander returns the expander as VariableExpander interface.
 func (f *ComponentFactory) Expander() VariableExpander {
+	if f == nil {
+		return nil
+	}
 	// VariableExpander and internal.LineExpander are now the same type
 	// via type aliases, so direct return works
 	return f.expander
@@ -179,5 +184,31 @@ func (c *Config) buildComponentFactoryWithFS(fs FileSystem) *ComponentFactory {
 		})
 	}
 
+	// Pre-compute public-facing adapters once
+	factory.cachedValidator = factory.buildValidatorAdapter()
+	factory.cachedAuditor = factory.buildAuditorAdapter()
+
 	return factory
+}
+
+// buildValidatorAdapter creates the public Validator adapter from the internal validator.
+func (f *ComponentFactory) buildValidatorAdapter() Validator {
+	switch v := f.validator.(type) {
+	case Validator:
+		return v
+	default:
+		return &validatorInterfaceWrapper{v}
+	}
+}
+
+// buildAuditorAdapter creates the public FullAuditLogger adapter from the internal auditor.
+func (f *ComponentFactory) buildAuditorAdapter() FullAuditLogger {
+	switch a := f.auditor.(type) {
+	case *internal.Auditor:
+		return newAuditorAdapter(a)
+	case FullAuditLogger:
+		return a
+	default:
+		return &auditorInterfaceWrapper{a}
+	}
 }

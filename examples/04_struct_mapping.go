@@ -16,7 +16,7 @@ import (
 type AppConfig struct {
 	Name    string `env:"APP_NAME"`
 	Port    int    `env:"APP_PORT"`
-	Debug   bool   `env:"DEBUG"`
+	Debug   bool   `env:"APP_DEBUG"`
 	Version string `env:"APP_VERSION" envDefault:"1.0.0"`
 }
 
@@ -85,8 +85,9 @@ func demonstrateStructWithDefaults() {
 
 func demonstrateNestedStruct() {
 	fmt.Println("\n=== Nested Struct ===")
-	// Nested structs are populated from loaded environment variables
-	// The env tags map flat keys to nested struct fields
+	// Nested structs are populated from loaded environment variables.
+	// The YAML/JSON parser flattens nested keys to UPPER_CASE (e.g. app.name → APP_NAME)
+	// which then maps to the env tags in each nested struct field.
 	var cfg FullConfig
 	if err := env.ParseInto(&cfg); err != nil {
 		log.Fatalf("Failed to parse: %v", err)

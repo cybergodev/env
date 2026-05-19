@@ -362,6 +362,44 @@ func TestExpansionError_NoKey(t *testing.T) {
 // Sentinel Errors Tests
 // ============================================================================
 
+func TestValidationError_Is(t *testing.T) {
+	tests := []struct {
+		name string
+		err  *ValidationError
+		target error
+		match  bool
+	}{
+		{"value rule matches ErrInvalidValue", &ValidationError{Rule: "value"}, ErrInvalidValue, true},
+		{"null_byte rule matches ErrInvalidValue", &ValidationError{Rule: "null_byte"}, ErrInvalidValue, true},
+		{"control_char rule matches ErrInvalidValue", &ValidationError{Rule: "control_char"}, ErrInvalidValue, true},
+		{"utf8 rule matches ErrInvalidValue", &ValidationError{Rule: "utf8"}, ErrInvalidValue, true},
+		{"key rule does not match ErrInvalidValue", &ValidationError{Rule: "key"}, ErrInvalidValue, false},
+		{"empty rule does not match ErrInvalidValue", &ValidationError{Rule: ""}, ErrInvalidValue, false},
+		{"config rule does not match ErrInvalidValue", &ValidationError{Rule: "config"}, ErrInvalidValue, false},
+		{"does not match wrong target", &ValidationError{Rule: "value"}, ErrFileTooLarge, false},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := errors.Is(tt.err, tt.target); got != tt.match {
+				t.Errorf("errors.Is(%v, %v) = %v, want %v", tt.err, tt.target, got, tt.match)
+			}
+		})
+	}
+}
+
+func TestSecurityError_Is(t *testing.T) {
+	err := &SecurityError{Action: "set", Key: "FORBIDDEN", Reason: "blocked"}
+
+	if !errors.Is(err, ErrSecurityViolation) {
+		t.Error("errors.Is(SecurityError, ErrSecurityViolation) = false, want true")
+	}
+
+	if errors.Is(err, ErrFileTooLarge) {
+		t.Error("errors.Is(SecurityError, ErrFileTooLarge) = true, want false")
+	}
+}
+
 func TestSentinelErrors(t *testing.T) {
 	// Verify sentinel errors are defined
 	sentinelErrors := []error{

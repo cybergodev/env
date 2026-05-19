@@ -1,29 +1,55 @@
 package env
 
 import (
+	"errors"
 	"fmt"
+	"io"
+	"time"
 
 	"github.com/cybergodev/env/internal"
 )
 
 // structuredParserConfig holds common configuration for structured file parsers (JSON/YAML).
-// This is used internally to share validation logic between parsers.
 type structuredParserConfig struct {
 	config    Config
 	validator Validator
 	auditor   FullAuditLogger
 }
 
+// structuredParseResult wraps common SecureReader + validation logic for JSON and YAML parsers.
+// flattenFn receives raw bytes and returns the flattened key-value map.
+func (c *structuredParserConfig) structuredParseResult(
+	r io.Reader, filename, formatName string,
+	flattenFn func(data []byte) (map[string]string, error),
+) (map[string]string, error) {
+	start := time.Now()
+
+	secureRd := internal.NewSecureReader(r, c.config.MaxFileSize, c.config.MaxLineLength)
+	data, err := io.ReadAll(secureRd)
+	if err != nil {
+		if errors.Is(err, internal.ErrFileTooLarge) || errors.Is(err, internal.ErrLineTooLong) {
+			_ = c.auditor.LogError(internal.ActionParse, "", "file exceeds size limit")
+			return nil, &FileError{Path: filename, Op: "size_check", Err: err}
+		}
+		return nil, err
+	}
+
+	result, err := flattenFn(data)
+	if err != nil {
+		_ = c.auditor.LogError(internal.ActionParse, "", "invalid "+formatName)
+		return nil, err
+	}
+
+	if err := c.validateResult(result, formatName); err != nil {
+		return nil, err
+	}
+
+	_ = c.auditor.LogWithDuration(internal.ActionParse, "", "parsed "+formatName+": "+filename, true, time.Since(start))
+	return result, nil
+}
+
 // validateResult validates parsed key-value pairs from structured files (JSON/YAML).
-// It checks:
-//   - Maximum variable count
-//   - Key pattern validity (using IsValidJSONKey for both JSON and YAML)
-//   - Value validation (if enabled in config)
-//   - Required keys presence
-//
-// Returns an error if validation fails, nil otherwise.
 func (c *structuredParserConfig) validateResult(result map[string]string, format string) error {
-	// Check result size against config
 	if len(result) > c.config.MaxVariables {
 		_ = c.auditor.LogError(internal.ActionParse, "", "maximum variables exceeded")
 		return &ValidationError{
@@ -32,10 +58,7 @@ func (c *structuredParserConfig) validateResult(result map[string]string, format
 		}
 	}
 
-	// Validate each key and value using fast byte-level validation
 	for key, val := range result {
-		// Use fast byte-level validation (allows @, -, ., etc.)
-		// Note: Both JSON and YAML use the same key validation pattern
 		if !internal.IsValidJSONKey(key) {
 			_ = c.auditor.LogError(internal.ActionParse, key, "key does not match "+format+" key pattern")
 			return &ValidationError{
@@ -53,7 +76,6 @@ func (c *structuredParserConfig) validateResult(result map[string]string, format
 		}
 	}
 
-	// Validate required keys
 	upperKeys := internal.KeysToUpperPooled(result)
 	err := c.validator.ValidateRequired(upperKeys)
 	internal.PutKeysToUpperMap(upperKeys)

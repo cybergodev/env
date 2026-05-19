@@ -4,6 +4,57 @@ All notable changes to the cybergodev/env library will be documented in this fil
 
 ---
 
+## v1.2.0 - Unified Key Resolution & Production Hardening (2026-05-20)
+
+### Breaking
+- Lazy singleton init removed — `Load()` must be called before convenience functions; returns `ErrNotInitialized` otherwise
+- `ComponentFactory.LineParserValidator/Auditor/Expander()` privatized (returned internal-only types)
+- Parser `Close()` methods removed (were no-ops; parsers own no resources)
+- `SecureValue.String()` returns masked representation — use `Reveal()` for plaintext
+
+### Added
+- `GetFloat64()` / `GetUint64()` — typed access for float64 and uint64 values (instance + global)
+- `ErrNotInitialized` — sentinel error for uninitialized default loader
+- `SetMemoryLockStrict()` / `NewSecureValueStrict()` — strict memory lock mode
+- `DetectFormat()` — auto-detect file format (.env / JSON / YAML) from content
+- `ResolveKeyName()` / `LookupInMap()` — shared case-insensitive + dot-notation key resolution
+- `EqualFoldASCII()` / `HasUpperPrefix()` — zero-allocation ASCII case utilities
+- `PutBuilderDiscard()` — opt-out of builder pooling for sensitive content
+- `ReleaseValue()` — return YAML `Value` nodes to sync.Pool after use
+- Windows forbidden keys: COMSPEC, PATHEXT, SYSTEMROOT, WINDIR
+- Nil receiver guards on SecureValue (10 methods), Loader (17 methods), ComponentFactory
+- 21 `Example*` test functions for pkg.go.dev documentation visibility
+
+### Changed
+- Key resolution unified: `GetSecure`, `StructInto`, `Lookup` all use case-insensitive + dot-notation strategy
+- Prefix filtering in `LoadFiles` is case-insensitive
+- `CloseableChannelHandler.Log` returns error when channel full instead of blocking
+- `BufferedHandler.Close` guarantees flush goroutine exits via `sync.WaitGroup`
+- `ValidationError.Is()` only matches `ErrInvalidValue` for value-related rules
+
+### Fixed
+- TOCTOU race in `GetSecure` — single atomic lookup replaces two-step exists+get
+- `ResetDefaultLoader` race — `Close()` runs under mutex
+- JSON/YAML `SecureReader` `MaxLineLength` was hardcoded 0 (unlimited line length)
+- Empty string values incorrectly treated as "not found" in Get/GetSecure/ToMap
+- Concurrent Close+Log panic in `CloseableChannelHandler` (mutex around channel close)
+- Recursive comment skipping stack overflow in `parseNestedValue` (iterative loop)
+- Duplicate package doc comments causing godoc conflict
+- Benchmark temp paths blocked by path validator on Windows
+- Example code printed passwords in plaintext; used wrong struct tags
+
+### Performance
+- `Parser_WithExpansion`: -25% time, -54% memory, -48% allocs
+- `YAMLParser_Medium`: -16% time, -24% memory, -54% allocs
+- `YAMLParser_Small`: -11% time, -26% memory, -48% allocs
+- `Expander_SingleVariable`: -19% time; `BracedVariable`: -14% time
+- `Parser_LargeFile`: -11% time
+- `looksLikeNumber()` fast path eliminates ~732 MB/iter of failed parse allocations
+- YAML/JSON key builder uses direct concatenation for keys ≤64 chars (avoids pool overhead)
+- `buildArrayIndex` coverage: 34.8% → 100%; overall: 83.0% → 87.9%
+
+---
+
 ## v1.1.1 - Production Readiness & Performance (2026-05-07)
 
 ### Added

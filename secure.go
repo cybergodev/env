@@ -23,7 +23,7 @@ import (
 // 2. NewSecureValue() sets the finalizer when taking from pool
 // This avoids "finalizer already set" panics.
 var secureValuePool = sync.Pool{
-	New: func() interface{} {
+	New: func() any {
 		return &SecureValue{}
 	},
 }
@@ -210,7 +210,7 @@ func (sv *SecureValue) finalize() {
 	defer sv.mu.Unlock()
 
 	// Double-check after acquiring lock (standard pattern)
-	if sv.closed.Load() || sv.data == nil {
+	if sv.closed.Load() {
 		return
 	}
 
@@ -248,6 +248,9 @@ func (sv *SecureValue) clearDataLocked() {
 // fmt.Printf, log.Println, or error wrapping. For the actual plaintext value,
 // use Reveal() explicitly.
 func (sv *SecureValue) String() string {
+	if sv == nil {
+		return "[NIL]"
+	}
 	return sv.Masked()
 }
 
@@ -257,9 +260,12 @@ func (sv *SecureValue) String() string {
 // Use this only when the actual value is needed for cryptographic operations,
 // API calls, or similar secure processing.
 func (sv *SecureValue) Reveal() string {
+	if sv == nil {
+		return ""
+	}
 	sv.mu.RLock()
 	defer sv.mu.RUnlock()
-	if sv.closed.Load() || sv.data == nil {
+	if sv.closed.Load() {
 		return ""
 	}
 	return string(sv.data)
@@ -268,9 +274,12 @@ func (sv *SecureValue) Reveal() string {
 // Bytes returns a copy of the value as a byte slice.
 // The caller is responsible for securely clearing the returned slice using ClearBytes.
 func (sv *SecureValue) Bytes() []byte {
+	if sv == nil {
+		return nil
+	}
 	sv.mu.RLock()
 	defer sv.mu.RUnlock()
-	if sv.closed.Load() || sv.data == nil {
+	if sv.closed.Load() {
 		return nil
 	}
 	result := make([]byte, len(sv.data))
@@ -280,9 +289,12 @@ func (sv *SecureValue) Bytes() []byte {
 
 // Length returns the length of the value without exposing it.
 func (sv *SecureValue) Length() int {
+	if sv == nil {
+		return 0
+	}
 	sv.mu.RLock()
 	defer sv.mu.RUnlock()
-	if sv.closed.Load() || sv.data == nil {
+	if sv.closed.Load() {
 		return 0
 	}
 	return len(sv.data)
@@ -293,6 +305,9 @@ func (sv *SecureValue) Length() int {
 // Note: This method does NOT return the SecureValue to the pool.
 // For explicit pool return, use Release() instead.
 func (sv *SecureValue) Close() error {
+	if sv == nil {
+		return nil
+	}
 	sv.mu.Lock()
 	defer sv.mu.Unlock()
 	if sv.closed.Load() {
@@ -311,6 +326,9 @@ func (sv *SecureValue) Close() error {
 // 1. The object can be safely reused without finalizer interference
 // 2. NewSecureValue() will set a fresh finalizer when the object is reused
 func (sv *SecureValue) Release() {
+	if sv == nil {
+		return
+	}
 	sv.mu.Lock()
 	defer sv.mu.Unlock()
 	if sv.closed.Load() {
@@ -327,6 +345,9 @@ func (sv *SecureValue) Release() {
 
 // IsClosed returns true if the value has been closed.
 func (sv *SecureValue) IsClosed() bool {
+	if sv == nil {
+		return true
+	}
 	return sv.closed.Load()
 }
 
@@ -335,6 +356,9 @@ var _ io.Closer = (*SecureValue)(nil)
 
 // Masked returns a masked representation for logging.
 func (sv *SecureValue) Masked() string {
+	if sv == nil {
+		return "[NIL]"
+	}
 	sv.mu.RLock()
 	defer sv.mu.RUnlock()
 	if sv.closed.Load() {
@@ -363,6 +387,9 @@ func (sv *SecureValue) Masked() string {
 // (protected from being swapped to disk).
 // Returns false if memory locking is not enabled or if locking failed.
 func (sv *SecureValue) IsMemoryLocked() bool {
+	if sv == nil {
+		return false
+	}
 	sv.mu.RLock()
 	defer sv.mu.RUnlock()
 	return sv.locked && !sv.closed.Load()
@@ -372,6 +399,9 @@ func (sv *SecureValue) IsMemoryLocked() bool {
 // Returns nil if locking was successful or not attempted.
 // This is useful in strict mode to detect if memory locking failed.
 func (sv *SecureValue) MemoryLockError() error {
+	if sv == nil {
+		return nil
+	}
 	sv.mu.RLock()
 	defer sv.mu.RUnlock()
 	return sv.lockErr
@@ -575,14 +605,16 @@ func (sm *secureMap) Get(key string) (string, bool) {
 	}
 	// Acquire SecureValue's read lock for consistency with GetSecure/ToMap
 	sv.mu.RLock()
-	closed := sv.closed.Load() || sv.data == nil
-	var result string
-	if !closed {
-		result = string(sv.data)
+	if sv.closed.Load() {
+		sv.mu.RUnlock()
+		shard.mu.RUnlock()
+		return "", false
 	}
+	// data may be nil for empty string values — string(nil) == "" is correct
+	result := string(sv.data)
 	sv.mu.RUnlock()
 	shard.mu.RUnlock()
-	return result, !closed
+	return result, true
 }
 
 // GetSecure retrieves a copy of the SecureValue for the given key.
@@ -606,7 +638,7 @@ func (sm *secureMap) GetSecure(key string) *SecureValue {
 	if sv, ok := shard.values[key]; ok {
 		// Acquire SecureValue's read lock to prevent data race
 		sv.mu.RLock()
-		if sv.closed.Load() || sv.data == nil {
+		if sv.closed.Load() {
 			sv.mu.RUnlock()
 			return nil
 		}
@@ -660,7 +692,7 @@ func (sm *secureMap) Clear() {
 //
 // Note: In concurrent scenarios, the returned slice may have slightly different
 // capacity than the actual number of keys due to concurrent modifications.
-// This is a performance optimization - the capacity is estimate is approximate
+// This is a performance optimization - the capacity estimate is approximate
 // and the actual key count may differ by the time the slice is allocated
 // and the time keys are collected. The slice will grow automatically if needed.
 // For an exact snapshot, external synchronization is required.
@@ -718,7 +750,7 @@ func (sm *secureMap) ToMap() map[string]string {
 		for k, sv := range shard.values {
 			// Acquire SecureValue's read lock to prevent data race
 			sv.mu.RLock()
-			if !sv.closed.Load() && sv.data != nil {
+			if !sv.closed.Load() {
 				result[k] = string(sv.data)
 			}
 			sv.mu.RUnlock()

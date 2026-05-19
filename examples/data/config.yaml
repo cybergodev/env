@@ -22,6 +22,8 @@ cache:
   hosts:
     - redis1:6379
     - redis2:6379
+  ratio: 0.85
+  max_size: 2048
 
 # Feature Flags
 features:

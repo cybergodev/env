@@ -1,6 +1,7 @@
 package internal
 
 import (
+	"strings"
 	"testing"
 )
 
@@ -694,5 +695,315 @@ func TestFlattenYAML_NilInArray(t *testing.T) {
 	// Index 1 is nil, should be skipped
 	if result["ITEMS_2"] != "three" {
 		t.Errorf("result[\"ITEMS_2\"] = %q, want %q", result["ITEMS_2"], "three")
+	}
+}
+
+func TestFlattenYAML_LongKeys(t *testing.T) {
+	cfg := YAMLFlattenConfig{
+		KeyDelimiter:     "_",
+		ArrayIndexFormat: "underscore",
+		NullAsEmpty:      true,
+		NumberAsString:   true,
+		BoolAsString:     true,
+		MaxDepth:         10,
+	}
+
+	// Build a long key that exceeds 64 chars to hit builder path
+	longKey := "a"
+	for i := 0; i < 70; i++ {
+		longKey += "b"
+	}
+
+	value := &Value{
+		Type: ValueTypeMap,
+		Map: map[string]*Value{
+			longKey: {
+				Type: ValueTypeMap,
+				Map: map[string]*Value{
+					"nested": NewScalarValue("value", 1, 1),
+				},
+			},
+		},
+	}
+
+	result, err := FlattenYAML(value, cfg)
+	if err != nil {
+		t.Fatalf("FlattenYAML() error = %v", err)
+	}
+
+	if len(result) != 1 {
+		t.Errorf("expected 1 item, got %d", len(result))
+	}
+
+	for k := range result {
+		if len(k) < 70 {
+			t.Errorf("expected key length >= 70, got %d: %q", len(k), k)
+		}
+	}
+}
+
+func TestFlattenYAML_BracketArrayFormat(t *testing.T) {
+	cfg := YAMLFlattenConfig{
+		KeyDelimiter:     "_",
+		ArrayIndexFormat: "bracket",
+		NullAsEmpty:      true,
+		NumberAsString:   true,
+		BoolAsString:     true,
+		MaxDepth:         10,
+	}
+
+	value := &Value{
+		Type: ValueTypeMap,
+		Map: map[string]*Value{
+			"items": {
+				Type: ValueTypeArray,
+				Array: []*Value{
+					NewScalarValue("a", 1, 1),
+					NewScalarValue("b", 1, 1),
+					NewScalarValue("c", 1, 1),
+				},
+			},
+		},
+	}
+
+	result, err := FlattenYAML(value, cfg)
+	if err != nil {
+		t.Fatalf("FlattenYAML() error = %v", err)
+	}
+
+	if result["ITEMS[0]"] != "a" {
+		t.Errorf("ITEMS[0] = %q, want %q", result["ITEMS[0]"], "a")
+	}
+	if result["ITEMS[1]"] != "b" {
+		t.Errorf("ITEMS[1] = %q, want %q", result["ITEMS[1]"], "b")
+	}
+}
+
+func TestFlattenYAML_InlineJSON(t *testing.T) {
+	cfg := YAMLFlattenConfig{
+		KeyDelimiter:     "_",
+		ArrayIndexFormat: "underscore",
+		NullAsEmpty:      true,
+		NumberAsString:   true,
+		BoolAsString:     true,
+		MaxDepth:         10,
+	}
+
+	// Test with inline JSON-like string value
+	value := &Value{
+		Type: ValueTypeMap,
+		Map: map[string]*Value{
+			"config": NewScalarValue(`{"nested": {"key": "value"}}`, 1, 1),
+		},
+	}
+
+	result, err := FlattenYAML(value, cfg)
+	if err != nil {
+		t.Fatalf("FlattenYAML() error = %v", err)
+	}
+
+	// Should detect inline JSON and flatten it
+	found := false
+	for k := range result {
+		if len(k) > 0 {
+			found = true
+		}
+	}
+	if !found {
+		t.Error("expected at least one key from flattened data")
+	}
+}
+
+func TestFlattenYAML_LongKeyWithBracketFormat(t *testing.T) {
+	cfg := YAMLFlattenConfig{
+		KeyDelimiter:     "_",
+		ArrayIndexFormat: "bracket",
+		NullAsEmpty:      true,
+		NumberAsString:   true,
+		BoolAsString:     true,
+		MaxDepth:         10,
+	}
+
+	longKey := strings.Repeat("K", 70)
+	value := &Value{
+		Type: ValueTypeMap,
+		Map: map[string]*Value{
+			longKey: {
+				Type:  ValueTypeArray,
+				Array: []*Value{NewScalarValue("a", 1, 1), NewScalarValue("b", 1, 1)},
+			},
+		},
+	}
+
+	result, err := FlattenYAML(value, cfg)
+	if err != nil {
+		t.Fatalf("FlattenYAML() error = %v", err)
+	}
+	if len(result) != 2 {
+		t.Errorf("expected 2 items, got %d", len(result))
+	}
+	for k := range result {
+		if !strings.Contains(k, "[") {
+			t.Errorf("expected bracket in key %q", k)
+		}
+	}
+}
+
+func TestFlattenYAML_InlineJSONNull(t *testing.T) {
+	cfg := YAMLFlattenConfig{
+		KeyDelimiter:     "_",
+		ArrayIndexFormat: "underscore",
+		NullAsEmpty:      false,
+		NumberAsString:   true,
+		BoolAsString:     true,
+		MaxDepth:         10,
+	}
+
+	value := &Value{
+		Type: ValueTypeMap,
+		Map: map[string]*Value{
+			"key": NewScalarValue(`{"sub": null}`, 1, 1),
+		},
+	}
+
+	result, err := FlattenYAML(value, cfg)
+	if err != nil {
+		t.Fatalf("FlattenYAML() error = %v", err)
+	}
+	if result["KEY_SUB"] != "null" {
+		t.Errorf("KEY_SUB = %q, want %q", result["KEY_SUB"], "null")
+	}
+}
+
+func TestFlattenYAML_InlineJSONBool(t *testing.T) {
+	cfg := YAMLFlattenConfig{
+		KeyDelimiter:     "_",
+		ArrayIndexFormat: "underscore",
+		NullAsEmpty:      true,
+		NumberAsString:   true,
+		BoolAsString:     false,
+		MaxDepth:         10,
+	}
+
+	value := &Value{
+		Type: ValueTypeMap,
+		Map: map[string]*Value{
+			"key": NewScalarValue(`{"flag": true}`, 1, 1),
+		},
+	}
+
+	result, err := FlattenYAML(value, cfg)
+	if err != nil {
+		t.Fatalf("FlattenYAML() error = %v", err)
+	}
+	if result["KEY_FLAG"] != "true" {
+		t.Errorf("KEY_FLAG = %q, want %q", result["KEY_FLAG"], "true")
+	}
+}
+
+func TestFlattenYAML_InlineJSONNumber(t *testing.T) {
+	cfg := YAMLFlattenConfig{
+		KeyDelimiter:     "_",
+		ArrayIndexFormat: "underscore",
+		NullAsEmpty:      true,
+		NumberAsString:   false,
+		BoolAsString:     true,
+		MaxDepth:         10,
+	}
+
+	value := &Value{
+		Type: ValueTypeMap,
+		Map: map[string]*Value{
+			"key": NewScalarValue(`{"count": 42}`, 1, 1),
+		},
+	}
+
+	result, err := FlattenYAML(value, cfg)
+	if err != nil {
+		t.Fatalf("FlattenYAML() error = %v", err)
+	}
+	if result["KEY_COUNT"] != "42" {
+		t.Errorf("KEY_COUNT = %q, want %q", result["KEY_COUNT"], "42")
+	}
+}
+
+func TestFlattenYAML_InlineJSONNested(t *testing.T) {
+	cfg := YAMLFlattenConfig{
+		KeyDelimiter:     "_",
+		ArrayIndexFormat: "underscore",
+		NullAsEmpty:      true,
+		NumberAsString:   true,
+		BoolAsString:     true,
+		MaxDepth:         10,
+	}
+
+	value := &Value{
+		Type: ValueTypeMap,
+		Map: map[string]*Value{
+			"key": NewScalarValue(`{"a": {"b": "deep"}}`, 1, 1),
+		},
+	}
+
+	result, err := FlattenYAML(value, cfg)
+	if err != nil {
+		t.Fatalf("FlattenYAML() error = %v", err)
+	}
+	if result["KEY_A_B"] != "deep" {
+		t.Errorf("KEY_A_B = %q, want %q", result["KEY_A_B"], "deep")
+	}
+}
+
+func TestFlattenYAML_InlineJSONArrayOfObjects(t *testing.T) {
+	cfg := YAMLFlattenConfig{
+		KeyDelimiter:     "_",
+		ArrayIndexFormat: "underscore",
+		NullAsEmpty:      true,
+		NumberAsString:   true,
+		BoolAsString:     true,
+		MaxDepth:         10,
+	}
+
+	value := &Value{
+		Type: ValueTypeMap,
+		Map: map[string]*Value{
+			"servers": NewScalarValue(`[{"host": "a"}, {"host": "b"}]`, 1, 1),
+		},
+	}
+
+	result, err := FlattenYAML(value, cfg)
+	if err != nil {
+		t.Fatalf("FlattenYAML() error = %v", err)
+	}
+	if result["SERVERS_0_HOST"] != "a" {
+		t.Errorf("SERVERS_0_HOST = %q, want %q", result["SERVERS_0_HOST"], "a")
+	}
+	if result["SERVERS_1_HOST"] != "b" {
+		t.Errorf("SERVERS_1_HOST = %q, want %q", result["SERVERS_1_HOST"], "b")
+	}
+}
+
+func TestFlattenYAML_ConvertScalar_FloatNotString(t *testing.T) {
+	cfg := YAMLFlattenConfig{
+		KeyDelimiter:     "_",
+		ArrayIndexFormat: "underscore",
+		NullAsEmpty:      true,
+		NumberAsString:   false,
+		BoolAsString:     true,
+		MaxDepth:         10,
+	}
+
+	value := &Value{
+		Type: ValueTypeMap,
+		Map: map[string]*Value{
+			"pi": NewScalarValue("3.14", 1, 1),
+		},
+	}
+
+	result, err := FlattenYAML(value, cfg)
+	if err != nil {
+		t.Fatalf("FlattenYAML() error = %v", err)
+	}
+	if result["PI"] != "3.14" {
+		t.Errorf("PI = %q, want %q", result["PI"], "3.14")
 	}
 }

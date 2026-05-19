@@ -5,7 +5,46 @@ import (
 )
 
 // ============================================================================
-// Package-level Convenience Functions
+// Package-level Convenience Functions (Global Mode)
+// ============================================================================
+//
+// This file implements the Global Mode API — a set of package-level functions
+// that delegate to a singleton Loader instance. These functions provide the
+// simplest way to use the library for applications with a single configuration.
+//
+// # Usage Pattern
+//
+// Call Load() or LoadWithConfig() once at startup, then use the getter/setter
+// functions freely throughout the application:
+//
+//	err := env.Load(".env")
+//	if err != nil {
+//	    log.Fatal(err)
+//	}
+//	port := env.GetInt("PORT", 8080)
+//	host := env.GetString("DATABASE_HOST", "localhost")
+//
+// # Relationship to Instance Mode
+//
+// Every package-level function is a thin proxy over the corresponding Loader
+// method. The two modes share identical method signatures:
+//
+//	env.GetString("KEY")        // Global Mode
+//	loader.GetString("KEY")     // Instance Mode
+//
+// Use Global Mode when you need a single, application-wide configuration.
+// Use Instance Mode (New + Loader methods) for tests, multiple configs, or
+// explicit lifecycle control. See env.go package documentation for details.
+//
+// # Uninitialized Behavior
+//
+// If no loader has been set (Load/LoadWithConfig not called), the functions
+// behave as follows:
+//   - Get* functions: return the provided default value (or zero value)
+//   - Lookup: returns ("", false)
+//   - Keys/All/Len/GetSecure: return nil/0
+//   - Set/Delete/Validate/ParseInto: return ErrNotInitialized
+//
 // ============================================================================
 
 // withLoader executes a function with the default loader.
@@ -19,24 +58,15 @@ func withLoader[T any](fn func(*Loader) T, def T) T {
 	return fn(loader)
 }
 
-// withLoaderError executes a function with the default loader that may return an error.
-// If the loader cannot be obtained, returns the error directly.
-func withLoaderError[T any](fn func(*Loader) (T, error)) (T, error) {
-	loader, err := getDefaultLoader()
-	if err != nil {
-		var zero T
-		return zero, err
-	}
-	return fn(loader)
-}
-
 // GetString retrieves a value from the default loader with optional default.
-// Returns an empty string if the loader cannot be initialized or the key is not found
-// and no default is provided.
+// Requires Load() or LoadWithConfig() to have been called first.
+// Returns an empty string if the key is not found and no default is provided.
+// Returns the provided default value (or zero value) if no loader is initialized.
 // Use Lookup to distinguish between "not found" and "empty value".
 //
 // Example:
 //
+//	env.Load(".env")
 //	value := env.GetString("KEY")           // Returns "" if not found
 //	value := env.GetString("KEY", "default") // Returns "default" if not found
 func GetString(key string, defaultValue ...string) string {
@@ -46,11 +76,13 @@ func GetString(key string, defaultValue ...string) string {
 }
 
 // GetInt retrieves an integer value from the default loader with optional default.
-// Returns 0 if the loader cannot be initialized or the key is not found
-// and no default is provided.
+// Requires Load() or LoadWithConfig() to have been called first.
+// Returns 0 if the key is not found and no default is provided.
+// Returns the provided default value (or zero value) if no loader is initialized.
 //
 // Example:
 //
+//	env.Load(".env")
 //	port := env.GetInt("PORT")           // Returns 0 if not found
 //	port := env.GetInt("PORT", 8080)     // Returns 8080 if not found
 func GetInt(key string, defaultValue ...int64) int64 {
@@ -60,11 +92,13 @@ func GetInt(key string, defaultValue ...int64) int64 {
 }
 
 // GetBool retrieves a boolean value from the default loader with optional default.
-// Returns false if the loader cannot be initialized or the key is not found
-// and no default is provided.
+// Requires Load() or LoadWithConfig() to have been called first.
+// Returns false if the key is not found and no default is provided.
+// Returns the provided default value (or zero value) if no loader is initialized.
 //
 // Example:
 //
+//	env.Load(".env")
 //	debug := env.GetBool("DEBUG")           // Returns false if not found
 //	debug := env.GetBool("DEBUG", true)     // Returns true if not found
 func GetBool(key string, defaultValue ...bool) bool {
@@ -73,12 +107,46 @@ func GetBool(key string, defaultValue ...bool) bool {
 	}, firstOrZero(defaultValue...))
 }
 
-// GetDuration retrieves a duration value from the default loader with optional default.
-// Returns 0 if the loader cannot be initialized or the key is not found
-// and no default is provided.
+// GetUint64 retrieves an unsigned integer value from the default loader with optional default.
+// Requires Load() or LoadWithConfig() to have been called first.
+// Returns 0 if the key is not found and no default is provided.
+// Returns the provided default value (or zero value) if no loader is initialized.
 //
 // Example:
 //
+//	env.Load(".env")
+//	port := env.GetUint64("PORT")           // Returns 0 if not found
+//	port := env.GetUint64("PORT", 8080)     // Returns 8080 if not found
+func GetUint64(key string, defaultValue ...uint64) uint64 {
+	return withLoader(func(l *Loader) uint64 {
+		return l.GetUint64(key, defaultValue...)
+	}, firstOrZero(defaultValue...))
+}
+
+// GetFloat64 retrieves a floating-point value from the default loader with optional default.
+// Requires Load() or LoadWithConfig() to have been called first.
+// Returns 0 if the key is not found and no default is provided.
+// Returns the provided default value (or zero value) if no loader is initialized.
+//
+// Example:
+//
+//	env.Load(".env")
+//	rate := env.GetFloat64("RATE")           // Returns 0 if not found
+//	rate := env.GetFloat64("RATE", 0.5)      // Returns 0.5 if not found
+func GetFloat64(key string, defaultValue ...float64) float64 {
+	return withLoader(func(l *Loader) float64 {
+		return l.GetFloat64(key, defaultValue...)
+	}, firstOrZero(defaultValue...))
+}
+
+// GetDuration retrieves a duration value from the default loader with optional default.
+// Requires Load() or LoadWithConfig() to have been called first.
+// Returns 0 if the key is not found and no default is provided.
+// Returns the provided default value (or zero value) if no loader is initialized.
+//
+// Example:
+//
+//	env.Load(".env")
 //	timeout := env.GetDuration("TIMEOUT")                  // Returns 0 if not found
 //	timeout := env.GetDuration("TIMEOUT", 30*time.Second) // Returns 30s if not found
 func GetDuration(key string, defaultValue ...time.Duration) time.Duration {
@@ -88,9 +156,12 @@ func GetDuration(key string, defaultValue ...time.Duration) time.Duration {
 }
 
 // Lookup retrieves a value and existence from the default loader.
+// Requires Load() or LoadWithConfig() to have been called first.
+// Returns ("", false) if no loader is initialized.
 //
 // Example:
 //
+//	env.Load(".env")
 //	value, exists := env.Lookup("DATABASE_URL")
 //	if !exists {
 //	    log.Fatal("DATABASE_URL is required")
@@ -104,38 +175,52 @@ func Lookup(key string) (string, bool) {
 }
 
 // Set sets a value in the default loader.
+// Requires Load() or LoadWithConfig() to have been called first.
+// Returns ErrNotInitialized if no loader is initialized.
 //
 // Example:
 //
+//	env.Load(".env")
 //	if err := env.Set("DEBUG", "true"); err != nil {
 //	    log.Fatal(err)
 //	}
 func Set(key, value string) error {
-	_, err := withLoaderError(func(l *Loader) (struct{}, error) {
-		return struct{}{}, l.Set(key, value)
-	})
-	return err
+	loader, err := getDefaultLoader()
+	if err != nil {
+		return err
+	}
+	return loader.Set(key, value)
 }
 
 // GetSlice retrieves a slice of values from the default loader.
-// Returns nil if the loader cannot be initialized or the key is not found
-// and no default is provided.
+// Requires Load() or LoadWithConfig() to have been called first.
+// Returns nil if the key is not found and no default is provided.
+// Returns nil if no loader is initialized.
 //
 // Indexed keys are searched in format: KEY_0, KEY_1, KEY_2, etc.
 // Also supports comma-separated values as fallback for .env files.
+//
+// For Instance Mode, use GetSliceFrom[T](loader, key) instead.
+// See GetSliceFrom documentation for details on why it is a function, not a method.
 //
 // Example:
 //
 //	ports := env.GetSlice[int]("PORTS")
 //	hosts := env.GetSlice[string]("HOSTS", []string{"localhost"})
 func GetSlice[T sliceElement](key string, defaultValue ...[]T) []T {
-	return withLoader(func(l *Loader) []T {
-		return GetSliceFrom[T](l, key, defaultValue...)
-	}, firstOrZero(defaultValue...))
+	loader, err := getDefaultLoader()
+	if err != nil {
+		if len(defaultValue) > 0 {
+			return defaultValue[0]
+		}
+		return nil
+	}
+	return GetSliceFrom[T](loader, key, defaultValue...)
 }
 
 // Keys returns all keys from the default loader.
-// Returns nil if the loader cannot be initialized.
+// Requires Load() or LoadWithConfig() to have been called first.
+// Returns nil if no loader is initialized.
 //
 // Example:
 //
@@ -147,7 +232,8 @@ func Keys() []string {
 }
 
 // All returns all environment variables from the default loader as a map.
-// Returns nil if the loader cannot be initialized.
+// Requires Load() or LoadWithConfig() to have been called first.
+// Returns nil if no loader is initialized.
 //
 // Example:
 //
@@ -160,7 +246,8 @@ func All() map[string]string {
 }
 
 // Len returns the number of loaded variables from the default loader.
-// Returns 0 if the loader cannot be initialized.
+// Requires Load() or LoadWithConfig() to have been called first.
+// Returns 0 if no loader is initialized.
 //
 // Example:
 //
@@ -171,7 +258,8 @@ func Len() int {
 }
 
 // Delete removes a key from the default loader.
-// Returns an error if the loader cannot be initialized.
+// Requires Load() or LoadWithConfig() to have been called first.
+// Returns ErrNotInitialized if no loader is initialized.
 //
 // Example:
 //
@@ -179,14 +267,16 @@ func Len() int {
 //	    log.Fatal(err)
 //	}
 func Delete(key string) error {
-	_, err := withLoaderError(func(l *Loader) (struct{}, error) {
-		return struct{}{}, l.Delete(key)
-	})
-	return err
+	loader, err := getDefaultLoader()
+	if err != nil {
+		return err
+	}
+	return loader.Delete(key)
 }
 
 // GetSecure retrieves a SecureValue from the default loader.
-// Returns nil if the loader cannot be initialized or the key is not found.
+// Requires Load() or LoadWithConfig() to have been called first.
+// Returns nil if the key is not found or no loader is initialized.
 // Use GetSecure for sensitive values that need secure memory handling.
 //
 // Example:
@@ -205,7 +295,8 @@ func GetSecure(key string) *SecureValue {
 }
 
 // Validate validates the default loader against required and allowed keys.
-// Returns an error if the loader cannot be initialized or validation fails.
+// Requires Load() or LoadWithConfig() to have been called first.
+// Returns ErrNotInitialized if no loader is initialized, or validation errors.
 //
 // Example:
 //
@@ -213,10 +304,11 @@ func GetSecure(key string) *SecureValue {
 //	    log.Fatal("Environment validation failed:", err)
 //	}
 func Validate() error {
-	_, err := withLoaderError(func(l *Loader) (struct{}, error) {
-		return struct{}{}, l.Validate()
-	})
-	return err
+	loader, err := getDefaultLoader()
+	if err != nil {
+		return err
+	}
+	return loader.Validate()
 }
 
 // ============================================================================
@@ -224,6 +316,8 @@ func Validate() error {
 // ============================================================================
 
 // Load initializes the default loader with the given files.
+// This function MUST be called before using any package-level convenience functions
+// (GetString, GetInt, GetBool, etc.).
 //
 // IMPORTANT: This function:
 //  1. Sets the package-level default loader (used by GetString, GetInt, etc.)
@@ -280,6 +374,8 @@ func Load(filenames ...string) error {
 }
 
 // LoadWithConfig initializes the default loader with a custom configuration.
+// This function MUST be called before using any package-level convenience functions
+// (GetString, GetInt, GetBool, etc.).
 //
 // IMPORTANT: This function:
 //  1. Sets the package-level default loader (used by GetString, GetInt, etc.)
@@ -298,6 +394,8 @@ func Load(filenames ...string) error {
 //	    log.Fatal(err)
 //	}
 func LoadWithConfig(cfg Config) error {
+	// Force AutoApply: convenience functions (GetString, etc.) require
+	// variables applied to os.Environ. Use New() for manual control.
 	cfg.AutoApply = true
 	loader, err := New(cfg)
 	if err != nil {
@@ -314,6 +412,8 @@ func LoadWithConfig(cfg Config) error {
 }
 
 // ParseInto populates a struct from the default loader's environment variables.
+// Requires Load() or LoadWithConfig() to have been called first.
+// Returns ErrNotInitialized if no loader is initialized.
 // Struct fields can be tagged with `env:"KEY"` to specify the env variable name.
 // Optional `envDefault:"value"` sets a default if the key is not found.
 //
@@ -337,7 +437,7 @@ func LoadWithConfig(cfg Config) error {
 //	if err := env.ParseInto(&cfg); err != nil {
 //	    log.Fatal(err)
 //	}
-func ParseInto(v interface{}) error {
+func ParseInto(v any) error {
 	loader, err := getDefaultLoader()
 	if err != nil {
 		return err

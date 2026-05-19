@@ -300,6 +300,47 @@ func ClearInternCache() {
 	}
 }
 
+// EqualFoldASCII compares two strings case-insensitively for ASCII characters only.
+// This is faster than strings.EqualFold for short ASCII strings because it avoids
+// the Unicode fallback path. Returns false if either string contains non-ASCII bytes.
+func EqualFoldASCII(a, b string) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := 0; i < len(a); i++ {
+		ca, cb := a[i], b[i]
+		if ca >= 'A' && ca <= 'Z' {
+			ca += 32
+		}
+		if cb >= 'A' && cb <= 'Z' {
+			cb += 32
+		}
+		if ca != cb {
+			return false
+		}
+	}
+	return true
+}
+
+// HasUpperPrefix checks whether s starts with the given uppercase prefix,
+// performing case-insensitive comparison on s without allocation.
+// The prefix must already be uppercase.
+func HasUpperPrefix(s string, upperPrefix string) bool {
+	if len(s) < len(upperPrefix) {
+		return false
+	}
+	for i := 0; i < len(upperPrefix); i++ {
+		c := s[i]
+		if c >= 'a' && c <= 'z' {
+			c -= 32
+		}
+		if c != upperPrefix[i] {
+			return false
+		}
+	}
+	return true
+}
+
 // TrimSpace trims leading and trailing whitespace from a string.
 // This is an optimized version that returns the original string if no trimming is needed,
 // avoiding allocation in the common case where values are already trimmed.
@@ -335,6 +376,21 @@ func TrimSpace(s string) string {
 	}
 
 	return s[start:end]
+}
+
+// TrimSpaceBytes trims leading and trailing whitespace from a byte slice,
+// converting to string. Avoids the intermediate string(buf.String()) that
+// strings.TrimSpace would require.
+func TrimSpaceBytes(b []byte) string {
+	start := 0
+	end := len(b)
+	for start < end && (b[start] == ' ' || b[start] == '\t' || b[start] == '\n' || b[start] == '\r') {
+		start++
+	}
+	for end > start && (b[end-1] == ' ' || b[end-1] == '\t' || b[end-1] == '\n' || b[end-1] == '\r') {
+		end--
+	}
+	return string(b[start:end])
 }
 
 // ToUpperASCII converts an ASCII string to uppercase.

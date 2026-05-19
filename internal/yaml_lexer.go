@@ -3,14 +3,14 @@ package internal
 
 import (
 	"bytes"
-	"strings"
+	"fmt"
 	"sync"
 )
 
 // lexerBufferPool provides a pool of reusable bytes.Buffer instances.
 // This reduces allocations for frequent buffer operations in the YAML lexer.
 var lexerBufferPool = sync.Pool{
-	New: func() interface{} {
+	New: func() any {
 		return new(bytes.Buffer)
 	},
 }
@@ -76,6 +76,15 @@ type Token struct {
 	IsQuoted bool
 }
 
+// lexerPool pools Lexer structs to avoid per-parse allocation.
+var lexerPool = sync.Pool{
+	New: func() any {
+		return &Lexer{
+			indents: make([]int, 1, 8),
+		}
+	},
+}
+
 // Lexer tokenizes YAML input.
 type Lexer struct {
 	input    string
@@ -89,14 +98,32 @@ type Lexer struct {
 	eof      bool    // Whether we've reached EOF
 }
 
-// NewYAMLLexer creates a new YAML lexer.
+// NewYAMLLexer creates a new YAML lexer (from pool if available).
 func NewYAMLLexer(input string) *Lexer {
-	return &Lexer{
-		input:   input,
-		line:    1,
-		column:  1,
-		indents: []int{0},
+	l, ok := lexerPool.Get().(*Lexer)
+	if !ok {
+		l = &Lexer{
+			indents: make([]int, 1, 8),
+		}
 	}
+	l.input = input
+	l.pos = 0
+	l.line = 1
+	l.column = 1
+	l.indent = 0
+	l.indents = l.indents[:1]
+	l.indents[0] = 0
+	l.tokens = nil
+	l.buffered = false
+	l.eof = false
+	return l
+}
+
+// release returns the Lexer to the pool.
+func (l *Lexer) release() {
+	l.input = ""
+	l.tokens = nil
+	lexerPool.Put(l)
 }
 
 // NextToken returns the next token from the input.
@@ -228,6 +255,16 @@ func (l *Lexer) handleNewline() (Token, error) {
 	currentLevel := l.indents[len(l.indents)-1]
 
 	if newLevel > currentLevel {
+		// SECURITY: Limit indent stack depth to prevent unbounded memory growth
+		// from malicious YAML with monotonically increasing indentation.
+		const maxIndentDepth = 256
+		if len(l.indents) >= maxIndentDepth {
+			return Token{}, &YAMLError{
+				Line:    startLine,
+				Column:  l.column,
+				Message: fmt.Sprintf("maximum indent depth exceeded (%d)", maxIndentDepth),
+			}
+		}
 		// Indentation increased
 		l.indents = append(l.indents, newLevel)
 		l.indent = newLevel
@@ -387,7 +424,7 @@ func (l *Lexer) scanKey() (Token, error) {
 		l.column++
 	}
 
-	return Token{Type: TokenKey, Value: strings.TrimSpace(buf.String()), Line: startLine, Column: startCol, Indent: l.indent}, nil
+	return Token{Type: TokenKey, Value: TrimSpaceBytes(buf.Bytes()), Line: startLine, Column: startCol, Indent: l.indent}, nil
 }
 
 // scanValue scans a scalar value.
@@ -438,7 +475,7 @@ func (l *Lexer) scanValue() (Token, error) {
 		l.column++
 	}
 
-	return Token{Type: TokenValue, Value: strings.TrimSpace(buf.String()), Line: startLine, Column: startCol, Indent: l.indent}, nil
+	return Token{Type: TokenValue, Value: TrimSpaceBytes(buf.Bytes()), Line: startLine, Column: startCol, Indent: l.indent}, nil
 }
 
 // scanQuotedString scans a quoted string.
@@ -536,18 +573,18 @@ func (l *Lexer) scanComment() (Token, error) {
 		l.column++
 	}
 
-	return Token{Type: TokenComment, Value: strings.TrimSpace(buf.String()), Line: startLine, Column: startCol, Indent: l.indent}, nil
+	return Token{Type: TokenComment, Value: TrimSpaceBytes(buf.Bytes()), Line: startLine, Column: startCol, Indent: l.indent}, nil
 }
 
 // Tokenize returns all tokens from the input.
 // Pre-allocates token slice based on input length for efficiency.
 func (l *Lexer) Tokenize() ([]Token, error) {
 	// Estimate token count based on input length
-	// Average: ~1 token per 20 characters (conservative estimate)
 	estimatedTokens := len(l.input)/20 + 10
 	if estimatedTokens > 1024 {
-		estimatedTokens = 1024 // Cap to prevent over-allocation
+		estimatedTokens = 1024
 	}
+
 	tokens := make([]Token, 0, estimatedTokens)
 
 	for {
