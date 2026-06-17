@@ -41,11 +41,20 @@ This library is designed for **high-security environments** with the following b
 The following system-critical keys are blocked by default:
 
 ```
-PATH, LD_PRELOAD, LD_LIBRARY_PATH, LD_DEBUG, LD_AUDIT
-DYLD_INSERT_LIBRARIES, DYLD_LIBRARY_PATH
+# Dynamic linker / library preloading (Unix)
+PATH, LD_PRELOAD, LD_PRELOAD_32, LD_PRELOAD_64,
+LD_LIBRARY_PATH, LD_LIBRARY_PATH_32, LD_LIBRARY_PATH_64,
+LD_DEBUG, LD_AUDIT, DYLD_INSERT_LIBRARIES, DYLD_LIBRARY_PATH
+# Shell escape
 IFS, SHELL, ENV, BASH_ENV
+# Language-specific injection
 PERL5OPT, PYTHONPATH, RUBYLIB, NODE_PATH
+# Windows-specific injection
+COMSPEC, PATHEXT, SYSTEMROOT, WINDIR
 ```
+
+> Custom forbidden keys can be added via `cfg.ForbiddenKeys`; they are merged
+> with the defaults above (the defaults cannot be removed).
 
 ### Memory Security
 
@@ -119,11 +128,11 @@ cfg.MaxValueLength = 1024
 ```go
 sv := env.GetSecure("API_KEY")
 if sv != nil {
-    // Safe for logging
+    // Safe for logging — Masked()/String() never expose the secret
     log.Println(sv.Masked()) // [SECURE:32 bytes]
 
-    // Access the value
-    value := sv.String()
+    // Access the plaintext value (handle with care — never log or persist it)
+    value := sv.Reveal()
 
     // Or get bytes (caller must clear)
     data := sv.Bytes()
@@ -167,15 +176,25 @@ cfg.AuditHandler = env.NewNopAuditHandler()
 
 ### Audit Output Format
 
+Each event is written as a single JSON line. The `key` field is **masked for
+sensitive keys** as `[MASKED:<len> chars]` (where `<len>` is the key length);
+non-sensitive keys are logged verbatim. Optional fields (`file`, `masked`,
+`details`, `duration_ns`) are omitted when empty.
+
 ```json
 {
     "timestamp": "2026-03-11T10:30:00Z",
     "action": "set",
-    "key": "AP***",
-    "reason": "loaded",
-    "success": true
+    "key": "[MASKED:7 chars]",
+    "reason": "loaded (sensitive)",
+    "success": true,
+    "masked": true
 }
 ```
+
+> Note: The `AP***` (2-char prefix) style is used only in validator/path error
+> messages (`DefaultMaskKey`), not in audit output. Sensitive keys loaded from
+> files are audited with reason `"loaded (sensitive)"` on the fast path.
 
 ### Built-in Handlers
 

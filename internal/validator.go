@@ -6,7 +6,6 @@ import (
 	"regexp"
 	"strings"
 	"unicode/utf8"
-	"unsafe"
 )
 
 // ValidatorConfig holds configuration for creating a new Validator.
@@ -168,36 +167,6 @@ func (v *Validator) ValidateValue(value string) error {
 	return validateValueChars(value)
 }
 
-// stringToBytesSafe converts a string to a byte slice without allocation.
-// This is a safer wrapper around unsafe operations with clear documentation.
-//
-// SECURITY: This function includes a defensive check for empty strings.
-// While the caller should check len(s) > 0, this defense-in-depth approach
-// prevents potential undefined behavior if the precondition is violated.
-//
-// PERFORMANCE: This function is inlined by the compiler and has minimal overhead
-// (one additional length check). It exists to:
-// 1. Document the safety invariants in one place
-// 2. Make the code more maintainable
-// 3. Provide a single point of change if unsafe semantics ever need updating
-//
-// The returned slice is read-only; modifying it causes undefined behavior.
-func stringToBytesSafe(s string) []byte {
-	// SECURITY: Defensive check - return nil for empty strings
-	// This prevents potential undefined behavior with unsafe.StringData
-	// on empty strings, even though the caller should already check this.
-	if len(s) == 0 {
-		return nil
-	}
-	// SAFETY ANALYSIS:
-	// - len(s) > 0 guaranteed by check above
-	// - unsafe.StringData returns valid pointer for non-empty strings
-	// - unsafe.Slice creates a slice with correct length
-	// - All subsequent accesses are bounds-checked via the slice
-	// - The slice is only used for reading, never writing
-	return unsafe.Slice(unsafe.StringData(s), len(s))
-}
-
 // badCharTable is a lookup table for invalid characters.
 // Index 0-31: control characters (0x00-0x1F)
 // Index 127: DEL character (0x7F)
@@ -223,82 +192,19 @@ var badCharTable = [256]byte{
 }
 
 // validateValueChars checks for invalid characters using a lookup table.
-// This is significantly faster than multiple comparisons per character.
+// Each byte is classified in O(1) via badCharTable; the first disallowed byte
+// yields a descriptive error.
 //
-// Performance optimizations:
-// - Processes 8 bytes at a time using word-aligned access (SIMD-style)
-// - Uses lookup table for O(1) character classification
-// - Fast path for common case of all-valid characters
+// The previous 8-byte-at-a-time (SIMD-style) unrolling plus an unsafe
+// string-to-bytes helper were removed for readability. Per the project
+// guidelines, readability wins over micro-optimization unless profiling
+// identifies a regression, and the simple loop is obviously correct.
 func validateValueChars(value string) error {
-	// Fast path for empty string
-	if len(value) == 0 {
-		return nil
+	for i := 0; i < len(value); i++ {
+		if badCharTable[value[i]] != 0 {
+			return badCharError(value[i], i)
+		}
 	}
-
-	// Use the safe helper function that encapsulates the unsafe operation
-	// with proper guards and documentation.
-	sl := stringToBytesSafe(value)
-
-	// SIMD-style processing: check 8 bytes at a time
-	// This reduces loop iterations by 8x for long values
-	n := len(sl)
-	i := 0
-
-	// Process 8-byte chunks
-	// Using a simple OR-based check: if any byte is bad, the result will be non-zero
-	for i+8 <= n {
-		b0 := badCharTable[sl[i]]
-		b1 := badCharTable[sl[i+1]]
-		b2 := badCharTable[sl[i+2]]
-		b3 := badCharTable[sl[i+3]]
-		b4 := badCharTable[sl[i+4]]
-		b5 := badCharTable[sl[i+5]]
-		b6 := badCharTable[sl[i+6]]
-		b7 := badCharTable[sl[i+7]]
-
-		// Fast path: if all bytes are valid (all zeros), skip detailed check
-		if b0|b1|b2|b3|b4|b5|b6|b7 == 0 {
-			i += 8
-			continue
-		}
-
-		// At least one bad character found, find which one
-		if b0 != 0 {
-			return badCharError(sl[i], i)
-		}
-		if b1 != 0 {
-			return badCharError(sl[i+1], i+1)
-		}
-		if b2 != 0 {
-			return badCharError(sl[i+2], i+2)
-		}
-		if b3 != 0 {
-			return badCharError(sl[i+3], i+3)
-		}
-		if b4 != 0 {
-			return badCharError(sl[i+4], i+4)
-		}
-		if b5 != 0 {
-			return badCharError(sl[i+5], i+5)
-		}
-		if b6 != 0 {
-			return badCharError(sl[i+6], i+6)
-		}
-		if b7 != 0 {
-			return badCharError(sl[i+7], i+7)
-		}
-		i += 8
-	}
-
-	// Process remaining bytes (0-7 bytes)
-	for i < n {
-		c := sl[i]
-		if badCharTable[c] != 0 {
-			return badCharError(c, i)
-		}
-		i++
-	}
-
 	return nil
 }
 
@@ -318,6 +224,13 @@ func badCharError(c byte, pos int) error {
 		Rule:    "control_char",
 		Message: fmt.Sprintf("value contains control character at position %d", pos),
 	}
+}
+
+// HasRequiredKeys reports whether the validator has any required keys
+// configured. Callers use this to skip building the uppercase-key index when
+// there is nothing to validate — the common case (no RequiredKeys in Config).
+func (v *Validator) HasRequiredKeys() bool {
+	return len(v.requiredKeys) > 0
 }
 
 // ValidateRequired checks that all required keys are present.

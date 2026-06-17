@@ -305,6 +305,7 @@ func (e *Expander) expandSingleBracedVar(s string) (string, error) {
 			if !ok || value == "" {
 				return "", &ExpansionError{
 					Key:   key,
+					Kind:  ExpansionRequiredKind,
 					Chain: "required variable not set: " + defaultValue,
 				}
 			}
@@ -541,6 +542,7 @@ func (e *Expander) expandBracedVariable(s string, depth int, visited map[string]
 			if !ok || value == "" {
 				return "", end + 1, &ExpansionError{
 					Key:   key,
+					Kind:  ExpansionRequiredKind,
 					Chain: "required variable not set: " + defaultValue,
 				}
 			}

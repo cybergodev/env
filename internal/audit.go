@@ -365,8 +365,14 @@ func (a *Auditor) Log(action Action, key, reason string, success bool) error {
 		return nil
 	}
 	a.mu.RLock()
-	// Re-check under RLock: SetEnabled acquires the write lock, so this ensures
-	// we see a consistent state and don't log after a concurrent SetEnabled(false).
+	// NOTE: the RLock is held across handler.Log intentionally — it is
+	// load-bearing. It serializes Log against Close()/SetEnabled() (which take
+	// the write lock). Several handlers (e.g. JSONHandler) are NOT internally
+	// Close-safe: their Close() closes the writer without taking their own lock,
+	// so without this serialization a concurrent Auditor.Close() could close the
+	// writer mid-Write (a data race). Do not move handler.Log outside the lock
+	// without first making every Handler Close-safe. The re-check below also
+	// ensures we don't log after a concurrent SetEnabled(false).
 	if !a.enabled.Load() {
 		a.mu.RUnlock()
 		return nil
@@ -395,8 +401,14 @@ func (a *Auditor) LogWithFile(action Action, key, file, reason string, success b
 		return nil
 	}
 	a.mu.RLock()
-	// Re-check under RLock: SetEnabled acquires the write lock, so this ensures
-	// we see a consistent state and don't log after a concurrent SetEnabled(false).
+	// NOTE: the RLock is held across handler.Log intentionally — it is
+	// load-bearing. It serializes Log against Close()/SetEnabled() (which take
+	// the write lock). Several handlers (e.g. JSONHandler) are NOT internally
+	// Close-safe: their Close() closes the writer without taking their own lock,
+	// so without this serialization a concurrent Auditor.Close() could close the
+	// writer mid-Write (a data race). Do not move handler.Log outside the lock
+	// without first making every Handler Close-safe. The re-check below also
+	// ensures we don't log after a concurrent SetEnabled(false).
 	if !a.enabled.Load() {
 		a.mu.RUnlock()
 		return nil
@@ -422,8 +434,14 @@ func (a *Auditor) LogWithDuration(action Action, key, reason string, success boo
 		return nil
 	}
 	a.mu.RLock()
-	// Re-check under RLock: SetEnabled acquires the write lock, so this ensures
-	// we see a consistent state and don't log after a concurrent SetEnabled(false).
+	// NOTE: the RLock is held across handler.Log intentionally — it is
+	// load-bearing. It serializes Log against Close()/SetEnabled() (which take
+	// the write lock). Several handlers (e.g. JSONHandler) are NOT internally
+	// Close-safe: their Close() closes the writer without taking their own lock,
+	// so without this serialization a concurrent Auditor.Close() could close the
+	// writer mid-Write (a data race). Do not move handler.Log outside the lock
+	// without first making every Handler Close-safe. The re-check below also
+	// ensures we don't log after a concurrent SetEnabled(false).
 	if !a.enabled.Load() {
 		a.mu.RUnlock()
 		return nil
@@ -623,8 +641,10 @@ func (h *BufferedHandler) Log(event Event) error {
 }
 
 // Flush writes all buffered events to the underlying handler.
-// It clears the buffer after successful write.
-// This method is safe for concurrent use.
+// Events are removed from the buffer only once they have been written
+// successfully; on write failure the unwritten events are re-queued so that
+// nothing is lost and a later Flush/Close can retry them. This method is safe
+// for concurrent use.
 func (h *BufferedHandler) Flush() error {
 	h.mu.Lock()
 
@@ -633,24 +653,31 @@ func (h *BufferedHandler) Flush() error {
 		return nil
 	}
 
-	// Take ownership of buffer and create new one
+	// Take ownership of the current buffer and install a fresh one so that
+	// concurrent Log() calls append to the new buffer while we drain the old.
 	events := h.buffer
 	h.buffer = make([]Event, 0, h.size)
 
 	// Release lock before I/O to allow concurrent Log() calls
 	h.mu.Unlock()
 
-	var lastErr error
-	for _, event := range events {
-		if err := h.handler.Log(event); err != nil {
-			lastErr = err
+	for i := range events {
+		if err := h.handler.Log(events[i]); err != nil {
 			if h.onError != nil {
 				h.onError(err)
 			}
+			// Re-queue the unwritten tail (events[i:]) ahead of any events
+			// that concurrent Log() calls appended to the new buffer, so that
+			// failed events are retried in order and nothing is dropped.
+			// events[:i] were written successfully and are discarded.
+			h.mu.Lock()
+			h.buffer = append(events[i:], h.buffer...)
+			h.mu.Unlock()
+			return err
 		}
 	}
 
-	return lastErr
+	return nil
 }
 
 // RequestFlush signals that a flush should be performed soon.

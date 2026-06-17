@@ -264,35 +264,12 @@ func buildYAMLArrayIndex(prefix string, index int, cfg YAMLFlattenConfig) string
 // flattenInlineJSON parses and flattens inline JSON arrays or objects within YAML.
 func flattenInlineJSON(jsonStr, prefix string, cfg YAMLFlattenConfig, result map[string]string, depth int) error {
 	// SECURITY: Pre-validate JSON nesting depth to prevent excessive memory
-	// allocation during json.Unmarshal. Count brackets conservatively
-	// (may overcount brackets inside quoted strings, but that's safe).
-	nesting := 0
-	for i := 0; i < len(jsonStr); i++ {
-		switch jsonStr[i] {
-		case '{', '[':
-			nesting++
-			if depth+nesting > cfg.MaxDepth {
-				return &YAMLError{
-					Path:    prefix,
-					Message: fmt.Sprintf("maximum nesting depth exceeded (%d)", cfg.MaxDepth),
-				}
-			}
-		case '}', ']':
-			nesting--
-			if nesting < 0 {
-				nesting = 0
-			}
-		case '"':
-			// Skip string contents to avoid counting brackets inside strings
-			i++
-			for i < len(jsonStr) {
-				if jsonStr[i] == '\\' {
-					i++ // skip escaped char
-				} else if jsonStr[i] == '"' {
-					break
-				}
-				i++
-			}
+	// allocation during json.Unmarshal. Shares the same bracket-scanning logic
+	// as the standalone JSON path (see nestingDepthExceeded in json_flatten.go).
+	if nestingDepthExceeded([]byte(jsonStr), depth, cfg.MaxDepth) {
+		return &YAMLError{
+			Path:    prefix,
+			Message: fmt.Sprintf("maximum nesting depth exceeded (%d)", cfg.MaxDepth),
 		}
 	}
 

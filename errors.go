@@ -29,8 +29,9 @@ var (
 	// Re-exported from internal/errors for backward compatibility.
 	ErrSecurityViolation = ierrors.ErrSecurityViolation
 
-	// ErrExpansionDepth indicates variable expansion exceeded the maximum depth.
-	ErrExpansionDepth = errors.New("variable expansion depth exceeded")
+	// ErrExpansionDepth indicates variable expansion exceeded the maximum depth
+	// or hit a cycle. Re-exported from internal/errors for backward compatibility.
+	ErrExpansionDepth = ierrors.ErrExpansionDepth
 
 	// ErrMaxVariables indicates the maximum number of variables has been reached.
 	ErrMaxVariables = errors.New("maximum number of variables exceeded")
@@ -71,6 +72,17 @@ type FileError = ierrors.FileError
 // ExpansionError provides detailed information about variable expansion failures.
 // This is an alias for internal.ExpansionError to maintain backward compatibility.
 type ExpansionError = ierrors.ExpansionError
+
+// ExpansionErrorKind classifies the cause of an ExpansionError.
+// Re-exported from internal/errors for backward compatibility.
+type ExpansionErrorKind = ierrors.ExpansionErrorKind
+
+const (
+	// ExpansionDepthKind indicates an expansion hit a recursion-depth limit or cycle.
+	ExpansionDepthKind ExpansionErrorKind = ierrors.ExpansionDepthKind
+	// ExpansionRequiredKind indicates a required variable (${VAR:?message}) was unset.
+	ExpansionRequiredKind ExpansionErrorKind = ierrors.ExpansionRequiredKind
+)
 
 // JSONError represents a JSON parsing error.
 // This is an alias for internal.JSONError to maintain backward compatibility.

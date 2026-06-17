@@ -72,59 +72,37 @@ func lookupBoolASCII(s string) (bool, bool) {
 			return s[0] == '1', true
 		}
 	case 2:
-		if equalFoldASCII(s, "no") {
+		if internal.EqualFoldASCII(s, "no") {
 			return false, true
 		}
-		if equalFoldASCII(s, "on") {
+		if internal.EqualFoldASCII(s, "on") {
 			return true, true
 		}
 	case 3:
-		if equalFoldASCII(s, "yes") {
+		if internal.EqualFoldASCII(s, "yes") {
 			return true, true
 		}
-		if equalFoldASCII(s, "off") {
+		if internal.EqualFoldASCII(s, "off") {
 			return false, true
 		}
 	case 4:
-		if equalFoldASCII(s, "true") {
+		if internal.EqualFoldASCII(s, "true") {
 			return true, true
 		}
 	case 5:
-		if equalFoldASCII(s, "false") {
+		if internal.EqualFoldASCII(s, "false") {
 			return false, true
 		}
 	case 7:
-		if equalFoldASCII(s, "enabled") {
+		if internal.EqualFoldASCII(s, "enabled") {
 			return true, true
 		}
 	case 8:
-		if equalFoldASCII(s, "disabled") {
+		if internal.EqualFoldASCII(s, "disabled") {
 			return false, true
 		}
 	}
 	return false, false
-}
-
-// equalFoldASCII compares two strings case-insensitively for ASCII characters only.
-// This is faster than strings.EqualFold for the common case of short ASCII strings.
-func equalFoldASCII(a, b string) bool {
-	if len(a) != len(b) {
-		return false
-	}
-	for i := 0; i < len(a); i++ {
-		ca := a[i]
-		cb := b[i]
-		if ca >= 'A' && ca <= 'Z' {
-			ca += 32
-		}
-		if cb >= 'A' && cb <= 'Z' {
-			cb += 32
-		}
-		if ca != cb {
-			return false
-		}
-	}
-	return true
 }
 
 // parseDuration parses a duration string with additional validation.
@@ -509,6 +487,9 @@ func UnmarshalInto(data map[string]string, v any) error {
 // ============================================================================
 
 // parseSliceElement parses a string value into the target type T.
+// All parse failures are reported as *ValidationError for consistent error
+// handling by callers (the previous version returned a mix of raw strconv
+// errors and ValidationError depending on the type).
 func parseSliceElement[T sliceElement](value string) (T, error) {
 	var zero T
 
@@ -520,27 +501,47 @@ func parseSliceElement[T sliceElement](value string) (T, error) {
 		return any(trimmed).(T), nil
 	case int:
 		n, e := strconv.Atoi(trimmed)
-		return any(n).(T), e
+		if e != nil {
+			return zero, &ValidationError{Field: "int", Value: MaskSensitiveInString(value), Message: "invalid integer value"}
+		}
+		return any(n).(T), nil
 	case int64:
 		n, e := strconv.ParseInt(trimmed, 10, 64)
-		return any(n).(T), e
+		if e != nil {
+			return zero, &ValidationError{Field: "int64", Value: MaskSensitiveInString(value), Message: "invalid integer value"}
+		}
+		return any(n).(T), nil
 	case uint:
 		n, e := strconv.ParseUint(trimmed, 10, 64)
-		return any(uint(n)).(T), e
+		if e != nil {
+			return zero, &ValidationError{Field: "uint", Value: MaskSensitiveInString(value), Message: "invalid unsigned integer value"}
+		}
+		return any(uint(n)).(T), nil
 	case uint64:
 		n, e := strconv.ParseUint(trimmed, 10, 64)
-		return any(n).(T), e
+		if e != nil {
+			return zero, &ValidationError{Field: "uint64", Value: MaskSensitiveInString(value), Message: "invalid unsigned integer value"}
+		}
+		return any(n).(T), nil
 	case bool:
 		b, e := parseBool(trimmed)
-		return any(b).(T), e
+		if e != nil {
+			return zero, e
+		}
+		return any(b).(T), nil
 	case float64:
 		n, e := strconv.ParseFloat(trimmed, 64)
-		return any(n).(T), e
+		if e != nil {
+			return zero, &ValidationError{Field: "float", Value: MaskSensitiveInString(value), Message: "invalid float value"}
+		}
+		return any(n).(T), nil
 	case time.Duration:
 		d, e := parseDuration(trimmed)
-		return any(d).(T), e
+		if e != nil {
+			return zero, e
+		}
+		return any(d).(T), nil
 	default:
-		var zero T
 		return zero, fmt.Errorf("parseSliceElement: unsupported type %T", zero)
 	}
 }

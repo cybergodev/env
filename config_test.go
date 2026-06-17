@@ -12,9 +12,9 @@ import (
 
 func TestConfigPresets(t *testing.T) {
 	tests := []struct {
-		name     string
-		factory  func() Config
-		checks   []struct {
+		name    string
+		factory func() Config
+		checks  []struct {
 			desc string
 			ok   bool
 		}
@@ -26,7 +26,7 @@ func TestConfigPresets(t *testing.T) {
 				desc string
 				ok   bool
 			}{
-				{"Filenames=[.env]", false},  // placeholder; real checks below
+				{"Filenames=[.env]", false}, // placeholder; real checks below
 			},
 		},
 		{

@@ -45,7 +45,6 @@ func demonstrateDevelopmentConfig() {
 	// - FailOnMissingFile: false (graceful handling)
 	// - OverwriteExisting: true (easy iteration)
 	// - Relaxed size limits
-	// Files configured in cfg.Filenames are automatically loaded by New().
 	cfg := env.DevelopmentConfig()
 	cfg.Filenames = []string{"examples/data/config.env"}
 
@@ -64,7 +63,6 @@ func demonstrateProductionConfig() {
 	// - FailOnMissingFile: true (fail fast)
 	// - AuditEnabled: true (compliance)
 	// - Strict size limits
-	// Files configured in cfg.Filenames are automatically loaded by New().
 	//
 	// IMPORTANT: Don't use os.Stdout with JSONAuditHandler in production
 	// because Close() will close stdout. Use a file or custom writer instead.
@@ -85,11 +83,10 @@ func demonstrateProductionConfig() {
 func demonstrateCustomConfig() {
 	fmt.Println("\n=== Custom Configuration ===")
 	// Create a fully custom configuration.
-	// Files configured in cfg.Filenames are automatically loaded by New().
 	cfg := env.DefaultConfig()
 	cfg.Filenames = []string{"examples/data/config.env"}
 	cfg.OverwriteExisting = true
-	cfg.Prefix = "DB_" // Only load variables with DB_ prefix (flattened field)
+	cfg.Prefix = "DB_" // Only process variables that start with the DB_ prefix
 	cfg.RequiredKeys = []string{"DB_HOST", "DB_PORT"}
 
 	loader, err := env.New(cfg)

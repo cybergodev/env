@@ -99,11 +99,26 @@ func (r *SecureReader) Read(p []byte) (n int, err error) {
 		r.lineRead = lineRead
 	}
 
-	// Check if we've reached the limit and there's more data
-	// Use the returned error from the underlying reader to detect EOF
-	if r.totalRead >= r.maxSize && err == nil {
-		r.err = ErrFileTooLarge
-		return n, r.err
+	// Size boundary: we have consumed up to the allowed maximum. Distinguish a
+	// stream that ends exactly here (acceptable) from one that still has data
+	// (reject, to avoid silently accepting a truncated oversized file). The
+	// underlying reader may report (n, nil) for an exact-size input before
+	// signaling EOF, so when it has not already returned an error we probe for
+	// one more byte. The probed byte is discarded, which is safe because a
+	// positive result always means rejection.
+	if r.totalRead >= r.maxSize {
+		if err == nil {
+			var probe [1]byte
+			if pn, _ := r.reader.Read(probe[:]); pn > 0 {
+				r.err = ErrFileTooLarge
+				return n, r.err
+			}
+			err = io.EOF
+		}
+		// Record terminal state so subsequent Read calls return consistently
+		// instead of being misclassified as oversized by the pre-read check.
+		r.err = err
+		return n, err
 	}
 
 	return n, err

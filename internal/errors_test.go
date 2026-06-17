@@ -358,14 +358,36 @@ func TestExpansionError_NoKey(t *testing.T) {
 	}
 }
 
+func TestExpansionError_Is(t *testing.T) {
+	tests := []struct {
+		name   string
+		err    *ExpansionError
+		target error
+		match  bool
+	}{
+		{"depth error matches ErrExpansionDepth", &ExpansionError{Depth: 3, Limit: 2}, ErrExpansionDepth, true},
+		{"zero-value kind (depth/cycle) matches", &ExpansionError{Chain: "A -> B -> A"}, ErrExpansionDepth, true},
+		{"required-variable error does not match", &ExpansionError{Kind: ExpansionRequiredKind, Key: "VAR"}, ErrExpansionDepth, false},
+		{"does not match wrong target", &ExpansionError{Depth: 3, Limit: 2}, ErrInvalidValue, false},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := errors.Is(tt.err, tt.target); got != tt.match {
+				t.Errorf("errors.Is(%v, %v) = %v, want %v", tt.err, tt.target, got, tt.match)
+			}
+		})
+	}
+}
+
 // ============================================================================
 // Sentinel Errors Tests
 // ============================================================================
 
 func TestValidationError_Is(t *testing.T) {
 	tests := []struct {
-		name string
-		err  *ValidationError
+		name   string
+		err    *ValidationError
 		target error
 		match  bool
 	}{

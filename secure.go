@@ -3,7 +3,6 @@ package env
 import (
 	"fmt"
 	"io"
-	"maps"
 	"runtime"
 	"sync"
 	"sync/atomic"
@@ -160,6 +159,11 @@ func (sv *SecureValue) reset(value string) {
 // tryLockMemory attempts to lock the memory if memory locking is enabled.
 // Must be called with sv.mu held.
 // Stores any error for strict mode handling.
+//
+// Strict mode: when SetMemoryLockStrict(true) has been enabled, a lock failure
+// is surfaced through onStrictLockFailure so high-security callers are
+// notified (the default handler logs to stderr). The SecureValue itself stays
+// valid and usable; the data is simply not protected from swapping.
 func (sv *SecureValue) tryLockMemory() {
 	if !IsMemoryLockEnabled() || len(sv.data) == 0 {
 		return
@@ -168,8 +172,11 @@ func (sv *SecureValue) tryLockMemory() {
 	err := internal.LockMemory(sv.data)
 	if err != nil {
 		sv.lockErr = err
-		// In non-strict mode, we continue despite the error
-		// The data is still usable, just not protected from swapping
+		// Strict mode: make the failure observable. In non-strict mode we
+		// continue silently — the data is still usable, just not locked.
+		if IsMemoryLockStrict() {
+			onStrictLockFailure(err)
+		}
 	} else {
 		sv.locked = true
 	}
@@ -418,21 +425,6 @@ func (sv *SecureValue) MemoryLockError() error {
 //   - Memory overhead is minimal compared to single-lock design
 const numSecureMapShards = 8
 
-// secureMap capacity constants for efficient map growth.
-const (
-	// minShardCapacity is the minimum initial capacity for a shard's map.
-	minShardCapacity = 8
-
-	// loadFactorGrowthThreshold triggers map growth when len(values)*3 < newSize*2.
-	// This corresponds to a load factor of approximately 66%.
-	loadFactorGrowthThreshold = 3
-
-	// capacityGrowthFactor determines new capacity as newSize * 4 / 3.
-	// This provides 33% extra capacity to reduce future reallocations.
-	capacityGrowthNumerator   = 4
-	capacityGrowthDenominator = 3
-)
-
 // secureMapShard represents a single shard of the secure map.
 type secureMapShard struct {
 	mu     sync.RWMutex
@@ -485,6 +477,16 @@ func (sm *secureMap) Set(key string, value string) {
 	}
 }
 
+// secureKV is a key/value pair used to batch values into shards in SetAll.
+// A slice of pairs is more compact than the previous per-shard
+// map[string]string grouping: a single contiguous array with no per-bucket
+// overhead, and one allocation per non-empty shard instead of a map (which
+// allocates a bucket array) per shard.
+type secureKV struct {
+	key   string
+	value string
+}
+
 // SetAll stores multiple values securely in a batch operation.
 // This is more efficient than calling Set multiple times as it
 // groups operations by shard to minimize lock acquisitions.
@@ -493,91 +495,48 @@ func (sm *secureMap) SetAll(values map[string]string) {
 		return
 	}
 
-	// Distribute values to shard maps
-	shardValues, shardCounts := sm.distributeToShards(values)
+	// First pass: count items per shard so each slice is sized exactly.
+	var counts [numSecureMapShards]int
+	for key := range values {
+		counts[hashKey(key)]++
+	}
 
-	// Process each shard
+	// Allocate one compact slice per non-empty shard.
+	var buckets [numSecureMapShards][]secureKV
 	for i := range numSecureMapShards {
-		if shardCounts[i] == 0 {
+		if counts[i] > 0 {
+			buckets[i] = make([]secureKV, 0, counts[i])
+		}
+	}
+
+	// Second pass: distribute values into the per-shard slices.
+	for key, value := range values {
+		idx := hashKey(key)
+		buckets[idx] = append(buckets[idx], secureKV{key: key, value: value})
+	}
+
+	// Process each shard under a single lock.
+	for i := range numSecureMapShards {
+		if len(buckets[i]) == 0 {
 			continue
 		}
-		sm.setShardValues(i, shardValues[i], shardCounts[i])
-	}
-}
-
-// distributeToShards distributes values to per-shard maps for batch processing.
-// Returns the distributed values and count per shard.
-// Optimized to use pre-allocated stack arrays for small batches.
-func (sm *secureMap) distributeToShards(values map[string]string) ([numSecureMapShards]map[string]string, [numSecureMapShards]int) {
-	// First pass: count items per shard for accurate pre-allocation
-	var shardCounts [numSecureMapShards]int
-	for key := range values {
-		shardCounts[hashKey(key)]++
-	}
-
-	// Pre-allocate shard maps with exact sizes
-	var shardValues [numSecureMapShards]map[string]string
-	for i := range numSecureMapShards {
-		if shardCounts[i] > 0 {
-			// Pre-allocate with exact size to avoid map growth
-			shardValues[i] = make(map[string]string, shardCounts[i])
-		}
-	}
-
-	// Second pass: distribute values to shards
-	for key, value := range values {
-		shardIdx := hashKey(key)
-		shardValues[shardIdx][key] = value
-	}
-
-	return shardValues, shardCounts
-}
-
-// ensureShardCapacity ensures the shard map has enough capacity for new entries.
-// Must be called with shard.mu held.
-// Optimized to reduce allocations by using more aggressive growth for empty maps.
-func (sm *secureMap) ensureShardCapacity(shard *secureMapShard, additionalCount int) {
-	currentLen := len(shard.values)
-	newSize := currentLen + additionalCount
-
-	// Handle empty map initialization
-	if currentLen == 0 {
-		// Use the larger of: additionalCount with growth factor, or minimum capacity
-		newCap := max(newSize, minShardCapacity)
-		// Add growth buffer to reduce future reallocations
-		newCap = newCap * capacityGrowthNumerator / capacityGrowthDenominator
-		shard.values = make(map[string]*SecureValue, newCap)
-		return
-	}
-
-	// Handle map growth if load factor would be too high
-	// Grow when current size * loadFactorGrowthThreshold < new size * 2
-	if currentLen*loadFactorGrowthThreshold < newSize*2 {
-		// Calculate new capacity with growth factor
-		newCap := newSize * capacityGrowthNumerator / capacityGrowthDenominator
-		// Ensure minimum growth to avoid frequent reallocations
-		if newCap < currentLen*2 {
-			newCap = currentLen * 2
-		}
-		newMap := make(map[string]*SecureValue, newCap)
-		maps.Copy(newMap, shard.values)
-		shard.values = newMap
+		sm.setShardValues(i, buckets[i])
 	}
 }
 
 // setShardValues sets multiple values in a single shard.
-// Handles capacity management and secure value lifecycle.
 // Uses in-place updates for existing keys to reduce allocations.
-func (sm *secureMap) setShardValues(shardIdx int, values map[string]string, count int) {
+// The shard map grows on demand via Go's native map reallocation — the
+// previous manual pre-sizing did not outperform the runtime and added
+// maintenance cost, so it was removed.
+func (sm *secureMap) setShardValues(shardIdx int, pairs []secureKV) {
 	shard := &sm.shards[shardIdx]
 	shard.mu.Lock()
 
-	// Ensure capacity for new entries
-	sm.ensureShardCapacity(shard, count)
-
 	// Track new keys for count update
 	newKeys := 0
-	for key, value := range values {
+	for i := range pairs {
+		key, value := pairs[i].key, pairs[i].value
 		if existing, ok := shard.values[key]; ok {
 			// In-place update: reuse existing SecureValue
 			existing.reset(value)

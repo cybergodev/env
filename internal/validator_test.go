@@ -294,6 +294,27 @@ func TestValidator_ValidateRequired(t *testing.T) {
 	})
 }
 
+// TestValidator_HasRequiredKeys covers the capability the parser fast-path
+// probes (needsRequiredCheck in parser.go): with no required keys configured it
+// reports false so parsers skip building the uppercase-key index.
+func TestValidator_HasRequiredKeys(t *testing.T) {
+	t.Run("empty config reports false", func(t *testing.T) {
+		v := NewValidator(ValidatorConfig{})
+		if v.HasRequiredKeys() {
+			t.Error("HasRequiredKeys() = true, want false for empty config")
+		}
+	})
+
+	t.Run("with required keys reports true", func(t *testing.T) {
+		v := NewValidator(ValidatorConfig{
+			RequiredKeys: []string{"KEY1", "KEY2"},
+		})
+		if !v.HasRequiredKeys() {
+			t.Error("HasRequiredKeys() = false, want true when RequiredKeys set")
+		}
+	})
+}
+
 // ============================================================================
 // IsSensitive Tests
 // ============================================================================
