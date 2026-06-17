@@ -1,6 +1,7 @@
 package env
 
 import (
+	"log"
 	"sync/atomic"
 
 	"github.com/cybergodev/env/internal"
@@ -88,6 +89,25 @@ func SetMemoryLockStrict(strict bool) {
 // IsMemoryLockStrict returns whether strict mode is enabled.
 func IsMemoryLockStrict() bool {
 	return memLockConfig.strict.Load()
+}
+
+// onStrictLockFailure is invoked when strict memory-lock mode is enabled and a
+// lock attempt fails. It is the mechanism that makes SetMemoryLockStrict
+// observable: without it, enabling strict mode had no effect on the non-error
+// constructors (NewSecureValue cannot return an error).
+//
+// The default implementation logs a security warning to the standard logger
+// (stderr). Strict mode is opt-in, so the user has explicitly asked to be
+// informed of locking failures. The hook is an unexported variable so tests
+// (and internal callers) can redirect or suppress it without expanding the
+// public API. SecureValue has no reference to a Loader/Auditor, so auditor
+// routing is not possible at this layer.
+var onStrictLockFailure = defaultStrictLockFailureHandler
+
+// defaultStrictLockFailureHandler logs a memory-lock failure to the standard
+// logger. It is the default value of onStrictLockFailure.
+func defaultStrictLockFailureHandler(err error) {
+	log.Printf("env: memory lock failed in strict mode: %v", err)
 }
 
 // IsMemoryLockSupported returns whether the current platform supports memory locking.

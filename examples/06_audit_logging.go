@@ -40,10 +40,16 @@ func demonstrateJSONAudit() {
 	}
 	defer loader.Close()
 
-	// Operations are logged to the audit handler
+	// Trigger operations so the audit handler records them.
+	// The GetString return value is intentionally unused — the call exists
+	// only to produce an audit event.
 	_ = loader.GetString("APP_NAME")
-	_ = loader.Set("TEST_VAR", "test_value")
-	_ = loader.Delete("TEST_VAR")
+	if err := loader.Set("TEST_VAR", "test_value"); err != nil {
+		log.Printf("Set failed: %v", err)
+	}
+	if err := loader.Delete("TEST_VAR"); err != nil {
+		log.Printf("Delete failed: %v", err)
+	}
 
 	fmt.Println("Captured JSON audit logs:")
 	fmt.Println(buf.String())
@@ -66,7 +72,8 @@ func demonstrateLogAudit() {
 	}
 	defer loader.Close()
 
-	// These operations will be logged with [AUDIT] prefix
+	// These reads are logged with the [AUDIT] prefix. Return values are
+	// unused — the calls exist only to produce audit events.
 	_ = loader.GetString("APP_NAME")
 	_ = loader.GetString("DB_HOST")
 }

@@ -423,34 +423,34 @@ func TestLoader_LoadFiles(t *testing.T) {
 		}
 	})
 
-		t.Run("prefix filter case-insensitive", func(t *testing.T) {
-			fs := newTestFileSystem()
-			fs.files[".env"] = "APP_KEY=value\napp_secret=secret\nOTHER_KEY=other"
+	t.Run("prefix filter case-insensitive", func(t *testing.T) {
+		fs := newTestFileSystem()
+		fs.files[".env"] = "APP_KEY=value\napp_secret=secret\nOTHER_KEY=other"
 
-			cfg := DefaultConfig()
-			cfg.FileSystem = fs
-			cfg.Prefix = "app_"
-			loader, err := New(cfg)
-			if err != nil {
-				t.Fatalf("New() error = %v", err)
-			}
-			defer loader.Close()
+		cfg := DefaultConfig()
+		cfg.FileSystem = fs
+		cfg.Prefix = "app_"
+		loader, err := New(cfg)
+		if err != nil {
+			t.Fatalf("New() error = %v", err)
+		}
+		defer loader.Close()
 
-			if err := loader.LoadFiles(".env"); err != nil {
-				t.Fatalf("LoadFiles() error = %v", err)
-			}
+		if err := loader.LoadFiles(".env"); err != nil {
+			t.Fatalf("LoadFiles() error = %v", err)
+		}
 
-			// Both APP_KEY and app_secret should match the "app_" prefix case-insensitively
-			if loader.GetString("APP_KEY") != "value" {
-				t.Errorf("GetString(\"APP_KEY\") = %q, want %q", loader.GetString("APP_KEY"), "value")
-			}
-			if loader.GetString("app_secret") != "secret" {
-				t.Errorf("GetString(\"app_secret\") = %q, want %q", loader.GetString("app_secret"), "secret")
-			}
-			if _, ok := loader.Lookup("OTHER_KEY"); ok {
-				t.Error("OTHER_KEY should not be loaded with app_ prefix")
-			}
-		})
+		// Both APP_KEY and app_secret should match the "app_" prefix case-insensitively
+		if loader.GetString("APP_KEY") != "value" {
+			t.Errorf("GetString(\"APP_KEY\") = %q, want %q", loader.GetString("APP_KEY"), "value")
+		}
+		if loader.GetString("app_secret") != "secret" {
+			t.Errorf("GetString(\"app_secret\") = %q, want %q", loader.GetString("app_secret"), "secret")
+		}
+		if _, ok := loader.Lookup("OTHER_KEY"); ok {
+			t.Error("OTHER_KEY should not be loaded with app_ prefix")
+		}
+	})
 
 }
 
@@ -1204,217 +1204,81 @@ func TestLoader_CloseAndIsClosed(t *testing.T) {
 // GetInt/GetBool/GetDuration Tests (Table-Driven)
 // ============================================================================
 
-func TestLoader_GetInt(t *testing.T) {
-	tests := []struct {
-		name       string
-		key        string
-		value      string
-		defaultVal int64
-		useDefault bool
-		wantValue  int64
+func TestLoader_TypedGetters(t *testing.T) {
+	// The five typed accessors (GetInt/GetUint64/GetFloat64/GetBool/GetDuration)
+	// all delegate to getWithDefault, so they share one shape: an existing key is
+	// parsed, a missing key yields the default (or the zero value), and an
+	// unparseable value also yields the default. One table covers all five,
+	// including the invalid-value-falls-back rows that were missing for three of
+	// the types when these were five near-identical functions.
+	type tc struct {
+		name  string
+		key   string
+		value string // "" => do not Set (key is absent)
+		get   func(*Loader, string) any
+		want  any
+	}
+
+	groups := []struct {
+		name  string
+		cases []tc
 	}{
-		{"existing key", "PORT", "8080", 0, false, 8080},
-		{"missing key with default", "MISSING", "", 3000, true, 3000},
-		{"missing key without default", "MISSING", "", 0, false, 0},
+		{"GetInt", []tc{
+			{"existing key", "PORT", "8080", func(l *Loader, key string) any { return l.GetInt(key) }, int64(8080)},
+			{"invalid value falls back to default", "PORT", "abc", func(l *Loader, key string) any { return l.GetInt(key, 42) }, int64(42)},
+			{"missing key with default", "MISSING", "", func(l *Loader, key string) any { return l.GetInt(key, 3000) }, int64(3000)},
+			{"missing key without default", "MISSING", "", func(l *Loader, key string) any { return l.GetInt(key) }, int64(0)},
+		}},
+		{"GetUint64", []tc{
+			{"existing key", "PORT", "8080", func(l *Loader, key string) any { return l.GetUint64(key) }, uint64(8080)},
+			{"large value", "MAX_CONN", "18446744073709551615", func(l *Loader, key string) any { return l.GetUint64(key) }, uint64(18446744073709551615)},
+			{"invalid value falls back to default", "PORT", "abc", func(l *Loader, key string) any { return l.GetUint64(key, 42) }, uint64(42)},
+			{"missing key with default", "MISSING", "", func(l *Loader, key string) any { return l.GetUint64(key, 3000) }, uint64(3000)},
+			{"missing key without default", "MISSING", "", func(l *Loader, key string) any { return l.GetUint64(key) }, uint64(0)},
+		}},
+		{"GetFloat64", []tc{
+			{"existing key", "RATE", "3.14", func(l *Loader, key string) any { return l.GetFloat64(key) }, float64(3.14)},
+			{"negative value", "OFFSET", "-0.5", func(l *Loader, key string) any { return l.GetFloat64(key) }, float64(-0.5)},
+			{"scientific notation", "FACTOR", "1.5e3", func(l *Loader, key string) any { return l.GetFloat64(key) }, float64(1500)},
+			{"invalid value falls back to default", "RATE", "abc", func(l *Loader, key string) any { return l.GetFloat64(key, 1.0) }, float64(1.0)},
+			{"missing key with default", "MISSING", "", func(l *Loader, key string) any { return l.GetFloat64(key, 0.5) }, float64(0.5)},
+			{"missing key without default", "MISSING", "", func(l *Loader, key string) any { return l.GetFloat64(key) }, float64(0)},
+		}},
+		{"GetBool", []tc{
+			{"existing key true", "DEBUG", "true", func(l *Loader, key string) any { return l.GetBool(key) }, true},
+			{"existing key false", "DEBUG", "false", func(l *Loader, key string) any { return l.GetBool(key) }, false},
+			{"invalid value falls back to default", "DEBUG", "notabool", func(l *Loader, key string) any { return l.GetBool(key, true) }, true},
+			{"missing key with default", "MISSING", "", func(l *Loader, key string) any { return l.GetBool(key, true) }, true},
+			{"missing key without default", "MISSING", "", func(l *Loader, key string) any { return l.GetBool(key) }, false},
+		}},
+		{"GetDuration", []tc{
+			{"existing key", "TIMEOUT", "30s", func(l *Loader, key string) any { return l.GetDuration(key) }, 30 * time.Second},
+			{"invalid value falls back to default", "TIMEOUT", "notaduration", func(l *Loader, key string) any { return l.GetDuration(key, 5*time.Second) }, 5 * time.Second},
+			{"missing key with default", "MISSING", "", func(l *Loader, key string) any { return l.GetDuration(key, 5*time.Minute) }, 5 * time.Minute},
+			{"missing key without default", "MISSING", "", func(l *Loader, key string) any { return l.GetDuration(key) }, time.Duration(0)},
+		}},
 	}
 
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			loader, err := New(DefaultConfig())
-			if err != nil {
-				t.Fatalf("New() error = %v", err)
-			}
-			defer loader.Close()
+	for _, g := range groups {
+		t.Run(g.name, func(t *testing.T) {
+			for _, tt := range g.cases {
+				t.Run(tt.name, func(t *testing.T) {
+					loader, err := New(DefaultConfig())
+					if err != nil {
+						t.Fatalf("New() error = %v", err)
+					}
+					defer loader.Close()
 
-			if tt.value != "" {
-				if err := loader.Set(tt.key, tt.value); err != nil {
-					t.Fatalf("Set() error = %v", err)
-				}
-			}
+					if tt.value != "" {
+						if err := loader.Set(tt.key, tt.value); err != nil {
+							t.Fatalf("Set() error = %v", err)
+						}
+					}
 
-			var got int64
-			if tt.useDefault {
-				got = loader.GetInt(tt.key, tt.defaultVal)
-			} else {
-				got = loader.GetInt(tt.key)
-			}
-
-			if got != tt.wantValue {
-				t.Errorf("GetInt() = %d, want %d", got, tt.wantValue)
-			}
-		})
-	}
-}
-
-func TestLoader_GetUint64(t *testing.T) {
-	tests := []struct {
-		name       string
-		key        string
-		value      string
-		defaultVal uint64
-		useDefault bool
-		wantValue  uint64
-	}{
-		{"existing key", "PORT", "8080", 0, false, 8080},
-		{"large value", "MAX_CONN", "18446744073709551615", 0, false, 18446744073709551615},
-		{"missing key with default", "MISSING", "", 3000, true, 3000},
-		{"missing key without default", "MISSING", "", 0, false, 0},
-		{"invalid value", "PORT", "abc", 42, true, 42},
-	}
-
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			loader, err := New(DefaultConfig())
-			if err != nil {
-				t.Fatalf("New() error = %v", err)
-			}
-			defer loader.Close()
-
-			if tt.value != "" {
-				if err := loader.Set(tt.key, tt.value); err != nil {
-					t.Fatalf("Set() error = %v", err)
-				}
-			}
-
-			var got uint64
-			if tt.useDefault {
-				got = loader.GetUint64(tt.key, tt.defaultVal)
-			} else {
-				got = loader.GetUint64(tt.key)
-			}
-
-			if got != tt.wantValue {
-				t.Errorf("GetUint64() = %d, want %d", got, tt.wantValue)
-			}
-		})
-	}
-}
-
-func TestLoader_GetFloat64(t *testing.T) {
-	tests := []struct {
-		name       string
-		key        string
-		value      string
-		defaultVal float64
-		useDefault bool
-		wantValue  float64
-	}{
-		{"existing key", "RATE", "3.14", 0, false, 3.14},
-		{"negative value", "OFFSET", "-0.5", 0, false, -0.5},
-		{"scientific notation", "FACTOR", "1.5e3", 0, false, 1500.0},
-		{"missing key with default", "MISSING", "", 0.5, true, 0.5},
-		{"missing key without default", "MISSING", "", 0, false, 0},
-		{"invalid value", "RATE", "abc", 1.0, true, 1.0},
-	}
-
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			loader, err := New(DefaultConfig())
-			if err != nil {
-				t.Fatalf("New() error = %v", err)
-			}
-			defer loader.Close()
-
-			if tt.value != "" {
-				if err := loader.Set(tt.key, tt.value); err != nil {
-					t.Fatalf("Set() error = %v", err)
-				}
-			}
-
-			var got float64
-			if tt.useDefault {
-				got = loader.GetFloat64(tt.key, tt.defaultVal)
-			} else {
-				got = loader.GetFloat64(tt.key)
-			}
-
-			if got != tt.wantValue {
-				t.Errorf("GetFloat64() = %f, want %f", got, tt.wantValue)
-			}
-		})
-	}
-}
-
-func TestLoader_GetBool(t *testing.T) {
-	tests := []struct {
-		name       string
-		key        string
-		value      string
-		defaultVal bool
-		useDefault bool
-		wantValue  bool
-	}{
-		{"existing key true", "DEBUG", "true", false, false, true},
-		{"existing key false", "DEBUG", "false", true, false, false},
-		{"missing key with default", "MISSING", "", true, true, true},
-		{"missing key without default", "MISSING", "", false, false, false},
-	}
-
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			loader, err := New(DefaultConfig())
-			if err != nil {
-				t.Fatalf("New() error = %v", err)
-			}
-			defer loader.Close()
-
-			if tt.value != "" {
-				if err := loader.Set(tt.key, tt.value); err != nil {
-					t.Fatalf("Set() error = %v", err)
-				}
-			}
-
-			var got bool
-			if tt.useDefault {
-				got = loader.GetBool(tt.key, tt.defaultVal)
-			} else {
-				got = loader.GetBool(tt.key)
-			}
-
-			if got != tt.wantValue {
-				t.Errorf("GetBool() = %v, want %v", got, tt.wantValue)
-			}
-		})
-	}
-}
-
-func TestLoader_GetDuration(t *testing.T) {
-	tests := []struct {
-		name       string
-		key        string
-		value      string
-		defaultVal time.Duration
-		useDefault bool
-		wantValue  time.Duration
-	}{
-		{"existing key", "TIMEOUT", "30s", 0, false, 30 * time.Second},
-		{"missing key with default", "MISSING", "", 5 * time.Minute, true, 5 * time.Minute},
-		{"missing key without default", "MISSING", "", 0, false, 0},
-	}
-
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			loader, err := New(DefaultConfig())
-			if err != nil {
-				t.Fatalf("New() error = %v", err)
-			}
-			defer loader.Close()
-
-			if tt.value != "" {
-				if err := loader.Set(tt.key, tt.value); err != nil {
-					t.Fatalf("Set() error = %v", err)
-				}
-			}
-
-			var got time.Duration
-			if tt.useDefault {
-				got = loader.GetDuration(tt.key, tt.defaultVal)
-			} else {
-				got = loader.GetDuration(tt.key)
-			}
-
-			if got != tt.wantValue {
-				t.Errorf("GetDuration() = %v, want %v", got, tt.wantValue)
+					if got := tt.get(loader, tt.key); got != tt.want {
+						t.Errorf("%s(%q) = %v, want %v", g.name, tt.key, got, tt.want)
+					}
+				})
 			}
 		})
 	}
@@ -2440,7 +2304,6 @@ func TestValidateFilePath_SymlinkEscape(t *testing.T) {
 	}
 }
 
-
 // ============================================================================
 // newParseError Tests
 // ============================================================================
@@ -2515,205 +2378,103 @@ func TestNew_ErrorPaths(t *testing.T) {
 // OSFileSystem Tests
 // ============================================================================
 
-func TestOSFileSystem_Getenv(t *testing.T) {
+// OSFileSystem is a thin pass-through to the os package: every method just
+// forwards to its os.X counterpart. Interface conformance is already guaranteed
+// at compile time by `var DefaultFileSystem FileSystem = OSFileSystem{}`
+// (filesystem.go). A single smoke test confirms the wiring — that each method
+// delegates to the right os.X call — rather than re-asserting the standard
+// library's own behavior in ten near-identical functions.
+func TestOSFileSystem(t *testing.T) {
 	fs := OSFileSystem{}
 
-	// Test getting an environment variable
-	t.Setenv("TEST_OS_GETENV", "test_value")
-	result := fs.Getenv("TEST_OS_GETENV")
-	if result != "test_value" {
-		t.Errorf("Getenv() = %q, want %q", result, "test_value")
-	}
+	t.Run("env round-trip", func(t *testing.T) {
+		const key = "ENV_OS_SMOKE"
+		if err := fs.Setenv(key, "v"); err != nil {
+			t.Fatalf("Setenv() error = %v", err)
+		}
+		t.Cleanup(func() { _ = fs.Unsetenv(key) }) // best-effort cleanup
 
-	// Test getting non-existent variable
-	result = fs.Getenv("NON_EXISTENT_VAR_12345")
-	if result != "" {
-		t.Errorf("Getenv() for non-existent var = %q, want [CLOSED]", result)
-	}
-}
+		if got := fs.Getenv(key); got != "v" {
+			t.Errorf("Getenv() = %q, want %q", got, "v")
+		}
+		if v, ok := fs.LookupEnv(key); !ok || v != "v" {
+			t.Errorf("LookupEnv() = (%q, %v), want (v, true)", v, ok)
+		}
+		if err := fs.Unsetenv(key); err != nil {
+			t.Fatalf("Unsetenv() error = %v", err)
+		}
+		if _, ok := fs.LookupEnv(key); ok {
+			t.Error("LookupEnv() = true after Unsetenv, want false")
+		}
+	})
 
-func TestOSFileSystem_Setenv(t *testing.T) {
-	fs := OSFileSystem{}
+	t.Run("file ops", func(t *testing.T) {
+		dir := t.TempDir()
+		path := filepath.Join(dir, "src.txt")
+		if err := os.WriteFile(path, []byte("hi"), 0o644); err != nil {
+			t.Fatalf("WriteFile() error = %v", err)
+		}
 
-	err := fs.Setenv("TEST_OS_SETENV", "new_value")
-	if err != nil {
-		t.Errorf("Setenv() error = %v", err)
-	}
-
-	result := fs.Getenv("TEST_OS_SETENV")
-	if result != "new_value" {
-		t.Errorf("Getenv() after Setenv() = %q, want %q", result, "new_value")
-	}
-}
-
-func TestOSFileSystem_Unsetenv(t *testing.T) {
-	fs := OSFileSystem{}
-
-	// Set and then unset
-	t.Setenv("TEST_OS_UNSETENV", "value")
-	err := fs.Unsetenv("TEST_OS_UNSETENV")
-	if err != nil {
-		t.Errorf("Unsetenv() error = %v", err)
-	}
-
-	result := fs.Getenv("TEST_OS_UNSETENV")
-	if result != "" {
-		t.Errorf("Getenv() after Unsetenv() = %q, want [CLOSED]", result)
-	}
-}
-
-func TestOSFileSystem_LookupEnv(t *testing.T) {
-	fs := OSFileSystem{}
-
-	t.Setenv("TEST_OS_LOOKUP", "lookup_value")
-	value, ok := fs.LookupEnv("TEST_OS_LOOKUP")
-	if !ok {
-		t.Error("LookupEnv() should find existing variable")
-	}
-	if value != "lookup_value" {
-		t.Errorf("LookupEnv() = %q, want %q", value, "lookup_value")
-	}
-
-	_, ok = fs.LookupEnv("NON_EXISTENT_VAR_12345")
-	if ok {
-		t.Error("LookupEnv() should return false for non-existent variable")
-	}
-}
-
-func TestOSFileSystem_Stat(t *testing.T) {
-	fs := OSFileSystem{}
-
-	// Test existing file (this test file)
-	info, err := fs.Stat("filesystem.go")
-	if err != nil {
-		t.Errorf("Stat() error = %v", err)
-	}
-	if info.Name() != "filesystem.go" {
-		t.Errorf("Stat().Name() = %q, want %q", info.Name(), "filesystem.go")
-	}
-
-	// Test non-existent file
-	_, err = fs.Stat("non_existent_file_12345.txt")
-	if err == nil {
-		t.Error("Stat() should return error for non-existent file")
-	}
-}
-
-func TestOSFileSystem_MkdirAll(t *testing.T) {
-	fs := OSFileSystem{}
-
-	// Create temp directory
-	tmpDir := t.TempDir()
-	testDir := tmpDir + "/test/nested/dir"
-
-	err := fs.MkdirAll(testDir, 0755)
-	if err != nil {
-		t.Errorf("MkdirAll() error = %v", err)
-	}
-
-	// Verify directory exists
-	info, err := fs.Stat(testDir)
-	if err != nil {
-		t.Errorf("Stat() after MkdirAll() error = %v", err)
-	}
-	if !info.IsDir() {
-		t.Error("MkdirAll() should create a directory")
-	}
-}
-
-func TestOSFileSystem_Remove(t *testing.T) {
-	fs := OSFileSystem{}
-
-	// Remove non-existent file should fail
-	err := fs.Remove("non_existent_file_12345.txt")
-	if err == nil {
-		t.Error("Remove() should return error for non-existent file")
-	}
-}
-
-func TestOSFileSystem_Open_Missing(t *testing.T) {
-	fs := OSFileSystem{}
-
-	// Open non-existent file should fail
-	_, err := fs.Open("non_existent_file_12345.txt")
-	if err == nil {
-		t.Error("Open() should return error for non-existent file")
-	}
-}
-
-func TestOSFileSystem_OpenFile(t *testing.T) {
-	fs := OSFileSystem{}
-
-	// Create temp file for testing
-	tmpDir := t.TempDir()
-	tmpFile := tmpDir + "/test_openfile.txt"
-	content := []byte("test content for OpenFile")
-	if err := os.WriteFile(tmpFile, content, 0644); err != nil {
-		t.Fatalf("Failed to create temp file: %v", err)
-	}
-
-	// Test OpenFile with O_RDONLY
-	f, err := fs.OpenFile(tmpFile, os.O_RDONLY, 0644)
-	if err != nil {
-		t.Errorf("OpenFile() error = %v", err)
-	}
-	if f != nil {
-		// Read and verify content
-		data, err := io.ReadAll(f)
+		// Stat + Open (read path).
+		info, err := fs.Stat(path)
 		if err != nil {
-			t.Errorf("ReadAll() error = %v", err)
+			t.Fatalf("Stat() error = %v", err)
 		}
-		if string(data) != string(content) {
-			t.Errorf("OpenFile() content = %q, want %q", string(data), string(content))
+		if info.Name() != "src.txt" {
+			t.Errorf("Stat().Name() = %q, want %q", info.Name(), "src.txt")
 		}
-		f.Close()
-	}
+		f, err := fs.Open(path)
+		if err != nil {
+			t.Fatalf("Open() error = %v", err)
+		}
+		got, err := io.ReadAll(f)
+		_ = f.Close() // best-effort close after read
+		if err != nil || string(got) != "hi" {
+			t.Errorf("Open() read = %q, err %v; want %q", got, err, "hi")
+		}
 
-	// Test OpenFile with non-existent file should fail
-	_, err = fs.OpenFile(tmpDir+"/nonexistent.txt", os.O_RDONLY, 0644)
-	if err == nil {
-		t.Error("OpenFile() should return error for non-existent file")
-	}
-}
+		// MkdirAll + OpenFile (write path).
+		nested := filepath.Join(dir, "a", "b")
+		if err := fs.MkdirAll(nested, 0o755); err != nil {
+			t.Fatalf("MkdirAll() error = %v", err)
+		}
+		wf, err := fs.OpenFile(filepath.Join(nested, "c.txt"), os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0o644)
+		if err != nil {
+			t.Fatalf("OpenFile() error = %v", err)
+		}
+		if _, err := wf.Write([]byte("x")); err != nil {
+			t.Errorf("OpenFile() Write error = %v", err)
+		}
+		_ = wf.Close() // best-effort close after write
 
-func TestOSFileSystem_Rename(t *testing.T) {
-	fs := OSFileSystem{}
+		// Rename moves src -> dst.
+		dst := filepath.Join(dir, "dst.txt")
+		if err := fs.Rename(path, dst); err != nil {
+			t.Fatalf("Rename() error = %v", err)
+		}
+		if _, err := fs.Stat(path); !os.IsNotExist(err) {
+			t.Error("source should not exist after Rename")
+		}
 
-	tmpDir := t.TempDir()
-	oldPath := tmpDir + "/old_name.txt"
-	newPath := tmpDir + "/new_name.txt"
-	content := []byte("test content for rename")
+		// Remove deletes dst.
+		if err := fs.Remove(dst); err != nil {
+			t.Fatalf("Remove() error = %v", err)
+		}
+		if _, err := fs.Stat(dst); !os.IsNotExist(err) {
+			t.Error("file should not exist after Remove")
+		}
 
-	// Create the old file
-	if err := os.WriteFile(oldPath, content, 0644); err != nil {
-		t.Fatalf("Failed to create temp file: %v", err)
-	}
-
-	// Test Rename
-	err := fs.Rename(oldPath, newPath)
-	if err != nil {
-		t.Errorf("Rename() error = %v", err)
-	}
-
-	// Verify old file no longer exists
-	if _, err := os.Stat(oldPath); !os.IsNotExist(err) {
-		t.Error("Old file should not exist after rename")
-	}
-
-	// Verify new file exists with correct content
-	data, err := os.ReadFile(newPath)
-	if err != nil {
-		t.Errorf("ReadFile() error = %v", err)
-	}
-	if string(data) != string(content) {
-		t.Errorf("Rename() content = %q, want %q", string(data), string(content))
-	}
-
-	// Test Rename with non-existent source should fail
-	err = fs.Rename(tmpDir+"/nonexistent.txt", tmpDir+"/another.txt")
-	if err == nil {
-		t.Error("Rename() should return error for non-existent source")
-	}
+		// Missing-path error paths for Open/Stat/Remove.
+		if _, err := fs.Open("no_such_file_smoke"); err == nil {
+			t.Error("Open(missing) want error")
+		}
+		if _, err := fs.Stat("no_such_file_smoke"); err == nil {
+			t.Error("Stat(missing) want error")
+		}
+		if err := fs.Remove("no_such_file_smoke"); err == nil {
+			t.Error("Remove(missing) want error")
+		}
+	})
 }
 
 // FileFormat.String() Tests
@@ -2837,7 +2598,6 @@ func TestForceRegisterParser(t *testing.T) {
 	})
 }
 
-
 // ============================================================================
 // Error Type Is() Method Tests (from coverage_test.go)
 // ============================================================================
@@ -2876,10 +2636,10 @@ func TestSecurityError_Is(t *testing.T) {
 func TestFileError_Unwrap(t *testing.T) {
 	innerErr := errors.New("disk full")
 	base := &FileError{
-		Path: "config.env",
-		Op:   "open",
-		Err:  innerErr,
-		Size: 5000,
+		Path:  "config.env",
+		Op:    "open",
+		Err:   innerErr,
+		Size:  5000,
 		Limit: 1000,
 	}
 

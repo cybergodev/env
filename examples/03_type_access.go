@@ -130,16 +130,23 @@ func demonstrateSliceAccess() {
 	ports := env.GetSlice[int]("nonexistent_ports", []int{8080, 8081})
 	fmt.Printf("nonexistent_ports (default): %v\n", ports)
 
-	// Instance mode slice access using GetSliceFrom
+	// Instance mode slice access using GetSliceFrom.
 	// GetSliceFrom reads indexed keys: TAGS_0, TAGS_1, TAGS_2, ...
 	loader, err := env.New(env.DefaultConfig())
 	if err != nil {
 		log.Fatalf("Failed to create loader: %v", err)
 	}
 	defer loader.Close()
-	loader.Set("TAGS_0", "alpha")
-	loader.Set("TAGS_1", "beta")
-	loader.Set("TAGS_2", "stable")
+	// Seed the indexed keys for the GetSliceFrom demo.
+	for _, kv := range []struct{ k, v string }{
+		{"TAGS_0", "alpha"},
+		{"TAGS_1", "beta"},
+		{"TAGS_2", "stable"},
+	} {
+		if err := loader.Set(kv.k, kv.v); err != nil {
+			log.Fatalf("Failed to seed %s: %v", kv.k, err)
+		}
+	}
 	tags := env.GetSliceFrom[string](loader, "TAGS")
 	fmt.Printf("TAGS (instance mode): %v\n", tags)
 }

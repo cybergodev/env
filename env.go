@@ -193,6 +193,7 @@ func (l *Loader) cleanupOnError(err error, cleanup bool) error {
 	}
 	return err
 }
+
 // New creates a new Loader with the given configuration.
 //
 // BEHAVIOR:
@@ -314,6 +315,7 @@ func (l *Loader) LoadFiles(filenames ...string) error {
 // Thread safety:
 //   - Called from New(): no lock required (loader not yet shared)
 //   - Called from LoadFiles(): caller must hold l.mu
+//
 // The cleanupOnErr parameter determines whether to close the loader on error (used during initialization).
 func (l *Loader) loadFilesInternal(filenames []string, cleanupOnErr bool) error {
 	start := time.Now()
@@ -726,15 +728,19 @@ func (l *Loader) Close() error {
 
 	l.vars.Clear()
 
-	// Only close the factory if we own it
-	// This prevents double-closing when the factory is shared
+	// Mark the loader closed before closing the owned factory. This guarantees
+	// the loader is never left half-open (vars cleared but closed=false) if
+	// factory.Close fails; subsequent calls observe a closed loader either way.
+	l.closed = true
+
+	// Only close the factory if we own it.
+	// This prevents double-closing when the factory is shared.
 	if l.ownsFactory && l.factory != nil {
 		if err := l.factory.Close(); err != nil {
 			return err
 		}
 	}
 
-	l.closed = true
 	return nil
 }
 
@@ -872,13 +878,11 @@ func GetSliceFrom[T sliceElement](loader *Loader, key string, defaultValue ...[]
 		return firstOrZero(defaultValue...)
 	}
 
-	loader.mu.RLock()
-	defer loader.mu.RUnlock()
-
-	// Return default if closed
-	if loader.closed {
+	if err := loader.enterRead(); err != nil {
+		// nil or closed loader: behave like a miss
 		return firstOrZero(defaultValue...)
 	}
+	defer loader.exitRead()
 
 	// GetString candidate keys from path resolver (handles dot-notation)
 	candidates := internal.ResolvePath(key)
@@ -949,7 +953,7 @@ func getSliceFromIndexedKeys[T sliceElement](loader *Loader, baseKey string, def
 //   - ErrClosed: if the loader is nil or has been closed
 //   - MarshalError: if struct tag parsing or type conversion fails
 func (l *Loader) ParseInto(v any) error {
-	if l == nil {
+	if l == nil || l.IsClosed() {
 		return ErrClosed
 	}
 	return UnmarshalInto(l.All(), v)
@@ -963,7 +967,7 @@ func (l *Loader) ParseInto(v any) error {
 //   - ErrMissingRequired: if a required key is not present
 //   - ErrForbiddenKey: if a forbidden key is set
 func (l *Loader) Validate() error {
-	if l == nil {
+	if l == nil || l.IsClosed() {
 		return ErrClosed
 	}
 	return l.factory.Validator().ValidateRequired(l.keysToUpper())

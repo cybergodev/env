@@ -86,49 +86,29 @@ func ResolvePath(path string) []string {
 		return []string{converted}
 	}
 
-	// Build bracket format key
+	// Build bracket format key: numeric parts render as [index] with no
+	// surrounding separator; non-numeric parts are joined with underscore.
+	// (An earlier implementation tracked prevWasNumeric, but all three of
+	// its branches emitted identical bytes, so the tracking was dead logic.)
 	bracketResult := GetBuilder()
 	defer PutBuilder(bracketResult)
 	bracketResult.Grow(estimatedLen + dotCount*2) // Extra space for brackets
 
 	start = 0
 	partIndex = 0
-	prevWasNumeric := false
 
 	for i := 0; i <= len(path); i++ {
 		if i == len(path) || path[i] == '.' {
 			part := path[start:i]
 			if isNumericIndex(part) {
-				if partIndex == 0 {
-					// First part is numeric: use bracket format
-					bracketResult.WriteByte('[')
-					bracketResult.WriteString(part)
-					bracketResult.WriteByte(']')
-				} else if prevWasNumeric {
-					// Consecutive numeric: just add bracket directly (no underscore)
-					bracketResult.WriteByte('[')
-					bracketResult.WriteString(part)
-					bracketResult.WriteByte(']')
-				} else {
-					// Previous was non-numeric: append bracket directly
-					bracketResult.WriteByte('[')
-					bracketResult.WriteString(part)
-					bracketResult.WriteByte(']')
-				}
-				prevWasNumeric = true
+				bracketResult.WriteByte('[')
+				bracketResult.WriteString(part)
+				bracketResult.WriteByte(']')
 			} else {
-				// Non-numeric part
 				if partIndex > 0 {
-					if prevWasNumeric {
-						// Previous was numeric bracket: add underscore before non-numeric
-						bracketResult.WriteByte('_')
-					} else {
-						// Previous was non-numeric: add underscore separator
-						bracketResult.WriteByte('_')
-					}
+					bracketResult.WriteByte('_')
 				}
 				bracketResult.WriteString(ToUpperASCII(part))
-				prevWasNumeric = false
 			}
 			start = i + 1
 			partIndex++

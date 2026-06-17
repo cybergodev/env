@@ -173,9 +173,9 @@ func TestInternKey_EdgeCases(t *testing.T) {
 	ClearInternCache()
 
 	tests := []struct {
-		name  string
-		key   string
-		want  string
+		name string
+		key  string
+		want string
 	}{
 		{"empty string not interned", "", ""},
 		{"simple key", "SIMPLE", "SIMPLE"},
@@ -292,6 +292,74 @@ func TestInternKey_LongKey(t *testing.T) {
 	longKey := strings.Repeat("X", maxInternKeyLen+1)
 	if got := InternKey(longKey); got != longKey {
 		t.Errorf("InternKey(long) = %q, want %q", got, longKey)
+	}
+}
+
+func TestInternKeyBytes_ParityWithInternKey(t *testing.T) {
+	ClearInternCache()
+
+	keys := []string{
+		"",
+		"SIMPLE",
+		"MY_KEY_NAME",
+		"lowercase_key",
+		"MixedCase_Key_123",
+		strings.Repeat("X", maxInternKeyLen),   // boundary: internable
+		strings.Repeat("Y", maxInternKeyLen+1), // too long: not interned, copied as-is
+	}
+	for _, k := range keys {
+		// Prime the cache via the string path so the byte path observes a hit.
+		want := InternKey(k)
+		got := InternKeyBytes([]byte(k))
+		if got != want {
+			t.Errorf("InternKeyBytes(%q) = %q, want InternKey result %q", k, got, want)
+		}
+		if got != k {
+			t.Errorf("InternKeyBytes(%q) = %q, want %q", k, got, k)
+		}
+	}
+}
+
+// TestInternKeyBytes_StableAfterBufferReuse verifies the security invariant:
+// the returned string must remain valid after the input byte slice is reused
+// (as happens with bufio.Scanner's buffer on the next Scan()).
+func TestInternKeyBytes_StableAfterBufferReuse(t *testing.T) {
+	ClearInternCache()
+
+	// First intern with one buffer content.
+	buf := []byte("STABLE_KEY_001")
+	got := InternKeyBytes(buf)
+	if got != "STABLE_KEY_001" {
+		t.Fatalf("InternKeyBytes = %q, want STABLE_KEY_001", got)
+	}
+
+	// Mutate the backing buffer (simulating scanner reuse) and interleave a
+	// cache miss + hit to stress the intern cache as well.
+	for i := 0; i < len(buf) && i < 4; i++ {
+		buf[i] = 'Z'
+	}
+	_ = InternKeyBytes([]byte("OTHER_KEY_002")) // separate entry
+
+	// The earlier returned string must be unaffected by the buffer mutation.
+	if got != "STABLE_KEY_001" {
+		t.Errorf("interned string corrupted after buffer reuse: got %q", got)
+	}
+
+	// Re-interning the original bytes (fresh slice) must yield the same value.
+	if again := InternKeyBytes([]byte("STABLE_KEY_001")); again != "STABLE_KEY_001" {
+		t.Errorf("re-intern = %q, want STABLE_KEY_001", again)
+	}
+}
+
+func TestInternKeyBytes_HitIsZeroAlloc(t *testing.T) {
+	b := []byte("ZERO_ALLOC_HIT_KEY")
+	_ = InternKeyBytes(b) // warm the cache
+
+	n := testing.AllocsPerRun(1000, func() {
+		_ = InternKeyBytes(b)
+	})
+	if n != 0 {
+		t.Errorf("InternKeyBytes cache hit allocated %v/op, want 0", n)
 	}
 }
 

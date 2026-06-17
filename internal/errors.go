@@ -19,6 +19,11 @@ var (
 
 	// ErrSecurityViolation indicates a security policy violation.
 	ErrSecurityViolation = errors.New("security policy violation")
+
+	// ErrExpansionDepth indicates variable expansion exceeded the maximum depth
+	// or hit a variable cycle. errors.Is(err, ErrExpansionDepth) matches an
+	// *ExpansionError whose Kind is ExpansionDepthKind (the common case).
+	ErrExpansionDepth = errors.New("variable expansion depth exceeded")
 )
 
 // ParseError provides detailed information about parsing failures.
@@ -114,12 +119,28 @@ func (e *FileError) Unwrap() error {
 	return e.Err
 }
 
+// ExpansionErrorKind classifies the cause of an ExpansionError.
+type ExpansionErrorKind int
+
+const (
+	// ExpansionDepthKind indicates the expansion hit a recursion-depth limit or a
+	// variable cycle. This is the zero value so the common depth/cycle errors need
+	// no explicit classification. errors.Is(err, ErrExpansionDepth) matches them.
+	ExpansionDepthKind ExpansionErrorKind = iota
+
+	// ExpansionRequiredKind indicates a required variable (${VAR:?message}) was
+	// unset or empty. This is not a depth overflow, so it does not match
+	// ErrExpansionDepth.
+	ExpansionRequiredKind
+)
+
 // ExpansionError provides detailed information about variable expansion failures.
 type ExpansionError struct {
-	Key   string // The key being expanded
-	Depth int    // The current expansion depth
-	Limit int    // The maximum allowed depth
-	Chain string // The expansion chain (sanitized)
+	Key   string             // The key being expanded
+	Depth int                // The current expansion depth
+	Limit int                // The maximum allowed depth
+	Chain string             // The expansion chain (sanitized)
+	Kind  ExpansionErrorKind // The cause category (zero value = depth/cycle)
 }
 
 // Error implements the error interface.
@@ -132,6 +153,15 @@ func (e *ExpansionError) Error() string {
 	// Mask the key to prevent leaking sensitive key names in error messages
 	maskedKey := maskKeyName(e.Key)
 	return fmt.Sprintf("expansion error: key %q exceeded depth limit (%d/%d)", maskedKey, e.Depth, e.Limit)
+}
+
+// Is implements errors.Is for ExpansionError.
+// It matches ErrExpansionDepth for depth/cycle violations (ExpansionDepthKind)
+// but not for required-variable errors (ExpansionRequiredKind), which are a
+// distinct failure mode. This makes the previously orphaned ErrExpansionDepth
+// sentinel usable via errors.Is.
+func (e *ExpansionError) Is(target error) bool {
+	return target == ErrExpansionDepth && e.Kind != ExpansionRequiredKind
 }
 
 // maskKeyName masks a key name for safe error reporting.

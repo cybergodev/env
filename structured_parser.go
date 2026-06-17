@@ -76,12 +76,16 @@ func (c *structuredParserConfig) validateResult(result map[string]string, format
 		}
 	}
 
-	upperKeys := internal.KeysToUpperPooled(result)
-	err := c.validator.ValidateRequired(upperKeys)
-	internal.PutKeysToUpperMap(upperKeys)
-	if err != nil {
-		_ = c.auditor.LogError(internal.ActionValidate, "", err.Error())
-		return err
+	// Skip building the uppercase-key index when no required keys are
+	// configured — the common case (see needsRequiredCheck in parser.go).
+	if needsRequiredCheck(c.validator) {
+		upperKeys := internal.KeysToUpperPooled(result)
+		err := c.validator.ValidateRequired(upperKeys)
+		internal.PutKeysToUpperMap(upperKeys)
+		if err != nil {
+			_ = c.auditor.LogError(internal.ActionValidate, "", err.Error())
+			return err
+		}
 	}
 
 	return nil

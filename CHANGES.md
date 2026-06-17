@@ -4,6 +4,38 @@ All notable changes to the cybergodev/env library will be documented in this fil
 
 ---
 
+## v1.2.1 - Reliability & Parse-Path Performance (2026-06-18)
+
+### Added
+- `ExpansionErrorKind` type with `ExpansionDepthKind` / `ExpansionRequiredKind` constants — classify variable-expansion failures
+- `ExpansionError.Kind` field exposing the failure kind; `ErrExpansionDepth` re-exported from the root package
+- Strict memory-lock failure hook (`onStrictLockFailure`) makes lock failures observable in strict mode
+
+### Changed
+- `ExpansionError.Is()` now matches `ErrExpansionDepth` for depth/cycle errors (previously orphaned); `${VAR:?}` required-variable errors intentionally do not match
+- `Loader.Validate` / `ParseInto` return `ErrClosed` for a closed loader, matching their documented contract
+- `GetSliceFrom` uses the shared `enterRead`/`exitRead` accessors for consistent read-path guarding
+- Parser scanner max token size raised to 256 KB so `ErrLineTooLong` / `ErrFileTooLarge` surface before `bufio.ErrTooLong`
+- `secureMap.SetAll` batches values into per-shard slices; `InternKey` eviction simplified to single-entry
+- `validateValueChars` uses a single-byte lookup table (removed unsafe 8-byte unrolling); `lookupBoolASCII` reuses shared `EqualFoldASCII`
+- Examples: handle `Set`/`Delete` errors instead of discarding them; document the `examples` build tag for running samples
+
+### Fixed
+- JSON `FlattenJSON` pre-validates nesting depth before `json.Unmarshal` (DoS / stack-exhaustion defense; the YAML path already had it)
+- `BufferedHandler.Flush` no longer drops events on write failure — re-queues the unwritten tail
+- `SecureReader` accepts a stream ending exactly at the size limit instead of false-positive rejecting exact-size input
+- `parseSliceElement` returns `*ValidationError` consistently for all numeric/float types
+- `Loader.Close` marks the loader closed before closing the owned factory (no half-open state on failure)
+
+### Performance
+- Eliminated the per-line key string allocation on the `.env` parse path (`InternKeyBytes`, 0 allocs/op on cache hit)
+- `Parser_MediumFile` -48% allocs / -20% time; `Parser_LargeFile` -50% allocs
+- `LineParser` allocs 2 → 1; `Loader_LoadFiles_Medium` -24% allocs
+- Skip uppercase-key index build when the validator has no required keys (~28% of parse-path bytes removed)
+- `secureMap.SetAll`: -15.8% B/op, -12.7% allocs/op, -11.3% ns/op
+
+---
+
 ## v1.2.0 - Unified Key Resolution & Production Hardening (2026-05-20)
 
 ### Breaking

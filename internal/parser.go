@@ -139,8 +139,10 @@ func (p *LineParser) ParseLineBytes(line []byte) (string, string, error) {
 	// SECURITY: Must copy the key string because the scanner buffer will be
 	// overwritten on the next Scan() call. Using bytesToString here would cause
 	// the interned key to point to invalid memory after the buffer is reused.
-	// The small allocation cost is necessary for memory safety.
-	key := InternKey(string(line[keyStart:keyEnd]))
+	// InternKeyBytes returns a stable heap copy (independent of the buffer) on
+	// a cache miss, while avoiding the temporary string allocation that
+	// InternKey(string(...)) would incur on every call — including cache hits.
+	key := InternKeyBytes(line[keyStart:keyEnd])
 
 	// Validate key
 	if err := p.keyValidator.ValidateKey(key); err != nil {

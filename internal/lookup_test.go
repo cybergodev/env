@@ -4,88 +4,88 @@ import "testing"
 
 func TestLookupInMap(t *testing.T) {
 	tests := []struct {
-		name     string
-		data     map[string]string
-		key      string
-		wantVal  string
+		name      string
+		data      map[string]string
+		key       string
+		wantVal   string
 		wantFound bool
 	}{
 		{
-			name:       "exact match",
-			data:       map[string]string{"DEEPSEEK_KEY": "sk-123"},
-			key:        "DEEPSEEK_KEY",
-			wantVal:    "sk-123",
-			wantFound:  true,
+			name:      "exact match",
+			data:      map[string]string{"DEEPSEEK_KEY": "sk-123"},
+			key:       "DEEPSEEK_KEY",
+			wantVal:   "sk-123",
+			wantFound: true,
 		},
 		{
-			name:       "lowercase fallback to uppercase key",
-			data:       map[string]string{"DEEPSEEK_KEY": "sk-123"},
-			key:        "deepseek_key",
-			wantVal:    "sk-123",
-			wantFound:  true,
+			name:      "lowercase fallback to uppercase key",
+			data:      map[string]string{"DEEPSEEK_KEY": "sk-123"},
+			key:       "deepseek_key",
+			wantVal:   "sk-123",
+			wantFound: true,
 		},
 		{
-			name:       "dot-notation resolves to underscore key",
-			data:       map[string]string{"DATABASE_HOST": "localhost"},
-			key:        "database.host",
-			wantVal:    "localhost",
-			wantFound:  true,
+			name:      "dot-notation resolves to underscore key",
+			data:      map[string]string{"DATABASE_HOST": "localhost"},
+			key:       "database.host",
+			wantVal:   "localhost",
+			wantFound: true,
 		},
 		{
-			name:       "dot-notation mixed case",
-			data:       map[string]string{"A_B_C": "value"},
-			key:        "a.b.c",
-			wantVal:    "value",
-			wantFound:  true,
+			name:      "dot-notation mixed case",
+			data:      map[string]string{"A_B_C": "value"},
+			key:       "a.b.c",
+			wantVal:   "value",
+			wantFound: true,
 		},
 		{
-			name:       "dot-notation with nested path",
-			data:       map[string]string{"SERVER_PORT": "8080"},
-			key:        "server.port",
-			wantVal:    "8080",
-			wantFound:  true,
+			name:      "dot-notation with nested path",
+			data:      map[string]string{"SERVER_PORT": "8080"},
+			key:       "server.port",
+			wantVal:   "8080",
+			wantFound: true,
 		},
 		{
-			name:       "missing key returns false",
-			data:       map[string]string{"OTHER_KEY": "val"},
-			key:        "MISSING",
-			wantVal:    "",
-			wantFound:  false,
+			name:      "missing key returns false",
+			data:      map[string]string{"OTHER_KEY": "val"},
+			key:       "MISSING",
+			wantVal:   "",
+			wantFound: false,
 		},
 		{
-			name:       "preserves whitespace",
-			data:       map[string]string{"KEY": "  value  "},
-			key:        "KEY",
-			wantVal:    "  value  ",
-			wantFound:  true,
+			name:      "preserves whitespace",
+			data:      map[string]string{"KEY": "  value  "},
+			key:       "KEY",
+			wantVal:   "  value  ",
+			wantFound: true,
 		},
 		{
-			name:       "exact match preferred over uppercase",
-			data:       map[string]string{"key": "v1", "KEY": "v2"},
-			key:        "key",
-			wantVal:    "v1",
-			wantFound:  true,
+			name:      "exact match preferred over uppercase",
+			data:      map[string]string{"key": "v1", "KEY": "v2"},
+			key:       "key",
+			wantVal:   "v1",
+			wantFound: true,
 		},
 		{
-			name:       "empty map returns false",
-			data:       map[string]string{},
-			key:        "ANY_KEY",
-			wantVal:    "",
-			wantFound:  false,
+			name:      "empty map returns false",
+			data:      map[string]string{},
+			key:       "ANY_KEY",
+			wantVal:   "",
+			wantFound: false,
 		},
 		{
-			name:       "nil map returns false",
-			data:       nil,
-			key:        "ANY_KEY",
-			wantVal:    "",
-			wantFound:  false,
+			name:      "nil map returns false",
+			data:      nil,
+			key:       "ANY_KEY",
+			wantVal:   "",
+			wantFound: false,
 		},
 		{
-			name:       "already uppercase key no fallback needed",
-			data:       map[string]string{"MY_KEY": "val"},
-			key:        "MY_KEY",
-			wantVal:    "val",
-			wantFound:  true,
+			name:      "already uppercase key no fallback needed",
+			data:      map[string]string{"MY_KEY": "val"},
+			key:       "MY_KEY",
+			wantVal:   "val",
+			wantFound: true,
 		},
 	}
 
@@ -104,10 +104,10 @@ func TestLookupInMap(t *testing.T) {
 
 func TestSplitAndTrimAt(t *testing.T) {
 	tests := []struct {
-		name     string
-		input    string
-		index    int
-		wantVal  string
+		name      string
+		input     string
+		index     int
+		wantVal   string
 		wantFound bool
 	}{
 		{"first element", "a,b,c", 0, "a", true},

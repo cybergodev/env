@@ -1,7 +1,10 @@
 package env
 
 import (
+	"bytes"
+	"errors"
 	"io"
+	"log"
 	"strings"
 	"testing"
 
@@ -105,18 +108,38 @@ func TestSecureValue(t *testing.T) {
 }
 
 func TestSecureValuePool(t *testing.T) {
-	// Create multiple SecureValues and release them back to pool
-	for i := 0; i < 10; i++ {
+	// Stress alloc/free: must not panic, and reused values must carry the new
+	// secret (reset clears the old value before reuse).
+	for range 10 {
 		sv := NewSecureValue("test")
 		sv.Release()
 	}
-
-	// Create new ones - should potentially reuse from pool
-	for i := 0; i < 5; i++ {
-		newSv := NewSecureValue("new")
-		if newSv.Reveal() != "new" {
-			t.Errorf("New SecureValue from pool = %q, want %q", newSv.Reveal(), "new")
+	for range 5 {
+		if sv := NewSecureValue("new"); sv.Reveal() != "new" {
+			t.Errorf("reused SecureValue = %q, want %q", sv.Reveal(), "new")
 		}
+	}
+
+	// A released SecureValue is returned to the underlying sync.Pool, so the
+	// next allocation must hand back the same object (pointer identity). sync.Pool
+	// may evict under GC pressure, so require reuse on at least one of several
+	// tight alloc/free rounds rather than every one — but a healthy pool reuses
+	// reliably.
+	reused := 0
+	for range 5 {
+		first := NewSecureValue("a")
+		first.Release()
+
+		second := NewSecureValue("b")
+		if first == second {
+			reused++
+		}
+		second.Release()
+	}
+	if reused == 0 {
+		t.Error("SecureValue pool never reused a released value across 5 rounds")
+	} else {
+		t.Logf("SecureValue pool reused %d/5 released values", reused)
 	}
 }
 
@@ -456,6 +479,58 @@ func TestIsMemoryLockSupported(t *testing.T) {
 	// This test just verifies the function doesn't panic
 	supported := IsMemoryLockSupported()
 	t.Logf("IsMemoryLockSupported() = %v", supported)
+}
+
+// TestDefaultStrictLockFailureHandler covers the D-002 strict-mode hook. The
+// handler logs a security warning (with the causing error) to the standard
+// logger; strict mode is opt-in so the user has asked to be informed.
+func TestDefaultStrictLockFailureHandler(t *testing.T) {
+	var buf bytes.Buffer
+	logger := log.Default()
+	origOut := logger.Writer()
+	origFlags := logger.Flags()
+	log.SetOutput(&buf)
+	log.SetFlags(0) // drop timestamp for a deterministic substring check
+	defer func() {
+		log.SetOutput(origOut)
+		log.SetFlags(origFlags)
+	}()
+
+	defaultStrictLockFailureHandler(errors.New("boom"))
+
+	got := buf.String()
+	if !strings.Contains(got, "memory lock failed") {
+		t.Errorf("log output = %q, want substring %q", got, "memory lock failed")
+	}
+	if !strings.Contains(got, "boom") {
+		t.Errorf("log output = %q, want the wrapped error text %q", got, "boom")
+	}
+}
+
+// TestOnStrictLockFailureSwappable confirms the hook is redirectable — tests
+// and internal callers can swap it without expanding the public API, and the
+// swap is actually honored.
+func TestOnStrictLockFailureSwappable(t *testing.T) {
+	orig := onStrictLockFailure
+	defer func() { onStrictLockFailure = orig }()
+
+	var (
+		called bool
+		gotErr error
+	)
+	onStrictLockFailure = func(err error) {
+		called = true
+		gotErr = err
+	}
+
+	onStrictLockFailure(errors.New("injected"))
+
+	if !called {
+		t.Error("swapped onStrictLockFailure was not invoked")
+	}
+	if gotErr == nil || gotErr.Error() != "injected" {
+		t.Errorf("handler received err = %v, want %q", gotErr, "injected")
+	}
 }
 
 // ============================================================================
@@ -837,6 +912,38 @@ func TestLoader_NilMethodCalls(t *testing.T) {
 		var l *Loader
 		if v := l.GetString("KEY", "default"); v != "default" {
 			t.Errorf("nil GetString() = %q, want default", v)
+		}
+	})
+}
+
+// TestLoader_ClosedMethodCalls verifies that methods documenting ErrClosed
+// honor that contract for a closed (but non-nil) loader, not only for nil.
+func TestLoader_ClosedMethodCalls(t *testing.T) {
+	newClosedLoader := func(t *testing.T) *Loader {
+		t.Helper()
+		cfg := DefaultConfig()
+		cfg.Filenames = nil // no file dependency
+		l, err := New(cfg)
+		if err != nil {
+			t.Fatalf("New() error = %v", err)
+		}
+		if err := l.Close(); err != nil {
+			t.Fatalf("Close() error = %v", err)
+		}
+		return l
+	}
+
+	t.Run("ParseInto closed", func(t *testing.T) {
+		l := newClosedLoader(t)
+		if err := l.ParseInto(&struct{}{}); err != ErrClosed {
+			t.Errorf("closed ParseInto() = %v, want ErrClosed", err)
+		}
+	})
+
+	t.Run("Validate closed", func(t *testing.T) {
+		l := newClosedLoader(t)
+		if err := l.Validate(); err != ErrClosed {
+			t.Errorf("closed Validate() = %v, want ErrClosed", err)
 		}
 	})
 }

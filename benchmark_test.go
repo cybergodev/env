@@ -510,6 +510,24 @@ func BenchmarkInternKey_Cached(b *testing.B) {
 	}
 }
 
+// BenchmarkInternKeyBytes_Cached measures the byte-slice interning path used by
+// the parser (keys arrive as []byte from the scanner buffer). On a cache hit it
+// allocates nothing, unlike InternKey(string(b)) which allocates a temporary
+// string on every call.
+func BenchmarkInternKeyBytes_Cached(b *testing.B) {
+	internal.ClearInternCache()
+	keys := make([][]byte, 100)
+	for i := 0; i < 100; i++ {
+		keys[i] = []byte(fmt.Sprintf("KEY_%d", i))
+		internal.InternKeyBytes(keys[i]) // pre-populate
+	}
+
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		_ = internal.InternKeyBytes(keys[i%100])
+	}
+}
+
 // ============================================================================
 // ToUpperASCII Benchmarks
 // ============================================================================

@@ -31,6 +31,19 @@ func FlattenJSON(data []byte, cfg JSONFlattenConfig) (map[string]string, error) 
 		return make(map[string]string), nil
 	}
 
+	// SECURITY: Pre-validate JSON nesting depth BEFORE json.Unmarshal so that
+	// MaxDepth is enforced as a fail-fast boundary. Without this, json.Unmarshal
+	// recursively decodes the entire document into nested interface{} values
+	// before flattenValue can enforce the limit, defeating its purpose and
+	// risking excessive allocation (or goroutine-stack exhaustion on a document
+	// crafted entirely of nested brackets at the size ceiling). The YAML inline
+	// path (yaml_flatten.go) uses the same nestingDepthExceeded check.
+	if nestingDepthExceeded(data, 0, cfg.MaxDepth) {
+		return nil, &JSONError{
+			Message: fmt.Sprintf("maximum nesting depth exceeded (%d)", cfg.MaxDepth),
+		}
+	}
+
 	// Parse JSON
 	var raw interface{}
 	if err := json.Unmarshal(data, &raw); err != nil {
@@ -53,6 +66,44 @@ func FlattenJSON(data []byte, cfg JSONFlattenConfig) (map[string]string, error) 
 	}
 
 	return result, nil
+}
+
+// nestingDepthExceeded pre-scans JSON bytes and reports whether the bracket
+// nesting (starting at startDepth) exceeds maxDepth. String contents are
+// skipped so brackets inside JSON strings are not counted. Counting is
+// conservative (it may over-count on malformed input), which is safe — the
+// goal is to reject deeply nested input before json.Unmarshal allocates a
+// deep structure, not to compute an exact depth.
+//
+// Called BEFORE json.Unmarshal so MaxDepth acts as a fail-fast boundary
+// rather than a check that runs only after a full recursive parse. Shared by
+// the standalone JSON path (FlattenJSON) and the inline-JSON-in-YAML path.
+func nestingDepthExceeded(data []byte, startDepth, maxDepth int) bool {
+	nesting := 0
+	for i := 0; i < len(data); i++ {
+		switch data[i] {
+		case '{', '[':
+			if nesting++; startDepth+nesting > maxDepth {
+				return true
+			}
+		case '}', ']':
+			if nesting--; nesting < 0 {
+				nesting = 0
+			}
+		case '"':
+			// Skip string body so brackets inside strings are not counted.
+			i++
+			for i < len(data) {
+				if data[i] == '\\' {
+					i++ // skip escaped char
+				} else if data[i] == '"' {
+					break
+				}
+				i++
+			}
+		}
+	}
+	return false
 }
 
 // flattenValue recursively flattens a JSON value.

@@ -108,6 +108,27 @@ func (p *parser) configure(cfg Config, factory *ComponentFactory) {
 	p.lineParser = lp
 }
 
+// hasRequiredKeys is an optional capability implemented by validators that can
+// cheaply report whether any required keys are configured. Parsers use it to
+// skip building the uppercase-key index when there is nothing to validate.
+//
+// It is defined on the consumer side (here) rather than added to the public
+// Validator interface, so existing external Validator implementations keep
+// compiling without modification (they simply opt out of the fast path).
+type hasRequiredKeys interface {
+	HasRequiredKeys() bool
+}
+
+// needsRequiredCheck reports whether the validator has required keys to check.
+// It returns true for validators that do not expose hasRequiredKeys, preserving
+// the original always-validate behavior for custom implementations.
+func needsRequiredCheck(v Validator) bool {
+	if rc, ok := v.(hasRequiredKeys); ok {
+		return rc.HasRequiredKeys()
+	}
+	return true
+}
+
 // Parse reads and parses environment variables from an io.Reader.
 func (p *parser) Parse(r io.Reader, filename string) (map[string]string, error) {
 	startTime := time.Now()
@@ -116,10 +137,14 @@ func (p *parser) Parse(r io.Reader, filename string) (map[string]string, error) 
 	secureRd := internal.NewSecureReader(r, p.config.MaxFileSize, p.config.MaxLineLength)
 	scanner := bufio.NewScanner(secureRd)
 
-	// Use pooled buffer for scanner to reduce allocations
+	// Use pooled buffer for scanner to reduce allocations.
+	// The max token size is MaxPooledScannerBufferSize (256KB): every real
+	// limit enforced by SecureReader (line length ≤ 64KB, file size ≤ 100MB
+	// chunked) is below this, so the scanner never raises bufio.ErrTooLong
+	// before the SecureReader's own ErrLineTooLong/ErrFileTooLarge surface.
 	scannerBuf := getScannerBuffer()
 	defer putScannerBuffer(scannerBuf)
-	scanner.Buffer(*scannerBuf, cap(*scannerBuf))
+	scanner.Buffer(*scannerBuf, internal.MaxPooledScannerBufferSize)
 
 	// Pre-allocate result map with optimal capacity
 	// Estimate based on typical .env variable size: ~50-80 chars per variable
@@ -205,13 +230,19 @@ func (p *parser) Parse(r io.Reader, filename string) (map[string]string, error) 
 		return nil, parseErr
 	}
 
-	// Validate required keys (using pooled map to reduce allocations)
-	upperKeys := internal.KeysToUpperPooled(result)
-	err := p.validator.ValidateRequired(upperKeys)
-	internal.PutKeysToUpperMap(upperKeys)
-	if err != nil {
-		_ = p.auditor.LogError(internal.ActionValidate, "", err.Error())
-		return nil, err
+	// Validate required keys (using pooled map to reduce allocations).
+	// Skip building the uppercase-key index entirely when no required keys are
+	// configured — the common case. Building it allocates one string per parsed
+	// key (ToUpperASCII) plus map growth, all of which is wasted when there is
+	// nothing to check.
+	if needsRequiredCheck(p.validator) {
+		upperKeys := internal.KeysToUpperPooled(result)
+		err := p.validator.ValidateRequired(upperKeys)
+		internal.PutKeysToUpperMap(upperKeys)
+		if err != nil {
+			_ = p.auditor.LogError(internal.ActionValidate, "", err.Error())
+			return nil, err
+		}
 	}
 
 	// Expand variables if enabled

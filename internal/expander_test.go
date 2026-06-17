@@ -1,6 +1,7 @@
 package internal
 
 import (
+	"errors"
 	"regexp"
 	"strings"
 	"testing"
@@ -39,6 +40,7 @@ func TestExpanderExpand(t *testing.T) {
 		{name: "empty braces", input: "${}", expected: "{}"},
 		{name: "unclosed brace", input: "${VAR", expected: "${VAR"},
 		{name: "invalid key in braces", input: "${123BAD}", expected: "${123BAD}"},
+		{name: "nested variable in default value", input: "${MISSING:-${VAR2}}", expected: "value2"},
 	}
 
 	for _, tt := range tests {
@@ -64,7 +66,8 @@ func TestExpanderExpand(t *testing.T) {
 func TestExpanderDefaultValues(t *testing.T) {
 	lookup := func(key string) (string, bool) {
 		vars := map[string]string{
-			"VAR": "actual",
+			"VAR":   "actual",
+			"EMPTY": "", // present but empty — a valid explicit value
 		}
 		v, ok := vars[key]
 		return v, ok
@@ -84,7 +87,9 @@ func TestExpanderDefaultValues(t *testing.T) {
 	}{
 		{name: "default used when unset", input: "${UNSET:-default}", expected: "default"},
 		{name: "default not used when set", input: "${VAR:-default}", expected: "actual"},
+		{name: "explicit empty does not trigger default", input: "${EMPTY:-default}", expected: ""},
 		{name: "assign default", input: "${UNSET:=assigned}", expected: "assigned"},
+		{name: "assign not performed when already set", input: "${VAR:=newval}", expected: "actual"},
 		{name: "simple default without vars", input: "${UNSET:-simple_default}", expected: "simple_default"},
 	}
 
@@ -111,9 +116,9 @@ func TestExpanderQuestionOperator(t *testing.T) {
 		wantErr bool
 	}{
 		{
-			name:   "unset variable errors",
-			lookup: func(string) (string, bool) { return "", false },
-			input:  "${REQUIRED:?Variable is required}",
+			name:    "unset variable errors",
+			lookup:  func(string) (string, bool) { return "", false },
+			input:   "${REQUIRED:?Variable is required}",
 			wantErr: true,
 		},
 		{
@@ -123,9 +128,9 @@ func TestExpanderQuestionOperator(t *testing.T) {
 			want:   "value",
 		},
 		{
-			name:   "empty value errors",
-			lookup: func(string) (string, bool) { return "", true },
-			input:  "${REQUIRED:?Variable is required}",
+			name:    "empty value errors",
+			lookup:  func(string) (string, bool) { return "", true },
+			input:   "${REQUIRED:?Variable is required}",
 			wantErr: true,
 		},
 	}
@@ -164,6 +169,53 @@ func TestExpanderDepthLimit(t *testing.T) {
 	_, err := exp.Expand("$A")
 	if err == nil {
 		t.Error("expected depth limit error")
+	}
+}
+
+// TestExpander_ErrExpansionDepthMatching verifies that real expansion errors
+// classify correctly via errors.Is: depth-limit and cycle errors match
+// ErrExpansionDepth, while the ${VAR:?} required-variable error does not
+// (it carries ExpansionRequiredKind).
+func TestExpander_ErrExpansionDepthMatching(t *testing.T) {
+	// Depth-limit error
+	depthLookup := func(key string) (string, bool) {
+		vars := map[string]string{"A": "$B", "B": "$C", "C": "$D", "D": "$E", "E": "final"}
+		v, ok := vars[key]
+		return v, ok
+	}
+	depthExp := NewExpander(ExpanderConfig{MaxDepth: 2, Lookup: depthLookup, Mode: ModeAll})
+	_, depthErr := depthExp.Expand("$A")
+	if depthErr == nil {
+		t.Fatal("expected depth limit error")
+	}
+	if !errors.Is(depthErr, ErrExpansionDepth) {
+		t.Errorf("depth error should match ErrExpansionDepth, got %v", depthErr)
+	}
+
+	// Cycle error
+	cycleLookup := func(key string) (string, bool) {
+		vars := map[string]string{"A": "$B", "B": "$A"}
+		v, ok := vars[key]
+		return v, ok
+	}
+	cycleExp := NewExpander(ExpanderConfig{MaxDepth: 10, Lookup: cycleLookup, Mode: ModeAll})
+	_, cycleErr := cycleExp.Expand("$A")
+	if cycleErr == nil {
+		t.Fatal("expected cycle error")
+	}
+	if !errors.Is(cycleErr, ErrExpansionDepth) {
+		t.Errorf("cycle error should match ErrExpansionDepth, got %v", cycleErr)
+	}
+
+	// Required-variable error: must NOT match ErrExpansionDepth
+	unsetLookup := func(string) (string, bool) { return "", false }
+	reqExp := NewExpander(ExpanderConfig{MaxDepth: 5, Lookup: unsetLookup, Mode: ModeAll})
+	_, reqErr := reqExp.Expand("${REQUIRED:?Variable is required}")
+	if reqErr == nil {
+		t.Fatal("expected required-variable error")
+	}
+	if errors.Is(reqErr, ErrExpansionDepth) {
+		t.Errorf("required-variable error must NOT match ErrExpansionDepth, got %v", reqErr)
 	}
 }
 

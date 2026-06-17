@@ -27,10 +27,8 @@ const (
 // simpler lock management. The cache is small enough that RWMutex
 // overhead outweighs its benefits.
 type internShard struct {
-	mu         sync.Mutex
-	cache      map[string]string
-	order      []string // Used for FIFO eviction
-	orderStart int      // Start index for circular buffer behavior
+	mu    sync.Mutex
+	cache map[string]string
 }
 
 var internShards [numShards]internShard
@@ -41,15 +39,16 @@ func init() {
 	}
 }
 
-// HashKey returns a hash value for the given key using an optimized algorithm.
-// For short keys (<=8 chars), uses a simple multiplicative hash.
-// For longer keys, uses FNV-1a with sampling for better performance.
+// HashKey returns a hash value for the given key.
+// For short keys (<=8 chars) it uses a multiplicative hash that combines the
+// key bytes without a per-character loop; for longer keys it uses FNV-1a over
+// the first and last 8 bytes (sampling).
 // The numShards parameter determines the range of the returned hash (0 to numShards-1).
 //
-// Performance optimizations:
-// - Uses branchless bit manipulation for keys 1-4 chars (most common case)
-// - Avoids conditional branches in the hot path
-// - Single optimization point for numShards==8 at function exit
+// Performance notes:
+//   - For keys 1-4 chars (the common case) the bytes are combined with fixed
+//     indexing rather than a loop.
+//   - numShards==8 (the only value used in this package) maps to a single AND.
 func HashKey(key string, numShards int) uint32 {
 	keyLen := len(key)
 	if keyLen == 0 {
@@ -58,8 +57,8 @@ func HashKey(key string, numShards int) uint32 {
 
 	var hash uint32
 
-	// Fast path for very short keys (1-4 chars): branchless implementation
-	// This is the most common case for environment variable keys
+	// Fast path for very short keys (1-4 chars): loop-free byte combination.
+	// This is the most common case for environment variable keys.
 	if keyLen <= 4 {
 		// SAFETY: Go guarantees zero-initialization for local variables.
 		// The array b is fully initialized to zeros before we copy key bytes.
@@ -131,8 +130,9 @@ func getShard(key string) *internShard {
 // 2. RWMutex has higher overhead for the common case of cache hit + small cache
 // 3. Simpler lock management improves cache locality
 //
-// SECURITY: This function maintains strict consistency between the cache map
-// and order slice to prevent memory leaks and ensure correct FIFO eviction.
+// Callers that hold the key as a []byte (e.g. parsing from a reusable buffer)
+// should prefer InternKeyBytes, which avoids the temporary string allocation
+// on cache hits.
 func InternKey(key string) string {
 	if len(key) == 0 || len(key) > maxInternKeyLen {
 		return key // Don't intern empty or very long keys
@@ -140,73 +140,68 @@ func InternKey(key string) string {
 
 	shard := getShard(key)
 	shard.mu.Lock()
+	defer shard.mu.Unlock()
 
-	// Single lock acquisition - check and potentially insert
 	if interned, ok := shard.cache[key]; ok {
-		shard.mu.Unlock()
 		return interned
 	}
 
-	// FIFO eviction if cache is full
+	return storeInterned(shard, key)
+}
+
+// InternKeyBytes interns a key supplied as a byte slice, returning a stable
+// interned string. It is the allocation-free equivalent of InternKey(string(b))
+// for the common cache-hit case, which matters on hot parse paths where keys
+// arrive as []byte slices into a reusable buffer.
+//
+// Why this avoids an allocation on a cache hit: the call site
+// InternKey(string(b)) allocates a temporary string on every call because that
+// string escapes into InternKey. Here the compiler optimizes both string(b)
+// conversions away:
+//   - getShard(string(b)): escape analysis proves the converted string does not
+//     escape (getShard -> HashKey only read its bytes), so no allocation occurs.
+//   - shard.cache[string(b)]: the documented compiler elision for
+//     map[string]V[string([]byte)] index expressions allocates nothing.
+//
+// On a cache miss the key is allocated exactly once (inside storeInterned,
+// which stores it in the map), identical to InternKey. The returned string is a
+// stable heap copy independent of b, so it stays valid after b is reused — this
+// preserves the scanner-buffer-safety invariant required by ParseLineBytes.
+func InternKeyBytes(b []byte) string {
+	if len(b) == 0 || len(b) > maxInternKeyLen {
+		return string(b) // Don't intern empty or very long keys; must copy
+	}
+
+	shard := getShard(string(b))
+	shard.mu.Lock()
+	defer shard.mu.Unlock()
+
+	if interned, ok := shard.cache[string(b)]; ok {
+		return interned
+	}
+
+	return storeInterned(shard, string(b))
+}
+
+// storeInterned inserts key into the shard's cache (with bounded eviction) and
+// returns the stored string. The caller must already hold shard.mu and must
+// have confirmed the key is absent.
+//
+// Bounded cache: when full, evict a single entry. Go randomizes map iteration
+// order, so evicting the first key found is effectively random eviction —
+// simple and sufficient for a small interning cache. The previous FIFO
+// circular-buffer machinery produced the same observable behavior (bounded
+// cache, correct interning) with far more moving parts.
+func storeInterned(shard *internShard, key string) string {
 	if len(shard.cache) >= maxInternSize {
-		// SECURITY: Ensure order slice is consistent with cache before eviction.
-		// This handles edge cases where order might have gotten out of sync.
-		// We check both conditions:
-		// 1. order is shorter than cache (entries added without order tracking)
-		// 2. order is longer than cache (entries deleted without order tracking)
-		if len(shard.order) != len(shard.cache) {
-			shard.rebuildOrder()
-		}
-
-		// Remove oldest 1/4 of entries using circular buffer approach
-		// SECURITY: Use min() to ensure evictCount doesn't exceed len(shard.order)
-		// This prevents index out of bounds if shard.order is shorter than expected
-		evictCount := min(maxInternSize/4, len(shard.order))
-		if evictCount > 0 {
-			for i := 0; i < evictCount; i++ {
-				idx := (shard.orderStart + i) % len(shard.order)
-				keyToEvict := shard.order[idx]
-				delete(shard.cache, keyToEvict)
-				shard.order[idx] = "" // Clear reference for GC
-			}
-			// Move start pointer forward (circular buffer)
-			shard.orderStart = (shard.orderStart + evictCount) % len(shard.order)
-
-			// Compact if we've wrapped around too many times
-			if shard.orderStart > 0 && len(shard.order) >= maxInternSize*3/4 {
-				shard.compactOrder()
-			}
+		for k := range shard.cache {
+			delete(shard.cache, k)
+			break
 		}
 	}
 
 	shard.cache[key] = key
-	shard.order = append(shard.order, key)
-	shard.mu.Unlock()
 	return key
-}
-
-// rebuildOrder rebuilds the order slice from cache keys to restore consistency.
-// Must be called with shard.mu held.
-func (s *internShard) rebuildOrder() {
-	s.order = s.order[:0]
-	for k := range s.cache {
-		s.order = append(s.order, k)
-	}
-	s.orderStart = 0
-}
-
-// compactOrder compacts the order slice by removing empty slots.
-// Must be called with shard.mu held.
-func (s *internShard) compactOrder() {
-	newOrder := make([]string, 0, maxInternSize)
-	for i := 0; i < len(s.order); i++ {
-		idx := (s.orderStart + i) % len(s.order)
-		if s.order[idx] != "" {
-			newOrder = append(newOrder, s.order[idx])
-		}
-	}
-	s.order = newOrder
-	s.orderStart = 0
 }
 
 // isValidDefaultKey is the canonical implementation for validating environment variable
@@ -294,8 +289,6 @@ func ClearInternCache() {
 		shard := &internShards[i]
 		shard.mu.Lock()
 		shard.cache = make(map[string]string, maxInternSize)
-		shard.order = nil
-		shard.orderStart = 0
 		shard.mu.Unlock()
 	}
 }

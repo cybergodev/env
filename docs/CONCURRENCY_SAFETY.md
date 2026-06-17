@@ -36,7 +36,7 @@ The core storage mechanism uses a **sharded map architecture** to minimize lock 
 
 **Implementation Details:**
 - **8 shards** for optimal distribution
-- **FNV-1a hash** for shard selection
+- **Hybrid hash** for shard selection — multiplicative (Knuth) hashing for short keys (≤8 chars, the common case) and FNV-1a with first/last-8-byte sampling for longer keys
 - **Per-shard RWMutex** for fine-grained locking
 - **Atomic counter** for O(1) `Len()` operations
 
@@ -101,7 +101,10 @@ type SecureValue struct {
 
 ### 4. Singleton Pattern (Default Loader)
 
-The default loader uses **atomic pointer + mutex** for thread-safe initialization:
+The default loader is an **explicitly-initialized singleton** — it is *not* lazily
+created on first access. It must be set once via `Load()` or `LoadWithConfig()`
+(both call `setDefaultLoader()` under a mutex). Subsequent reads use a lock-free
+atomic pointer load and return `ErrNotInitialized` until it has been set.
 
 ```go
 var (
@@ -109,35 +112,32 @@ var (
     defaultMu     sync.Mutex
 )
 
+// getDefaultLoader is the fast read path used by every package-level getter.
+// It only performs an atomic load — no creation, no locking.
 func getDefaultLoader() (*Loader, error) {
-    // Fast path: atomic check
     if loader := defaultLoader.Load(); loader != nil {
         return loader, nil
     }
+    return nil, ErrNotInitialized // caller must call Load()/LoadWithConfig() first
+}
 
-    // Slow path: mutex for initialization
+// setDefaultLoader stores the singleton under the mutex, exactly once.
+// Returns ErrAlreadyInitialized if a loader was already set.
+func setDefaultLoader(loader *Loader) error {
     defaultMu.Lock()
     defer defaultMu.Unlock()
-
-    // Double-check after acquiring lock
-    if loader := defaultLoader.Load(); loader != nil {
-        return loader, nil
+    if current := defaultLoader.Load(); current != nil {
+        return ErrAlreadyInitialized
     }
-
-    loader, err := New(DefaultConfig())
-    if err != nil {
-        return nil, err
-    }
-
     defaultLoader.Store(loader)
-    return loader, nil
+    return nil
 }
 ```
 
 **Guarantees:**
-- Single initialization (no race conditions)
-- Lock-free fast path for read access
-- Safe concurrent reset via `Swap()`
+- Explicit, once-only initialization via `Load()` / `LoadWithConfig()` (no silent auto-creation)
+- Lock-free fast path for read access (atomic `Pointer.Load`)
+- Safe concurrent reset via `Swap()` in `ResetDefaultLoader()`
 
 ### 5. ComponentFactory Lifecycle
 
@@ -145,6 +145,10 @@ Thread-safe factory with atomic close state:
 
 ```go
 func (f *ComponentFactory) Close() error {
+    if f == nil {
+        return nil
+    }
+
     // Atomic transition: open → closed
     if !f.closed.CompareAndSwap(false, true) {
         return nil // Already closed
@@ -153,9 +157,9 @@ func (f *ComponentFactory) Close() error {
     f.mu.Lock()
     defer f.mu.Unlock()
 
-    // Safe cleanup
-    if f.auditor != nil {
-        return f.auditor.Close()
+    // Close the auditor only if it implements io.Closer
+    if c, ok := f.auditor.(io.Closer); ok {
+        return c.Close()
     }
     return nil
 }
@@ -401,7 +405,6 @@ All concurrency tests are located in:
 |------|----------|
 | `concurrent_test.go` | Loader, SecureMap, SecureValue, Singleton tests |
 | `internal/concurrent_test.go` | InternKey, Expander, Auditor, Validator, Pool tests |
-| `singleton_test.go` | Singleton lifecycle tests |
 | `secure_test.go` | SecureValue thread-safety tests |
 
 Run all tests with race detection:

@@ -235,56 +235,46 @@ func TestConvenienceNoLoader(t *testing.T) {
 	ResetDefaultLoader()
 	defer ResetDefaultLoader()
 
-	// Without a loader, should return defaults/zero values
-	got := GetString("KEY", "default")
-	if got != "default" {
-		t.Errorf("GetString with no loader = %q, want \"default\"", got)
+	// With no default loader configured, every package-level accessor returns
+	// the caller-supplied default, or its zero value when none is given.
+	withDefault := []struct {
+		name string
+		call func() any
+		want any
+	}{
+		{"GetString", func() any { return GetString("KEY", "default") }, "default"},
+		{"GetInt", func() any { return GetInt("KEY", 123) }, int64(123)},
+		{"GetBool", func() any { return GetBool("KEY", true) }, true},
+		{"GetDuration", func() any { return GetDuration("KEY", 10*time.Second) }, 10 * time.Second},
+		{"GetUint64", func() any { return GetUint64("KEY", 999) }, uint64(999)},
+		{"GetFloat64", func() any { return GetFloat64("KEY", 3.14) }, float64(3.14)},
+	}
+	for _, tt := range withDefault {
+		t.Run(tt.name+"/default", func(t *testing.T) {
+			if got := tt.call(); got != tt.want {
+				t.Errorf("%s() = %v, want %v", tt.name, got, tt.want)
+			}
+		})
 	}
 
-	gotInt := GetInt("KEY", 123)
-	if gotInt != 123 {
-		t.Errorf("GetInt with no loader = %d, want 123", gotInt)
+	withoutDefault := []struct {
+		name string
+		call func() any
+		want any
+	}{
+		{"GetString", func() any { return GetString("KEY") }, ""},
+		{"GetInt", func() any { return GetInt("KEY") }, int64(0)},
+		{"GetBool", func() any { return GetBool("KEY") }, false},
+		{"GetUint64", func() any { return GetUint64("KEY") }, uint64(0)},
+		{"GetFloat64", func() any { return GetFloat64("KEY") }, float64(0)},
+		{"GetDuration", func() any { return GetDuration("KEY") }, time.Duration(0)},
 	}
-
-	// With defaults
-	gotBool := GetBool("KEY", true)
-	if gotBool != true {
-		t.Errorf("GetBool with no loader = %v, want true", gotBool)
-	}
-
-	gotDuration := GetDuration("KEY", 10*time.Second)
-	if gotDuration != 10*time.Second {
-		t.Errorf("GetDuration with no loader = %v, want 10s", gotDuration)
-	}
-
-	gotUint64 := GetUint64("KEY", 999)
-	if gotUint64 != 999 {
-		t.Errorf("GetUint64 with no loader = %d, want 999", gotUint64)
-	}
-
-	gotFloat64 := GetFloat64("KEY", 3.14)
-	if gotFloat64 != 3.14 {
-		t.Errorf("GetFloat64 with no loader = %f, want 3.14", gotFloat64)
-	}
-
-	// Without defaults
-	if GetString("KEY") != "" {
-		t.Error("GetString with no loader and no default should return \"\"")
-	}
-	if GetInt("KEY") != 0 {
-		t.Error("GetInt with no loader and no default should return 0")
-	}
-	if GetBool("KEY") != false {
-		t.Error("GetBool with no loader and no default should return false")
-	}
-	if GetUint64("KEY") != 0 {
-		t.Error("GetUint64 with no loader and no default should return 0")
-	}
-	if GetFloat64("KEY") != 0.0 {
-		t.Error("GetFloat64 with no loader and no default should return 0")
-	}
-	if GetDuration("KEY") != 0 {
-		t.Error("GetDuration with no loader and no default should return 0")
+	for _, tt := range withoutDefault {
+		t.Run(tt.name+"/zero", func(t *testing.T) {
+			if got := tt.call(); got != tt.want {
+				t.Errorf("%s() = %v, want %v", tt.name, got, tt.want)
+			}
+		})
 	}
 }
 
