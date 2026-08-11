@@ -91,11 +91,11 @@ func (p *parser) configure(cfg Config, factory *ComponentFactory) {
 	}
 
 	// Create LineParser with interfaces instead of concrete types.
-	// The factory provides adapter methods that return internal interfaces.
+	// Direct field access to internal interfaces (same package).
 	lp := internal.NewLineParser(lineParserCfg,
-		factory.lineParserValidator(),
-		factory.lineParserAuditor(),
-		factory.lineParserExpander(),
+		factory.validator,
+		factory.auditor,
+		factory.expander,
 	)
 	// Set value validator if the validator also implements LineValueValidator
 	if vv, ok := validator.(internal.LineValueValidator); ok {
@@ -131,10 +131,17 @@ func needsRequiredCheck(v Validator) bool {
 
 // Parse reads and parses environment variables from an io.Reader.
 func (p *parser) Parse(r io.Reader, filename string) (map[string]string, error) {
-	startTime := time.Now()
+	// Only record start time when audit is enabled — avoids time.Now() overhead
+	// and string concatenation in the common (audit-disabled) case.
+	var startTime time.Time
+	auditEnabled := p.config.AuditEnabled
+	if auditEnabled {
+		startTime = time.Now()
+	}
 
 	// Wrap with secure reader
 	secureRd := internal.NewSecureReader(r, p.config.MaxFileSize, p.config.MaxLineLength)
+	defer internal.ReleaseSecureReader(secureRd)
 	scanner := bufio.NewScanner(secureRd)
 
 	// Use pooled buffer for scanner to reduce allocations.
@@ -230,19 +237,9 @@ func (p *parser) Parse(r io.Reader, filename string) (map[string]string, error) 
 		return nil, parseErr
 	}
 
-	// Validate required keys (using pooled map to reduce allocations).
-	// Skip building the uppercase-key index entirely when no required keys are
-	// configured — the common case. Building it allocates one string per parsed
-	// key (ToUpperASCII) plus map growth, all of which is wasted when there is
-	// nothing to check.
-	if needsRequiredCheck(p.validator) {
-		upperKeys := internal.KeysToUpperPooled(result)
-		err := p.validator.ValidateRequired(upperKeys)
-		internal.PutKeysToUpperMap(upperKeys)
-		if err != nil {
-			_ = p.auditor.LogError(internal.ActionValidate, "", err.Error())
-			return nil, err
-		}
+	// Validate required keys (shared logic with structured parsers).
+	if err := validateRequiredKeys(p.validator, p.auditor, result); err != nil {
+		return nil, err
 	}
 
 	// Expand variables if enabled
@@ -254,7 +251,9 @@ func (p *parser) Parse(r io.Reader, filename string) (map[string]string, error) 
 		result = expanded
 	}
 
-	_ = p.auditor.LogWithDuration(internal.ActionParse, "", "parsed: "+filename, true, time.Since(startTime))
+	if auditEnabled {
+		_ = p.auditor.LogWithDuration(internal.ActionParse, "", "parsed: "+filename, true, time.Since(startTime))
+	}
 	return result, nil
 }
 

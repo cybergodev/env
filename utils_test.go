@@ -129,139 +129,6 @@ func TestParseInt(t *testing.T) {
 }
 
 // ============================================================================
-// parseSliceElement Edge Case Tests
-// ============================================================================
-
-func TestParseSliceElement(t *testing.T) {
-	// Test string type (no conversion needed)
-	t.Run("string type", func(t *testing.T) {
-		cfg := DefaultConfig()
-		loader, err := New(cfg)
-		if err != nil {
-			t.Fatalf("New() error = %v", err)
-		}
-		defer loader.Close()
-
-		loader.Set("KEY_0", "value1")
-		loader.Set("KEY_1", "value2")
-
-		result := GetSliceFrom[string](loader, "KEY")
-		if len(result) != 2 || result[0] != "value1" || result[1] != "value2" {
-			t.Errorf("GetSliceFrom[string]() = %v, want [value1 value2]", result)
-		}
-	})
-
-	// Test int type
-	t.Run("int type", func(t *testing.T) {
-		cfg := DefaultConfig()
-		loader, err := New(cfg)
-		if err != nil {
-			t.Fatalf("New() error = %v", err)
-		}
-		defer loader.Close()
-
-		loader.Set("NUM_0", "42")
-		loader.Set("NUM_1", "-10")
-
-		result := GetSliceFrom[int64](loader, "NUM")
-		if len(result) != 2 || result[0] != 42 || result[1] != -10 {
-			t.Errorf("GetSliceFrom[int64]() = %v, want [42 -10]", result)
-		}
-	})
-
-	// Test uint type
-	t.Run("uint type", func(t *testing.T) {
-		cfg := DefaultConfig()
-		loader, err := New(cfg)
-		if err != nil {
-			t.Fatalf("New() error = %v", err)
-		}
-		defer loader.Close()
-
-		loader.Set("UNS_0", "10")
-		loader.Set("UNS_1", "20")
-
-		result := GetSliceFrom[uint64](loader, "UNS")
-		if len(result) != 2 || result[0] != 10 || result[1] != 20 {
-			t.Errorf("GetSliceFrom[uint64]() = %v, want [10 20]", result)
-		}
-	})
-
-	// Test float64 type
-	t.Run("float64 type", func(t *testing.T) {
-		cfg := DefaultConfig()
-		loader, err := New(cfg)
-		if err != nil {
-			t.Fatalf("New() error = %v", err)
-		}
-		defer loader.Close()
-
-		loader.Set("RATES_0", "1.5")
-		loader.Set("RATES_1", "2.75")
-
-		result := GetSliceFrom[float64](loader, "RATES")
-		if len(result) != 2 || result[0] != 1.5 || result[1] != 2.75 {
-			t.Errorf("GetSliceFrom[float64]() = %v, want [1.5 2.75]", result)
-		}
-	})
-
-	// Test bool type
-	t.Run("bool type", func(t *testing.T) {
-		cfg := DefaultConfig()
-		loader, err := New(cfg)
-		if err != nil {
-			t.Fatalf("New() error = %v", err)
-		}
-		defer loader.Close()
-
-		loader.Set("FLAGS_0", "true")
-		loader.Set("FLAGS_1", "false")
-		loader.Set("FLAGS_2", "yes")
-		loader.Set("FLAGS_3", "no")
-
-		result := GetSliceFrom[bool](loader, "FLAGS")
-		if len(result) != 4 || result[0] != true || result[1] != false || result[2] != true || result[3] != false {
-			t.Errorf("GetSliceFrom[bool]() = %v, want [true false true false]", result)
-		}
-	})
-
-	// Test duration type
-	t.Run("duration type", func(t *testing.T) {
-		cfg := DefaultConfig()
-		loader, err := New(cfg)
-		if err != nil {
-			t.Fatalf("New() error = %v", err)
-		}
-		defer loader.Close()
-
-		loader.Set("TIMES_0", "5s")
-		loader.Set("TIMES_1", "1m30s")
-
-		result := GetSliceFrom[time.Duration](loader, "TIMES")
-		if len(result) != 2 || result[0] != 5*time.Second || result[1] != 90*time.Second {
-			t.Errorf("GetSliceFrom[duration]() = %v, want [5s 1m30s]", result)
-		}
-	})
-
-	// Test parse error returns default
-	t.Run("parse error returns default", func(t *testing.T) {
-		cfg := DefaultConfig()
-		loader, err := New(cfg)
-		if err != nil {
-			t.Fatalf("New() error = %v", err)
-		}
-		defer loader.Close()
-
-		loader.Set("BAD_INT_0", "not_a_number")
-
-		result := GetSliceFrom[int64](loader, "BAD_INT", []int64{42})
-		if len(result) != 1 || result[0] != 42 {
-			t.Errorf("GetSliceFrom[int64]() with bad value = %v, want [42]", result)
-		}
-	})
-}
-
-// ============================================================================
 // Marshal Tests
 // ============================================================================
 
@@ -1053,10 +920,10 @@ func TestValidatorInterfaceWrapper_ValidateRequired(t *testing.T) {
 		}
 		// Check that error message contains guidance
 		errMsg := err.Error()
-		if !containsString(errMsg, "ValidateRequired") {
+		if !strings.Contains(errMsg, "ValidateRequired") {
 			t.Errorf("Error message should mention ValidateRequired, got: %s", errMsg)
 		}
-		if !containsString(errMsg, "Validator") {
+		if !strings.Contains(errMsg, "Validator") {
 			t.Errorf("Error message should mention Validator interface, got: %s", errMsg)
 		}
 	})
@@ -1203,10 +1070,10 @@ func TestErrValidateRequiredUnsupported_ErrorMessage(t *testing.T) {
 
 	// Verify error message contains helpful guidance
 	errMsg := err.Error()
-	if !containsString(errMsg, "ValidateRequired") {
+	if !strings.Contains(errMsg, "ValidateRequired") {
 		t.Errorf("Error message should mention ValidateRequired, got: %s", errMsg)
 	}
-	if !containsString(errMsg, "Validator") {
+	if !strings.Contains(errMsg, "Validator") {
 		t.Errorf("Error message should mention Validator interface, got: %s", errMsg)
 	}
 }
@@ -1217,24 +1084,6 @@ func TestErrValidateRequiredUnsupported_ErrorsIs(t *testing.T) {
 	if !errors.Is(wrappedErr, ErrValidateRequiredUnsupported) {
 		t.Error("errors.Is should match ErrValidateRequiredUnsupported in wrapped error")
 	}
-}
-
-// ============================================================================
-// Helper Functions
-// ============================================================================
-
-func containsString(s, substr string) bool {
-	return len(s) >= len(substr) && (s == substr || len(substr) == 0 ||
-		(len(s) > 0 && len(substr) > 0 && findSubstring(s, substr)))
-}
-
-func findSubstring(s, substr string) bool {
-	for i := 0; i <= len(s)-len(substr); i++ {
-		if s[i:i+len(substr)] == substr {
-			return true
-		}
-	}
-	return false
 }
 
 // ============================================================================

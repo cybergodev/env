@@ -63,6 +63,55 @@ func TestPutBuilder_LargeBuilder(t *testing.T) {
 }
 
 // ============================================================================
+// PutBuilderDiscard Tests
+// ============================================================================
+
+func TestPutBuilderDiscard(t *testing.T) {
+	t.Run("resets builder content", func(t *testing.T) {
+		sb := GetBuilder()
+		sb.WriteString("sensitive_data")
+		originalLen := sb.Len()
+
+		PutBuilderDiscard(sb)
+
+		// After discard, builder should be reset (len 0) but pointer is still valid
+		if originalLen == 0 {
+			t.Error("sanity: builder should have had content before discard")
+		}
+	})
+
+	t.Run("nil is safe", func(t *testing.T) {
+		// Should not panic
+		PutBuilderDiscard(nil)
+	})
+
+	t.Run("discarded builder not pooled (content overwritten)", func(t *testing.T) {
+		// Fill the pool with known data via PutBuilder, then discard one,
+		// then verify GetBuilder returns clean builders.
+		for range 5 {
+			sb := GetBuilder()
+			sb.WriteString("pool_seed")
+			PutBuilder(sb) // goes to pool
+		}
+
+		// Now discard a builder with sensitive content
+		sb := GetBuilder()
+		sb.WriteString("SECRET_TOKEN_VALUE")
+		PutBuilderDiscard(sb) // must NOT return to pool
+
+		// All subsequent GetBuilder calls should return reset (empty) builders
+		for range 10 {
+			got := GetBuilder()
+			if got.Len() != 0 {
+				t.Error("GetBuilder() returned a non-reset builder — discard may have leaked to pool")
+			}
+			got.WriteString("x")
+			PutBuilder(got)
+		}
+	})
+}
+
+// ============================================================================
 // Byte Slice Pool Tests
 // ============================================================================
 

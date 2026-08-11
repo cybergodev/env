@@ -105,8 +105,8 @@ if !exists {
 }
 
 // CRUD 操作
-env.Set("KEY", "value")           // 设置值（返回 error）
-env.Delete("KEY")                 // 删除键（返回 error）
+if err := env.Set("KEY", "value"); err != nil { /* 处理错误 */ }
+if err := env.Delete("KEY"); err != nil { /* 处理错误 */ }
 keys := env.Keys()                // 获取所有键
 all := env.All()                  // 获取所有变量为 map
 count := env.Len()                // 变量数量
@@ -175,8 +175,8 @@ env.GetBool("debug.mode")       // 解析为 DEBUG_MODE
 
 ```go
 type Config struct {
-    Port    int           `env:"PORT" envDefault:"8080"`
-    Debug   bool          `env:"DEBUG" envDefault:"false"`
+    Port    int           `env:"PORT,envDefault:8080"`
+    Debug   bool          `env:"DEBUG,envDefault:false"`
     Timeout time.Duration `env:"TIMEOUT"`
     Origins []string      `env:"CORS_ORIGINS"`
 }
@@ -302,11 +302,14 @@ PORT=8080
 # 变量引用
 URL=${HOST}:${PORT}                    # → "localhost:8080"
 
-# 未设置或为空时使用默认值
+# 未设置时使用默认值（空字符串会被保留）
 TIMEOUT=${TIMEOUT:-30s}
 
-# 仅未设置时使用默认值（保留空字符串）
-NAME=${NAME-default}
+# 未设置时赋值默认值（本库中行为与 :- 相同）
+NAME=${NAME:=default_value}
+
+# 必需变量 — 未设置或为空时报错
+API_KEY=${API_KEY:?API_KEY must be set}
 
 # 组合展开
 FULL_URL=https://${HOST}:${PORT:-443}
@@ -325,6 +328,9 @@ if sv != nil {
     defer sv.Release()
 
     // 安全日志输出（String() 返回掩码表示）
+    // 输出格式：[SECURE:<N> bytes]
+    // 启用内存锁定时，会追加状态后缀：
+    //   [SECURE:32 bytes locked] / [SECURE:32 bytes unlocked] / [SECURE:32 bytes lock-failed]
     fmt.Println(sv)                // [SECURE:32 bytes]
     fmt.Println(sv.Masked())       // [SECURE:32 bytes]
 
@@ -443,9 +449,16 @@ env.DetectFormat("config.yaml")  // FormatYAML
 自动检测的模式（不区分大小写）：
 
 ```
-*password*, *secret*, *key*, *token*, *credential*,
-*api_key*, *private*, *auth*, *session*, *access*
+password, secret, token, credential, passphrase,
+api_key, apikey, access_key, secret_key, private_key,
+private, auth, session, cookie,
+encryption_key, signing_key, connection_string,
+database_url, db_password, ssn, credit_card,
+mnemonic, seed, recovery, wallet, service_account
 ```
+
+> **注意：** 以上为代表性子集，完整列表包含 40+ 个模式。
+> 匹配方式为子串匹配且不区分大小写 — 例如 `MY_API_KEY` 会因包含 `API_KEY` 而匹配。
 
 ---
 
@@ -698,18 +711,23 @@ err := env.ForceRegisterParser(env.FormatEnv, customFactory)
 
 ## 📁 示例
 
-完整示例代码请查看 [examples](examples) 目录：
+完整可运行的示例程序请查看 [examples](examples) 目录，每个示例都是独立目录中的自包含程序。
 
 | 示例 | 描述 |
 |:-----|:-----|
-| [01_quickstart.go](examples/01_quickstart.go) | 基础用法 |
-| [02_loader_config.go](examples/02_loader_config.go) | 配置选项 |
-| [03_type_access.go](examples/03_type_access.go) | 类型转换 |
-| [04_struct_mapping.go](examples/04_struct_mapping.go) | 结构体填充 |
-| [05_secure_values.go](examples/05_secure_values.go) | 安全处理 |
-| [06_audit_logging.go](examples/06_audit_logging.go) | 审计日志 |
-| [07_marshal_unmarshal.go](examples/07_marshal_unmarshal.go) | 序列化 |
-| [08_utilities.go](examples/08_utilities.go) | 工具函数 |
+| [01_quickstart](examples/01_quickstart/) | 全局模式基础：`Load`、类型访问器、`Lookup`、`Set` |
+| [02_loader_config](examples/02_loader_config/) | 实例模式、配置预设、前缀过滤、必需键、生命周期 |
+| [03_type_access](examples/03_type_access/) | 所有类型 getter：string、int、bool、duration、float、uint、slice |
+| [04_struct_mapping](examples/04_struct_mapping/) | `env` 标签结构体序列化/反序列化、嵌套结构体、默认值 |
+| [05_secure_values](examples/05_secure_values/) | `SecureValue` 生命周期、`Close` 与 `Release`、内存锁定 |
+| [06_audit_logging](examples/06_audit_logging/) | JSON、Channel 和 Log 审计处理器 |
+| [07_marshal_unmarshal](examples/07_marshal_unmarshal/) | 格式转换：map ↔ string、struct ↔ map、多格式输出 |
+| [08_utilities](examples/08_utilities/) | 内省（`Keys`/`All`/`Len`）、脱敏、格式检测 |
+| [09_error_handling](examples/09_error_handling/) | 哨兵错误（`errors.Is`）、类型化错误（`errors.As`） |
+| [10_concurrency](examples/10_concurrency/) | 并发读、写和混合访问 |
+| [11_advanced](examples/11_advanced/) | 变量展开、多文件覆盖、前缀过滤 |
+
+示例共享的数据文件位于 [`examples/data/`](examples/data/)。
 
 ---
 

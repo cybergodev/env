@@ -44,7 +44,7 @@ func defaultIsSensitive(key string) bool { return false }
 func defaultMaskSensitive(s string) string {
 	const maxLen = 50
 	if len(s) > maxLen {
-		return s[:maxLen] + "..."
+		return s[:maxLen-3] + "..."
 	}
 	return s
 }

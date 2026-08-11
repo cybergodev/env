@@ -7,6 +7,7 @@ import (
 	"io"
 	"log"
 	"os"
+	"runtime/debug"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -206,9 +207,10 @@ func (h *ChannelHandler) Close() error {
 //	// ... use handler ...
 //	handler.Close() // Closes the channel, consumer goroutine exits gracefully
 type CloseableChannelHandler struct {
-	ch      chan Event
-	done    chan struct{} // closed in Close() to unblock Log() without panic
-	closeMu sync.Mutex
+	ch        chan Event
+	done      chan struct{} // closed in Close() to unblock Log() without panic
+	closeMu   sync.Mutex
+	closeOnce sync.Once // ensures done/ch are closed exactly once
 }
 
 // NewCloseableChannelHandler creates a new CloseableChannelHandler with a
@@ -231,9 +233,15 @@ func (h *CloseableChannelHandler) Channel() <-chan Event {
 }
 
 // Log sends an audit event to the channel.
-// Returns an error if the handler has been closed or the channel is full.
-// Holds closeMu during the send to prevent Close() from closing the channel
-// concurrently, which would cause a send-on-closed-channel panic.
+//
+// For buffered channels, the send is non-blocking: if the buffer is full the
+// event is dropped and an error is returned. For unbuffered channels (buffer
+// size 0), the send blocks until a receiver is ready or the handler is closed.
+//
+// closeMu is held during the send to prevent Close() from closing the channel
+// concurrently, which would cause a send-on-closed-channel panic. For
+// unbuffered channels, Close() closes the done channel before acquiring
+// closeMu so that a blocked send can be interrupted without a deadlock.
 func (h *CloseableChannelHandler) Log(event Event) error {
 	h.closeMu.Lock()
 	defer h.closeMu.Unlock()
@@ -244,6 +252,17 @@ func (h *CloseableChannelHandler) Log(event Event) error {
 	default:
 	}
 
+	if cap(h.ch) == 0 {
+		// Unbuffered: block until the event is received or the handler closes.
+		select {
+		case h.ch <- event:
+			return nil
+		case <-h.done:
+			return fmt.Errorf("handler is closed")
+		}
+	}
+
+	// Buffered: non-blocking send, drop the event if the buffer is full.
 	select {
 	case h.ch <- event:
 		return nil
@@ -253,19 +272,23 @@ func (h *CloseableChannelHandler) Log(event Event) error {
 }
 
 // Close implements Handler.
-// Closes done first to unblock any waiting Log calls, then closes the event channel.
-// Safe to call multiple times.
+//
+// Closes done first (via closeOnce, without holding closeMu) so that any Log()
+// call blocked on an unbuffered send is interrupted immediately. Only then does
+// it acquire closeMu to close the event channel, guaranteeing no send is in
+// progress when the channel is closed. Safe to call multiple times.
 func (h *CloseableChannelHandler) Close() error {
-	h.closeMu.Lock()
-	defer h.closeMu.Unlock()
-	select {
-	case <-h.done:
-		return nil // Already closed
-	default:
+	h.closeOnce.Do(func() {
+		// Signal shutdown. This unblocks any Log() waiting on an unbuffered
+		// send before we contend on closeMu.
 		close(h.done)
+
+		// Wait for any in-flight Log() to finish its send, then close ch.
+		h.closeMu.Lock()
 		close(h.ch)
-		return nil
-	}
+		h.closeMu.Unlock()
+	})
+	return nil
 }
 
 // IsClosed returns true if the handler has been closed.
@@ -610,12 +633,28 @@ func (h *BufferedHandler) flushLoop() {
 		case <-h.stopCh:
 			return
 		case <-ticker.C:
-			h.Flush()
+			h.safeFlush()
 		case <-h.flushCh:
 			// Manual flush requested
-			h.Flush()
+			h.safeFlush()
 		}
 	}
+}
+
+// safeFlush calls Flush with panic protection.
+// The underlying handler is user-supplied; if it panics during Log,
+// the panic is recovered and reported via the OnError callback rather
+// than crashing the process. The flushLoop goroutine continues running
+// so subsequent flushes are unaffected.
+func (h *BufferedHandler) safeFlush() {
+	defer func() {
+		if r := recover(); r != nil {
+			if h.onError != nil {
+				h.onError(fmt.Errorf("panic during background flush: %v\n%s", r, debug.Stack()))
+			}
+		}
+	}()
+	_ = h.Flush() // error already handled internally via onError + re-queue
 }
 
 // Log adds an event to the buffer.

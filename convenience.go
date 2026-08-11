@@ -356,7 +356,9 @@ func Validate() error {
 //	port := env.GetInt("PORT", 8080)
 func Load(filenames ...string) error {
 	cfg := DefaultConfig()
-	cfg.Filenames = filenames
+	if len(filenames) > 0 {
+		cfg.Filenames = filenames
+	}
 	cfg.AutoApply = true
 
 	loader, err := New(cfg)
@@ -404,7 +406,7 @@ func LoadWithConfig(cfg Config) error {
 
 	// Set as default loader for package-level functions
 	if err := setDefaultLoader(loader); err != nil {
-		_ = loader.Close()
+		_ = loader.Close() // best-effort cleanup; error not actionable
 		return err
 	}
 

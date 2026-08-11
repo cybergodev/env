@@ -114,7 +114,10 @@ func (p *LineParser) ParseLineBytes(line []byte) (string, string, error) {
 		}
 	}
 
-	// Find the separator using byte-level search
+	// Find the separator using byte-level search.
+	// A manual loop outperforms bytes.IndexAny for typical short env lines
+	// (≤40 chars) because IndexAny's charset-bitset setup overhead exceeds
+	// the per-byte comparison cost at that length.
 	sepIdx := -1
 	for i := 0; i < len(line); i++ {
 		if line[i] == '=' || line[i] == ':' {

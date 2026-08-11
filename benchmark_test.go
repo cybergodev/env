@@ -675,6 +675,7 @@ func BenchmarkJSONParser_Medium(b *testing.B) {
 	content := generateJSONContent(100)
 	cfg := DefaultConfig()
 	cfg.MaxVariables = 200
+	cfg.MaxLineLength = 16384 // Single-line JSON exceeds default 1024
 	loader, err := New(cfg)
 	if err != nil {
 		b.Fatal(err)

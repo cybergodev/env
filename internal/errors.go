@@ -9,10 +9,10 @@ import (
 // Sentinel errors used by internal packages.
 var (
 	// ErrFileTooLarge indicates the file exceeds the maximum allowed size.
-	ErrFileTooLarge = fmt.Errorf("file exceeds maximum size limit")
+	ErrFileTooLarge = errors.New("file exceeds maximum size limit")
 
 	// ErrLineTooLong indicates a line exceeds the maximum allowed length.
-	ErrLineTooLong = fmt.Errorf("line exceeds maximum length limit")
+	ErrLineTooLong = errors.New("line exceeds maximum length limit")
 
 	// ErrInvalidValue indicates a value is invalid.
 	ErrInvalidValue = errors.New("invalid value content")

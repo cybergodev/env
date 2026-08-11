@@ -124,3 +124,50 @@ func TestSecureReaderErrorPersisted(t *testing.T) {
 		t.Errorf("expected persistent error ErrFileTooLarge, got %v", err)
 	}
 }
+
+// ============================================================================
+// ReleaseSecureReader Tests
+// ============================================================================
+
+func TestReleaseSecureReader(t *testing.T) {
+	t.Run("valid reader returns to pool", func(t *testing.T) {
+		reader := NewSecureReader(strings.NewReader("test"), 1024, 1024)
+		// Should not panic
+		ReleaseSecureReader(reader)
+	})
+
+	t.Run("nil is safe", func(t *testing.T) {
+		// Should not panic
+		ReleaseSecureReader(nil)
+	})
+
+	t.Run("reader reused from pool after release", func(t *testing.T) {
+		// Create, release, create again — the second should reuse the pooled struct
+		first := NewSecureReader(strings.NewReader("data1"), 512, 64)
+		first.Read(make([]byte, 5)) // exercise Read to set internal state
+		ReleaseSecureReader(first)
+
+		second := NewSecureReader(strings.NewReader("data2"), 512, 64)
+		// Verify the reused reader is functional
+		buf := make([]byte, 5)
+		n, err := second.Read(buf)
+		if err != nil && err != io.EOF {
+			t.Errorf("reused reader Read() error = %v", err)
+		}
+		if n != 5 || string(buf) != "data2" {
+			t.Errorf("reused reader Read() = %q (%d bytes), want \"data2\" (5 bytes)", string(buf[:n]), n)
+		}
+		// totalRead should be reset from the previous reader's state
+		if second.totalRead != 5 {
+			t.Errorf("reused reader totalRead = %d, want 5 (should be reset)", second.totalRead)
+		}
+	})
+
+	t.Run("released reader has nil underlying reader (GC-friendly)", func(t *testing.T) {
+		reader := NewSecureReader(strings.NewReader("content"), 1024, 1024)
+		ReleaseSecureReader(reader)
+		if reader.reader != nil {
+			t.Error("released reader should have nil underlying reader for GC")
+		}
+	})
+}

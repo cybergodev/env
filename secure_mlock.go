@@ -91,6 +91,10 @@ func IsMemoryLockStrict() bool {
 	return memLockConfig.strict.Load()
 }
 
+// strictLockFailureHandler is the function signature for strict memory-lock
+// failure notifications.
+type strictLockFailureHandler func(error)
+
 // onStrictLockFailure is invoked when strict memory-lock mode is enabled and a
 // lock attempt fails. It is the mechanism that makes SetMemoryLockStrict
 // observable: without it, enabling strict mode had no effect on the non-error
@@ -102,7 +106,17 @@ func IsMemoryLockStrict() bool {
 // (and internal callers) can redirect or suppress it without expanding the
 // public API. SecureValue has no reference to a Loader/Auditor, so auditor
 // routing is not possible at this layer.
-var onStrictLockFailure = defaultStrictLockFailureHandler
+//
+// Thread Safety: The handler is stored in an atomic.Pointer so that concurrent
+// reads from tryLockMemory and test-time swaps are race-free. The atomic load
+// adds ~1 ns per call — negligible compared to the syscall it follows.
+var onStrictLockFailure atomic.Pointer[strictLockFailureHandler]
+
+// init installs the default strict-lock-failure handler.
+func init() {
+	h := strictLockFailureHandler(defaultStrictLockFailureHandler)
+	onStrictLockFailure.Store(&h)
+}
 
 // defaultStrictLockFailureHandler logs a memory-lock failure to the standard
 // logger. It is the default value of onStrictLockFailure.

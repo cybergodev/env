@@ -580,6 +580,69 @@ func (h *errorTestHandler) Close() error {
 	return nil
 }
 
+// panicTestHandler panics on Log to verify recover protection in flushLoop.
+type panicTestHandler struct{}
+
+func (h *panicTestHandler) Log(event Event) error {
+	panic("simulated handler panic")
+}
+
+func (h *panicTestHandler) Close() error {
+	return nil
+}
+
+// TestBufferedHandler_FlushLoopPanicRecovery verifies that a panic in a
+// user-supplied handler during the background flushLoop goroutine does not
+// crash the process. The panic is recovered and reported via OnError.
+func TestBufferedHandler_FlushLoopPanicRecovery(t *testing.T) {
+	var (
+		mu       sync.Mutex
+		captured error
+	)
+
+	handler := NewBufferedHandler(BufferedHandlerConfig{
+		Handler:       &panicTestHandler{},
+		BufferSize:    100,
+		FlushInterval: 20 * time.Millisecond,
+		OnError: func(err error) {
+			mu.Lock()
+			captured = err
+			mu.Unlock()
+		},
+	})
+
+	// Log an event so the background flush has something to flush.
+	_ = handler.Log(Event{Action: ActionSet})
+
+	// Wait for the background flush to trigger and the panic to be recovered.
+	deadline := time.After(2 * time.Second)
+	for {
+		mu.Lock()
+		done := captured != nil
+		mu.Unlock()
+		if done {
+			break
+		}
+		select {
+		case <-deadline:
+			t.Fatal("timed out waiting for panic recovery via OnError")
+		default:
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+
+	// Close should still succeed — the goroutine is alive.
+	if err := handler.Close(); err != nil {
+		t.Errorf("Close() after panic recovery error = %v", err)
+	}
+
+	mu.Lock()
+	defer mu.Unlock()
+	if !strings.Contains(captured.Error(), "panic during background flush") {
+		t.Errorf("OnError message = %q, want substring %q", captured.Error(), "panic during background flush")
+	}
+}
+
 func TestBufferedHandler_Defaults(t *testing.T) {
 	// Test with minimal config
 	handler := NewBufferedHandler(BufferedHandlerConfig{
