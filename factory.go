@@ -83,21 +83,6 @@ func (f *ComponentFactory) IsClosed() bool {
 	return f.closed.Load()
 }
 
-// lineParserValidator returns the validator as internal.LineKeyValidator interface.
-func (f *ComponentFactory) lineParserValidator() internal.LineKeyValidator {
-	return f.validator
-}
-
-// lineParserAuditor returns the auditor as internal.LineAuditLogger interface.
-func (f *ComponentFactory) lineParserAuditor() internal.LineAuditLogger {
-	return f.auditor
-}
-
-// lineParserExpander returns the expander as internal.LineExpander interface.
-func (f *ComponentFactory) lineParserExpander() internal.LineExpander {
-	return f.expander
-}
-
 // Expander returns the expander as VariableExpander interface.
 func (f *ComponentFactory) Expander() VariableExpander {
 	if f == nil {

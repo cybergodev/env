@@ -228,13 +228,15 @@ func (c *Config) IsZero() bool {
 	// Check numeric limits (non-zero defaults in DefaultConfig)
 	if c.MaxFileSize != 0 || c.MaxVariables != 0 ||
 		c.MaxLineLength != 0 || c.MaxKeyLength != 0 ||
-		c.MaxValueLength != 0 || c.MaxExpansionDepth != 0 {
+		c.MaxValueLength != 0 || c.MaxExpansionDepth != 0 ||
+		c.JSONMaxDepth != 0 || c.YAMLMaxDepth != 0 {
 		return false
 	}
 
 	// Check boolean fields (any non-zero value means initialized)
-	if c.ValidateValues || c.JSONNullAsEmpty || c.JSONNumberAsString ||
-		c.JSONBoolAsString || c.YAMLNullAsEmpty || c.YAMLNumberAsString ||
+	if c.ValidateValues || c.ValidateUTF8 || c.JSONNullAsEmpty ||
+		c.JSONNumberAsString || c.JSONBoolAsString ||
+		c.YAMLNullAsEmpty || c.YAMLNumberAsString ||
 		c.YAMLBoolAsString || c.AllowExportPrefix || c.ExpandVariables ||
 		c.OverwriteExisting || c.AutoApply || c.FailOnMissingFile ||
 		c.AllowYamlSyntax || c.AuditEnabled {
@@ -245,6 +247,11 @@ func (c *Config) IsZero() bool {
 	if c.KeyPattern != nil || c.FileSystem != nil ||
 		c.CustomValidator != nil || c.CustomExpander != nil ||
 		c.CustomAuditor != nil || c.AuditHandler != nil {
+		return false
+	}
+
+	// Check string fields (non-empty means partially initialized)
+	if c.Prefix != "" {
 		return false
 	}
 

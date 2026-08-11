@@ -566,3 +566,38 @@ func TestWriteFile_ErrorPaths(t *testing.T) {
 		}
 	})
 }
+
+// TestWriteFile_OverwriteAtomic verifies that writing to an existing file
+// atomically replaces the old content (rename-over-existing path).
+func TestWriteFile_OverwriteAtomic(t *testing.T) {
+	tmpDir := t.TempDir()
+	filename := filepath.Join(tmpDir, "overwrite.env")
+
+	// Write initial content
+	var buf1 bytes.Buffer
+	buf1.WriteString("OLD=value\n")
+	if err := WriteFile(filename, &buf1); err != nil {
+		t.Fatalf("first WriteFile() error = %v", err)
+	}
+
+	// Overwrite — exercises the rename-over-existing path
+	var buf2 bytes.Buffer
+	buf2.WriteString("NEW=value\n")
+	if err := WriteFile(filename, &buf2); err != nil {
+		t.Fatalf("second WriteFile() error = %v", err)
+	}
+
+	data, err := os.ReadFile(filename)
+	if err != nil {
+		t.Fatalf("ReadFile() error = %v", err)
+	}
+	if string(data) != "NEW=value\n" {
+		t.Errorf("content = %q, want %q", string(data), "NEW=value\n")
+	}
+
+	// Verify no temp file left behind
+	tempFile := filename + ".tmp"
+	if _, err := os.Stat(tempFile); err == nil {
+		t.Error("temp file should not exist after successful write")
+	}
+}

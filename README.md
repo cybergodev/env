@@ -105,8 +105,8 @@ if !exists {
 }
 
 // CRUD operations
-env.Set("KEY", "value")           // Set value (returns error)
-env.Delete("KEY")                 // Delete key (returns error)
+if err := env.Set("KEY", "value"); err != nil { /* handle */ }
+if err := env.Delete("KEY"); err != nil { /* handle */ }
 keys := env.Keys()                // Get all keys
 all := env.All()                  // Get all variables as map
 count := env.Len()                // Variable count
@@ -175,8 +175,8 @@ env.GetBool("debug.mode")       // resolves to DEBUG_MODE
 
 ```go
 type Config struct {
-    Port    int           `env:"PORT" envDefault:"8080"`
-    Debug   bool          `env:"DEBUG" envDefault:"false"`
+    Port    int           `env:"PORT,envDefault:8080"`
+    Debug   bool          `env:"DEBUG,envDefault:false"`
     Timeout time.Duration `env:"TIMEOUT"`
     Origins []string      `env:"CORS_ORIGINS"`
 }
@@ -302,11 +302,14 @@ PORT=8080
 # Variable reference
 URL=${HOST}:${PORT}                    # → "localhost:8080"
 
-# Default value if unset or empty
+# Default value if unset (empty string is preserved)
 TIMEOUT=${TIMEOUT:-30s}
 
-# Default value only if unset (preserves empty string)
-NAME=${NAME-default}
+# Assign default if unset (same behavior as :- in this library)
+NAME=${NAME:=default_value}
+
+# Required variable — error if unset or empty
+API_KEY=${API_KEY:?API_KEY must be set}
 
 # Combined expansion
 FULL_URL=https://${HOST}:${PORT:-443}
@@ -325,6 +328,9 @@ if sv != nil {
     defer sv.Release()
 
     // Safe logging (String() returns masked representation)
+    // Output format: [SECURE:<N> bytes]
+    // When memory locking is enabled, a status suffix is appended:
+    //   [SECURE:32 bytes locked] / [SECURE:32 bytes unlocked] / [SECURE:32 bytes lock-failed]
     fmt.Println(sv)                // [SECURE:32 bytes]
     fmt.Println(sv.Masked())       // [SECURE:32 bytes]
 
@@ -443,9 +449,17 @@ env.DetectFormat("config.yaml")  // FormatYAML
 Automatically detected (case-insensitive):
 
 ```
-*password*, *secret*, *key*, *token*, *credential*,
-*api_key*, *private*, *auth*, *session*, *access*
+password, secret, token, credential, passphrase,
+api_key, apikey, access_key, secret_key, private_key,
+private, auth, session, cookie,
+encryption_key, signing_key, connection_string,
+database_url, db_password, ssn, credit_card,
+mnemonic, seed, recovery, wallet, service_account
 ```
+
+> **Note:** This is a representative subset. The full list contains 40+ patterns.
+> Matching is substring-based and case-insensitive — a key like `MY_API_KEY`
+> matches because it contains `API_KEY`.
 
 ---
 
@@ -698,18 +712,24 @@ err := env.ForceRegisterParser(env.FormatEnv, customFactory)
 
 ## 📁 Examples
 
-See the [examples](examples) directory for complete example code:
+See the [examples](examples) directory for complete, runnable example programs.
+Each example is a self-contained program in its own directory.
 
 | Example | Description |
 |:--------|:------------|
-| [01_quickstart.go](examples/01_quickstart.go) | Basic usage |
-| [02_loader_config.go](examples/02_loader_config.go) | Configuration options |
-| [03_type_access.go](examples/03_type_access.go) | Type conversion |
-| [04_struct_mapping.go](examples/04_struct_mapping.go) | Struct population |
-| [05_secure_values.go](examples/05_secure_values.go) | Secure handling |
-| [06_audit_logging.go](examples/06_audit_logging.go) | Audit logging |
-| [07_marshal_unmarshal.go](examples/07_marshal_unmarshal.go) | Serialization |
-| [08_utilities.go](examples/08_utilities.go) | Utility functions |
+| [01_quickstart](examples/01_quickstart/) | Global mode basics: `Load`, typed accessors, `Lookup`, `Set` |
+| [02_loader_config](examples/02_loader_config/) | Instance mode, config presets, prefix filter, required keys, lifecycle |
+| [03_type_access](examples/03_type_access/) | All typed getters: string, int, bool, duration, float, uint, slice |
+| [04_struct_mapping](examples/04_struct_mapping/) | Struct unmarshal/marshal with `env` tags, nested structs, defaults |
+| [05_secure_values](examples/05_secure_values/) | `SecureValue` lifecycle, `Close` vs `Release`, memory locking |
+| [06_audit_logging](examples/06_audit_logging/) | JSON, Channel, and Log audit handlers |
+| [07_marshal_unmarshal](examples/07_marshal_unmarshal/) | Format conversion: map ↔ string, struct ↔ map, multi-format output |
+| [08_utilities](examples/08_utilities/) | Introspection (`Keys`/`All`/`Len`), masking, format detection |
+| [09_error_handling](examples/09_error_handling/) | Sentinel errors (`errors.Is`), typed errors (`errors.As`) |
+| [10_concurrency](examples/10_concurrency/) | Concurrent reads, writes, and mixed access |
+| [11_advanced](examples/11_advanced/) | Variable expansion, multiple file override, prefix filter |
+
+Shared data files for the examples live in [`examples/data/`](examples/data/).
 
 ---
 

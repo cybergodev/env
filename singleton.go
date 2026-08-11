@@ -51,13 +51,14 @@ func getDefaultLoader() (*Loader, error) {
 func ResetDefaultLoader() error {
 	defaultMu.Lock()
 	oldLoader := defaultLoader.Swap(nil)
-
-	if oldLoader != nil {
-		err := oldLoader.Close()
-		defaultMu.Unlock()
-		return err
-	}
 	defaultMu.Unlock()
+
+	// Close outside the mutex to avoid holding the lock during potentially
+	// slow cleanup and to prevent deadlock if Close triggers code that
+	// needs the default loader.
+	if oldLoader != nil {
+		return oldLoader.Close()
+	}
 	return nil
 }
 

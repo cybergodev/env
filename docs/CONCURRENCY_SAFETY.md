@@ -36,7 +36,7 @@ The core storage mechanism uses a **sharded map architecture** to minimize lock 
 
 **Implementation Details:**
 - **8 shards** for optimal distribution
-- **Hybrid hash** for shard selection — multiplicative (Knuth) hashing for short keys (≤8 chars, the common case) and FNV-1a with first/last-8-byte sampling for longer keys
+- **Hybrid hash** for shard selection — multiplicative (Knuth) hashing for short keys (≤8 chars, the common case), full FNV-1a for medium keys (9–16 chars), and FNV-1a with first/last-8-byte sampling for longer keys (>16 chars)
 - **Per-shard RWMutex** for fine-grained locking
 - **Atomic counter** for O(1) `Len()` operations
 
@@ -169,41 +169,21 @@ func (f *ComponentFactory) Close() error {
 
 ## Tested Scenarios
 
-### Concurrent Read Operations
+### Concurrent Read/Write Operations
 
 ```go
-// Test: 10 goroutines × 1000 iterations
-func TestLoader_ConcurrentGet(t *testing.T)
+// Test: 10 goroutines × 1000 iterations (read, write, delete mixed)
+func TestLoader_Concurrent(t *testing.T)
 ```
 
 **Operations Tested:**
 - `GetString()`, `GetInt()`, `GetBool()`, `GetDuration()`
 - `Lookup()`, `GetSecure()`
 - `Keys()`, `All()`, `Len()`
+- `Set()` with and without overwrite
+- `Delete()`
 
-**Result:** ✅ No data races, consistent reads
-
-### Concurrent Write Operations
-
-```go
-// Test: 10 goroutines × 1000 iterations
-func TestLoader_ConcurrentSet(t *testing.T)
-```
-
-**Operations Tested:**
-- `Set()` with overwrite
-- `Set()` without overwrite
-
-**Result:** ✅ No data races, consistent writes
-
-### Concurrent Read/Write Mix
-
-```go
-// Test: 5 readers + 5 writers + 2 deleters
-func TestLoader_ConcurrentReadWrite(t *testing.T)
-```
-
-**Result:** ✅ No data races, eventual consistency
+**Result:** ✅ No data races, consistent reads and writes
 
 ### Concurrent Operations with Close
 

@@ -5,7 +5,15 @@ import (
 	"bytes"
 	"io"
 	"math"
+	"sync"
 )
+
+// secureReaderPool reduces per-Parse allocations by reusing SecureReader structs.
+var secureReaderPool = sync.Pool{
+	New: func() any {
+		return &SecureReader{}
+	},
+}
 
 // SecureReader wraps an io.Reader with security limits.
 // It enforces maximum size and line length constraints.
@@ -19,6 +27,8 @@ type SecureReader struct {
 }
 
 // NewSecureReader creates a new SecureReader with the specified limits.
+// The returned reader must be returned to the pool via ReleaseSecureReader
+// when done to avoid per-call allocation overhead.
 func NewSecureReader(r io.Reader, maxSize int64, maxLineLen int) *SecureReader {
 	if maxSize > HardMaxFileSize {
 		maxSize = HardMaxFileSize
@@ -26,11 +36,27 @@ func NewSecureReader(r io.Reader, maxSize int64, maxLineLen int) *SecureReader {
 	if maxLineLen > HardMaxLineLength {
 		maxLineLen = HardMaxLineLength
 	}
-	return &SecureReader{
-		reader:     r,
-		maxSize:    maxSize,
-		maxLineLen: maxLineLen,
+	sr, ok := secureReaderPool.Get().(*SecureReader)
+	if !ok {
+		sr = &SecureReader{}
 	}
+	sr.reader = r
+	sr.maxSize = maxSize
+	sr.maxLineLen = maxLineLen
+	sr.totalRead = 0
+	sr.lineRead = 0
+	sr.err = nil
+	return sr
+}
+
+// ReleaseSecureReader returns a SecureReader to the pool.
+// After calling this, the SecureReader must not be used.
+func ReleaseSecureReader(sr *SecureReader) {
+	if sr == nil {
+		return
+	}
+	sr.reader = nil // Allow GC of the wrapped reader
+	secureReaderPool.Put(sr)
 }
 
 // Read implements io.Reader with security checks.

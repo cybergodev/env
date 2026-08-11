@@ -115,8 +115,6 @@ import (
 	"fmt"
 	"io"
 	"os"
-	"strconv"
-	"strings"
 	"sync"
 	"time"
 
@@ -312,13 +310,17 @@ func (l *Loader) LoadFiles(filenames ...string) error {
 }
 
 // loadFilesInternal is the shared implementation for file loading.
-// Thread safety:
-//   - Called from New(): no lock required (loader not yet shared)
-//   - Called from LoadFiles(): caller must hold l.mu
+// Thread safety: caller MUST hold l.mu (write lock). New() callers are exempt
+// because the loader is not yet shared, but LoadFiles() acquires the lock first.
+// This method modifies l.loadTime and l.applied, which require write-lock protection.
 //
 // The cleanupOnErr parameter determines whether to close the loader on error (used during initialization).
 func (l *Loader) loadFilesInternal(filenames []string, cleanupOnErr bool) error {
-	start := time.Now()
+	var start time.Time
+	auditEnabled := l.config.AuditEnabled
+	if auditEnabled {
+		start = time.Now()
+	}
 
 	for _, filename := range filenames {
 		if err := l.loadFileLocked(filename); err != nil {
@@ -331,7 +333,9 @@ func (l *Loader) loadFilesInternal(filenames []string, cleanupOnErr bool) error 
 	}
 
 	l.loadTime = time.Now()
-	_ = l.factory.Auditor().LogWithDuration(internal.ActionLoad, "", "loaded files", true, time.Since(start))
+	if auditEnabled {
+		_ = l.factory.Auditor().LogWithDuration(internal.ActionLoad, "", "loaded files", true, time.Since(start))
+	}
 
 	if l.config.AutoApply {
 		if err := l.applyLocked(); err != nil {
@@ -343,7 +347,9 @@ func (l *Loader) loadFilesInternal(filenames []string, cleanupOnErr bool) error 
 }
 
 // loadFileLocked loads a single file.
-// Thread safety: safe to call with or without l.mu; secureMap provides its own locking.
+// Thread safety: caller MUST hold l.mu (write lock). While individual secureMap
+// operations are internally synchronized, this method modifies loader state
+// (via loadFilesInternal → l.loadTime, l.applied) that requires write-lock protection.
 //
 // SECURITY - Defense-in-Depth for TOCTOU:
 // There is a theoretical Time-Of-Check-Time-Of-Use window between Open() and Stat()
@@ -355,7 +361,13 @@ func (l *Loader) loadFilesInternal(filenames []string, cleanupOnErr bool) error 
 //  3. Validation: All parsed content is validated for size, format, and safety
 //     regardless of the initial Stat() results.
 func (l *Loader) loadFileLocked(filename string) error {
-	start := time.Now()
+	// Only record start time when audit is enabled — avoids time.Now() syscall
+	// and string concatenation in the common (audit-disabled) case.
+	var start time.Time
+	auditEnabled := l.config.AuditEnabled
+	if auditEnabled {
+		start = time.Now()
+	}
 
 	// SECURITY: Validate file path to prevent path traversal attacks
 	if err := validateFilePath(filename); err != nil {
@@ -407,45 +419,70 @@ func (l *Loader) loadFileLocked(filename string) error {
 		return err
 	}
 
-	// Fast path: if no prefix filter and overwrite is enabled, use SetAll directly
+	// Fast path: no prefix filter and overwrite enabled → SetAll directly
 	if l.config.Prefix == "" && l.config.OverwriteExisting {
-		// SECURITY: Log sensitive key operations even in fast path for audit trail
-		for key := range vars {
-			if IsSensitiveKey(key) {
-				_ = l.factory.Auditor().Log(internal.ActionSet, key, "loaded (sensitive)", true)
+		if l.config.AuditEnabled {
+			for key := range vars {
+				_ = l.factory.Auditor().Log(internal.ActionSet, key, "loaded", true)
 			}
 		}
 		l.vars.SetAll(vars)
-		_ = l.factory.Auditor().LogWithDuration(internal.ActionFileAccess, "", "file loaded: "+filename, true, time.Since(start))
+		if auditEnabled {
+			_ = l.factory.Auditor().LogWithDuration(internal.ActionFileAccess, "", "file loaded: "+filename, true, time.Since(start))
+		}
 		return nil
 	}
 
-	// Filter and prepare variables for batch set
-	toSet := make(map[string]string, len(vars))
+	// Fast path: no prefix filter, overwrite disabled → SetAllIfAbsent avoids
+	// creating an intermediate filtered map and eliminates per-key Get() allocations.
+	if l.config.Prefix == "" {
+		if l.config.AuditEnabled {
+			for key := range vars {
+				if l.vars.Has(key) {
+					_ = l.factory.Auditor().Log(internal.ActionSet, key, "skipped (no overwrite)", false)
+				} else {
+					_ = l.factory.Auditor().Log(internal.ActionSet, key, "loaded", true)
+				}
+			}
+		}
+		l.vars.SetAllIfAbsent(vars)
+		if auditEnabled {
+			_ = l.factory.Auditor().LogWithDuration(internal.ActionFileAccess, "", "file loaded: "+filename, true, time.Since(start))
+		}
+		return nil
+	}
 
-	// Pre-compute uppercase prefix once outside the loop
+	// Slow path: prefix filtering needed.
+	// Pre-compute uppercase prefix once outside the loop.
+	toSet := make(map[string]string, len(vars))
 	upperPrefix := internal.ToUpperASCII(l.config.Prefix)
 
 	for key, value := range vars {
 		// Check prefix if configured (case-insensitive, zero-allocation)
-		if l.config.Prefix != "" && !internal.HasUpperPrefix(key, upperPrefix) {
+		if !internal.HasUpperPrefix(key, upperPrefix) {
 			continue
 		}
 
-		// Check overwrite policy
-		if _, exists := l.vars.Get(key); exists && !l.config.OverwriteExisting {
-			_ = l.factory.Auditor().Log(internal.ActionSet, key, "skipped (no overwrite)", false)
+		// Check overwrite policy using Has (no string allocation)
+		if !l.config.OverwriteExisting && l.vars.Has(key) {
+			if l.config.AuditEnabled {
+				_ = l.factory.Auditor().Log(internal.ActionSet, key, "skipped (no overwrite)", false)
+			}
 			continue
 		}
 
 		toSet[key] = value
-		_ = l.factory.Auditor().Log(internal.ActionSet, key, "loaded", true)
+		if l.config.AuditEnabled {
+			_ = l.factory.Auditor().Log(internal.ActionSet, key, "loaded", true)
+		}
 	}
 
 	// Use batch set for better performance
 	l.vars.SetAll(toSet)
 
-	_ = l.factory.Auditor().LogWithDuration(internal.ActionFileAccess, "", "file loaded: "+filename, true, time.Since(start))
+	if auditEnabled {
+		_ = l.factory.Auditor().LogWithDuration(internal.ActionFileAccess, "", "file loaded: "+filename, true, time.Since(start))
+	}
 	return nil
 }
 
@@ -465,7 +502,8 @@ func (l *Loader) Apply() error {
 }
 
 // applyLocked applies variables to the environment.
-// Thread safety: safe to call with or without l.mu; individual operations are internally synchronized.
+// Thread safety: caller MUST hold l.mu (write lock). This method sets l.applied,
+// which requires write-lock protection.
 func (l *Loader) applyLocked() error {
 	keys := l.vars.Keys()
 	for _, key := range keys {
@@ -492,108 +530,6 @@ func (l *Loader) applyLocked() error {
 
 	l.applied = true
 	return nil
-}
-
-// GetString retrieves a value by key with optional default.
-// If the key is not found and no default is provided, returns empty string.
-// Supports dot-notation path resolution for nested keys (e.g., "database.host" -> "DATABASE_HOST").
-//
-// Example:
-//
-//	value := loader.GetString("KEY")           // Returns "" if not found
-//	value := loader.GetString("KEY", "default") // Returns "default" if not found
-func (l *Loader) GetString(key string, defaultValue ...string) string {
-	value, ok := l.Lookup(key)
-	if !ok {
-		if len(defaultValue) > 0 {
-			return defaultValue[0]
-		}
-		return ""
-	}
-	return value
-}
-
-// GetSecure retrieves a SecureValue by key.
-// Uses the same key resolution strategy as Lookup (exact match, uppercase fallback,
-// dot-notation) via internal.ResolveKeyName to ensure consistency.
-func (l *Loader) GetSecure(key string) *SecureValue {
-	if err := l.enterRead(); err != nil {
-		return nil
-	}
-	defer l.exitRead()
-
-	// Single-pass resolution: find key and allocate SecureValue atomically
-	// to avoid TOCTOU race between exists() and GetSecure().
-	var result *SecureValue
-	internal.ResolveKeyName(key, func(k string) bool {
-		if sv := l.vars.GetSecure(k); sv != nil {
-			result = sv
-			return true
-		}
-		return false
-	})
-	return result
-}
-
-// Lookup retrieves a value by key and reports whether it exists.
-// Supports dot-notation path resolution for nested keys (e.g., "database.host" -> "DATABASE_HOST").
-// For indexed access (e.g., "service.cors.origins.0"), falls back to comma-separated values
-// if indexed key is not found.
-// Returns the value with leading and trailing whitespace trimmed.
-func (l *Loader) Lookup(key string) (string, bool) {
-	if err := l.enterRead(); err != nil {
-		return "", false
-	}
-	defer l.exitRead()
-
-	return internal.ResolveKey(key, l.vars.Get)
-}
-
-// buildIndexedKey efficiently constructs an indexed key (e.g., "KEY_0", "KEY_1").
-// It uses a stack-allocated buffer to avoid heap allocations in the common case.
-//
-// SECURITY: Returns empty string if the resulting key would exceed hardMaxKeyLength.
-func buildIndexedKey(baseKey string, index int) string {
-	// SECURITY: Check for negative index
-	if index < 0 {
-		return ""
-	}
-
-	// Pre-calculate required capacity for the index
-	indexLen := 1
-	for tmp := index; tmp >= 10; tmp /= 10 {
-		indexLen++
-	}
-
-	// Calculate total length
-	totalLen := len(baseKey) + 1 + indexLen
-
-	// SECURITY: Check against hardMaxKeyLength to prevent excessively long keys
-	if totalLen > internal.HardMaxKeyLength {
-		return ""
-	}
-
-	// Use stack-allocated array for small keys (most common case)
-	// maxStackKeyLen should be <= internal.hardMaxKeyLength
-	const maxStackKeyLen = 64
-	if totalLen <= maxStackKeyLen {
-		var buf [maxStackKeyLen]byte
-		n := copy(buf[:], baseKey)
-		buf[n] = '_'
-		n++
-		// Append integer without allocation
-		b := strconv.AppendInt(buf[n:n], int64(index), 10)
-		return string(buf[:n+len(b)])
-	}
-
-	// Fallback for longer keys (but still within hardMaxKeyLength)
-	var sb strings.Builder
-	sb.Grow(totalLen)
-	sb.WriteString(baseKey)
-	sb.WriteByte('_')
-	var ibuf [20]byte
-	sb.Write(strconv.AppendInt(ibuf[:0], int64(index), 10))
-	return sb.String()
 }
 
 // Set sets a value for a key.
@@ -624,10 +560,9 @@ func (l *Loader) Set(key, value string) error {
 	}
 
 	// Check overwrite policy
-	// Only call Get (which allocates) when we actually need to check the policy.
-	// When OverwriteExisting=true, skip the Get entirely to avoid unnecessary allocation.
+	// Use Has (no allocation) instead of Get (allocates string copy).
 	if !l.config.OverwriteExisting {
-		if _, exists := l.vars.Get(key); exists {
+		if l.vars.Has(key) {
 			_ = l.factory.Auditor().Log(internal.ActionSet, key, "skipped (no overwrite)", false)
 			return nil
 		}
@@ -670,54 +605,6 @@ func (l *Loader) Delete(key string) error {
 	return nil
 }
 
-// Keys returns all keys.
-func (l *Loader) Keys() []string {
-	if err := l.enterRead(); err != nil {
-		return nil
-	}
-	defer l.exitRead()
-
-	return l.vars.Keys()
-}
-
-// All returns all environment variables as a map.
-func (l *Loader) All() map[string]string {
-	if err := l.enterRead(); err != nil {
-		return nil
-	}
-	defer l.exitRead()
-
-	return l.vars.ToMap()
-}
-
-// Len returns the number of loaded variables.
-func (l *Loader) Len() int {
-	if err := l.enterRead(); err != nil {
-		return 0
-	}
-	defer l.exitRead()
-
-	return l.vars.Len()
-}
-
-// IsApplied returns true if the variables have been applied to os.Environ.
-func (l *Loader) IsApplied() bool {
-	if err := l.enterRead(); err != nil {
-		return false
-	}
-	defer l.exitRead()
-	return l.applied
-}
-
-// LoadTime returns the time when variables were last loaded.
-func (l *Loader) LoadTime() time.Time {
-	if err := l.enterRead(); err != nil {
-		return time.Time{}
-	}
-	defer l.exitRead()
-	return l.loadTime
-}
-
 // Close closes the loader and securely clears all stored values.
 // If the loader owns its ComponentFactory, it will also close the factory.
 func (l *Loader) Close() error {
@@ -754,197 +641,6 @@ func (l *Loader) IsClosed() bool {
 	return l.closed
 }
 
-// getWithDefault is a generic helper for retrieving values with optional defaults.
-// It handles the common pattern of looking up a key, parsing it, and returning
-// a default value if the key is not found or parsing fails.
-// Parse failures are logged to the auditor for debugging purposes.
-func getWithDefault[T any](loader *Loader, key string, parse func(string) (T, error), defaultValue ...T) T {
-	if loader == nil {
-		return firstOrZero(defaultValue...)
-	}
-	value, ok := loader.Lookup(key)
-	if !ok {
-		return firstOrZero(defaultValue...)
-	}
-	result, err := parse(value)
-	if err != nil {
-		// Log parse failure for debugging
-		_ = loader.factory.Auditor().LogError(internal.ActionGet, key, fmt.Sprintf("parse failed: %v", err))
-		return firstOrZero(defaultValue...)
-	}
-	return result
-}
-
-// Config returns the loader's configuration.
-// Note: The returned Config should be treated as read-only.
-// Modifying the ValidationConfig (KeyPattern, AllowedKeys, ForbiddenKeys, RequiredKeys),
-// LimitsConfig, or ComponentConfig fields may affect the loader's behavior.
-// For a safe mutable copy, manually copy the necessary fields.
-func (l *Loader) Config() Config {
-	if l == nil {
-		return Config{}
-	}
-	return l.config
-}
-
-// GetInt retrieves an integer value with optional default.
-// If the key is not found and no default is provided, returns 0.
-//
-// Example:
-//
-//	port := loader.GetInt("PORT")           // Returns 0 if not found
-//	port := loader.GetInt("PORT", 8080)     // Returns 8080 if not found
-func (l *Loader) GetInt(key string, defaultValue ...int64) int64 {
-	return getWithDefault(l, key, func(s string) (int64, error) {
-		return parseInt(s, 64)
-	}, defaultValue...)
-}
-
-// GetUint64 retrieves an unsigned integer value with optional default.
-// If the key is not found and no default is provided, returns 0.
-//
-// Example:
-//
-//	port := loader.GetUint64("PORT")           // Returns 0 if not found
-//	port := loader.GetUint64("PORT", 8080)     // Returns 8080 if not found
-func (l *Loader) GetUint64(key string, defaultValue ...uint64) uint64 {
-	return getWithDefault(l, key, func(s string) (uint64, error) {
-		return parseUint(s, 64)
-	}, defaultValue...)
-}
-
-// GetFloat64 retrieves a floating-point value with optional default.
-// If the key is not found and no default is provided, returns 0.
-//
-// Example:
-//
-//	rate := loader.GetFloat64("RATE")           // Returns 0 if not found
-//	rate := loader.GetFloat64("RATE", 0.5)      // Returns 0.5 if not found
-func (l *Loader) GetFloat64(key string, defaultValue ...float64) float64 {
-	return getWithDefault(l, key, parseFloat64, defaultValue...)
-}
-
-// GetBool retrieves a boolean value with optional default.
-// If the key is not found and no default is provided, returns false.
-//
-// Example:
-//
-//	debug := loader.GetBool("DEBUG")           // Returns false if not found
-//	debug := loader.GetBool("DEBUG", true)     // Returns true if not found
-func (l *Loader) GetBool(key string, defaultValue ...bool) bool {
-	return getWithDefault(l, key, parseBool, defaultValue...)
-}
-
-// GetDuration retrieves a duration value with optional default.
-// If the key is not found and no default is provided, returns 0.
-//
-// Example:
-//
-//	timeout := loader.GetDuration("TIMEOUT")                  // Returns 0 if not found
-//	timeout := loader.GetDuration("TIMEOUT", 30*time.Second) // Returns 30s if not found
-func (l *Loader) GetDuration(key string, defaultValue ...time.Duration) time.Duration {
-	return getWithDefault(l, key, parseDuration, defaultValue...)
-}
-
-// GetSliceFrom retrieves a slice of values from a loader by iterating through indexed keys.
-// If the key is not found and no default is provided, returns nil.
-// Supports dot-notation path resolution for nested keys.
-//
-// Indexed keys are searched in format: KEY_0, KEY_1, KEY_2, etc.
-// Also supports comma-separated values as fallback for .env files.
-//
-// Type parameter T is constrained to: string, int, int64, uint, uint64, bool, float64, time.Duration.
-//
-// # Why a Function Instead of a Method?
-//
-// This is a generic function rather than a method because Go does not support
-// type parameters on methods. The pattern is:
-//
-//	// Method approach (not possible in Go):
-//	// loader.GetSlice[int]("PORTS")  // ❌ Compile error
-//
-//	// Function approach (current implementation):
-//	env.GetSliceFrom[int](loader, "PORTS")  // ✓ Works
-//
-// For package-level usage without a loader instance, use GetSlice[T]().
-//
-// Example:
-//
-//	ports := env.GetSliceFrom[int](loader, "PORTS")           // Returns []int{8080, 8081} from PORTS_0, PORTS_1
-//	hosts := env.GetSliceFrom[string](loader, "HOSTS", []string{"localhost"}) // With default
-func GetSliceFrom[T sliceElement](loader *Loader, key string, defaultValue ...[]T) []T {
-	// Fast path for nil loader
-	if loader == nil {
-		return firstOrZero(defaultValue...)
-	}
-
-	if err := loader.enterRead(); err != nil {
-		// nil or closed loader: behave like a miss
-		return firstOrZero(defaultValue...)
-	}
-	defer loader.exitRead()
-
-	// GetString candidate keys from path resolver (handles dot-notation)
-	candidates := internal.ResolvePath(key)
-
-	// Try each candidate in priority order
-	for _, baseKey := range candidates {
-		result := getSliceFromIndexedKeys[T](loader, baseKey, defaultValue)
-		if len(result) > 0 {
-			return result
-		}
-	}
-
-	// No indexed keys found, return default or nil
-	return firstOrZero(defaultValue...)
-}
-
-// getSliceFromIndexedKeys tries to get a slice from indexed keys for a specific base key.
-func getSliceFromIndexedKeys[T sliceElement](loader *Loader, baseKey string, defaultValue [][]T) []T {
-	// Collect values from indexed keys: KEY_0, KEY_1, KEY_2, ...
-	// SECURITY: Add maximum slice size limit to prevent DoS via infinite loop
-	// This is consistent with hardMaxVariables (10000) from internal/limits.go
-	const maxSliceSize = 10000
-
-	var result []T
-	for i := range maxSliceSize {
-		indexedKey := buildIndexedKey(baseKey, i)
-		value, ok := loader.vars.Get(indexedKey)
-		if !ok {
-			break
-		}
-
-		parsed, err := parseSliceElement[T](value)
-		if err != nil {
-			// Log parse failure for debugging and skip this element
-			_ = loader.factory.Auditor().LogError(internal.ActionGet, indexedKey,
-				fmt.Sprintf("slice element parse failed: %v", err))
-			continue
-		}
-		result = append(result, parsed)
-	}
-
-	// SECURITY: Log if we hit the slice size limit (potential DoS attempt)
-	if len(result) >= maxSliceSize {
-		_ = loader.factory.Auditor().LogError(internal.ActionGet, baseKey,
-			fmt.Sprintf("slice size limit reached (%d elements)", maxSliceSize))
-	}
-
-	// If no indexed keys found, try comma-separated value
-	if len(result) == 0 {
-		if value, ok := loader.vars.Get(baseKey); ok {
-			return parseCommaSeparated[T](value, defaultValue...)
-		}
-	}
-
-	// Return default only if we collected nothing and have a default
-	if len(result) == 0 && len(defaultValue) > 0 {
-		return defaultValue[0]
-	}
-
-	return result
-}
-
 // ParseInto populates a struct from loaded environment variables.
 // Struct fields can be tagged with `env:"KEY"` to specify the env variable name.
 // Optional `envDefault:"value"` sets a default if the key is not found.
@@ -953,10 +649,13 @@ func getSliceFromIndexedKeys[T sliceElement](loader *Loader, baseKey string, def
 //   - ErrClosed: if the loader is nil or has been closed
 //   - MarshalError: if struct tag parsing or type conversion fails
 func (l *Loader) ParseInto(v any) error {
-	if l == nil || l.IsClosed() {
-		return ErrClosed
+	// Hold the read lock across the snapshot to prevent a TOCTOU race where
+	// another goroutine closes the loader between the state check and All().
+	if err := l.enterRead(); err != nil {
+		return err
 	}
-	return UnmarshalInto(l.All(), v)
+	defer l.exitRead()
+	return UnmarshalInto(l.vars.ToMap(), v)
 }
 
 // Validate validates the loaded environment against required and allowed keys.
@@ -967,15 +666,20 @@ func (l *Loader) ParseInto(v any) error {
 //   - ErrMissingRequired: if a required key is not present
 //   - ErrForbiddenKey: if a forbidden key is set
 func (l *Loader) Validate() error {
-	if l == nil || l.IsClosed() {
-		return ErrClosed
+	// Hold the read lock across the snapshot to prevent a TOCTOU race where
+	// another goroutine closes the loader between the state check and Keys().
+	if err := l.enterRead(); err != nil {
+		return err
 	}
+	defer l.exitRead()
 	return l.factory.Validator().ValidateRequired(l.keysToUpper())
 }
 
 // keysToUpper returns all keys as uppercase for comparison.
+// Caller must already hold the read lock (l.mu) — accesses l.vars directly
+// to avoid the nested RLock that would occur through l.Keys().
 func (l *Loader) keysToUpper() map[string]bool {
-	keys := l.Keys()
+	keys := l.vars.Keys()
 	result := make(map[string]bool, len(keys))
 	for _, k := range keys {
 		result[internal.ToUpperASCII(k)] = true

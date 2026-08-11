@@ -22,7 +22,12 @@ func (c *structuredParserConfig) structuredParseResult(
 	r io.Reader, filename, formatName string,
 	flattenFn func(data []byte) (map[string]string, error),
 ) (map[string]string, error) {
-	start := time.Now()
+	// Only record start time when audit is enabled — avoids time.Now() syscall
+	// in the common (audit-disabled) case, consistent with the .env parser.
+	var start time.Time
+	if c.config.AuditEnabled {
+		start = time.Now()
+	}
 
 	secureRd := internal.NewSecureReader(r, c.config.MaxFileSize, c.config.MaxLineLength)
 	data, err := io.ReadAll(secureRd)
@@ -44,7 +49,9 @@ func (c *structuredParserConfig) structuredParseResult(
 		return nil, err
 	}
 
-	_ = c.auditor.LogWithDuration(internal.ActionParse, "", "parsed "+formatName+": "+filename, true, time.Since(start))
+	if c.config.AuditEnabled {
+		_ = c.auditor.LogWithDuration(internal.ActionParse, "", "parsed "+formatName+": "+filename, true, time.Since(start))
+	}
 	return result, nil
 }
 
@@ -59,6 +66,17 @@ func (c *structuredParserConfig) validateResult(result map[string]string, format
 	}
 
 	for key, val := range result {
+		// Enforce MaxKeyLength for structured formats, consistent with the
+		// .env parser's ValidateKey which checks length first.
+		if len(key) > c.config.MaxKeyLength {
+			_ = c.auditor.LogError(internal.ActionParse, key, "key exceeds maximum length")
+			return &ValidationError{
+				Field:   "key",
+				Value:   MaskSensitiveInString(key),
+				Rule:    "max_length",
+				Message: "key exceeds maximum length",
+			}
+		}
 		if !internal.IsValidJSONKey(key) {
 			_ = c.auditor.LogError(internal.ActionParse, key, "key does not match "+format+" key pattern")
 			return &ValidationError{
@@ -76,17 +94,22 @@ func (c *structuredParserConfig) validateResult(result map[string]string, format
 		}
 	}
 
-	// Skip building the uppercase-key index when no required keys are
-	// configured — the common case (see needsRequiredCheck in parser.go).
-	if needsRequiredCheck(c.validator) {
-		upperKeys := internal.KeysToUpperPooled(result)
-		err := c.validator.ValidateRequired(upperKeys)
-		internal.PutKeysToUpperMap(upperKeys)
-		if err != nil {
-			_ = c.auditor.LogError(internal.ActionValidate, "", err.Error())
-			return err
-		}
-	}
+	return validateRequiredKeys(c.validator, c.auditor, result)
+}
 
+// validateRequiredKeys is the shared required-key validation logic used by
+// both the .env parser and the structured (JSON/YAML) parsers. It skips the
+// uppercase-key index entirely when no required keys are configured.
+func validateRequiredKeys(validator Validator, auditor FullAuditLogger, result map[string]string) error {
+	if !needsRequiredCheck(validator) {
+		return nil
+	}
+	upperKeys := internal.KeysToUpperPooled(result)
+	err := validator.ValidateRequired(upperKeys)
+	internal.PutKeysToUpperMap(upperKeys)
+	if err != nil {
+		_ = auditor.LogError(internal.ActionValidate, "", err.Error())
+		return err
+	}
 	return nil
 }

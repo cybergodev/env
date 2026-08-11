@@ -44,6 +44,12 @@ func TestSecureValue(t *testing.T) {
 		// Masked output
 		{"masked with value", "test", "masked", "[SECURE:4 bytes]", false},
 		{"masked when closed", "test", "masked_closed", "[CLOSED]", true},
+		{"masked long value contains count", strings.Repeat("x", 100), "masked_count", "100", false},
+
+		// State queries after Close
+		{"string after close", "test", "string_closed", "[CLOSED]", true},
+		{"bytes after close nil", "test", "bytes_closed", "", true},
+		{"length after close zero", "test", "length_closed", 0, true},
 	}
 
 	for _, tt := range tests {
@@ -75,6 +81,25 @@ func TestSecureValue(t *testing.T) {
 				sv.Close()
 				if sv.Masked() != tt.wantResult.(string) {
 					t.Errorf("Masked() = %q, want %q", sv.Masked(), tt.wantResult)
+				}
+			case "masked_count":
+				if m := sv.Masked(); !strings.Contains(m, tt.wantResult.(string)) {
+					t.Errorf("Masked() = %q, should contain %q", m, tt.wantResult)
+				}
+			case "string_closed":
+				sv.Close()
+				if sv.String() != tt.wantResult.(string) {
+					t.Errorf("String() after Close() = %q, want %q", sv.String(), tt.wantResult)
+				}
+			case "bytes_closed":
+				sv.Close()
+				if sv.Bytes() != nil {
+					t.Errorf("Bytes() after Close() = %v, want nil", sv.Bytes())
+				}
+			case "length_closed":
+				sv.Close()
+				if sv.Length() != tt.wantResult.(int) {
+					t.Errorf("Length() after Close() = %d, want %d", sv.Length(), tt.wantResult)
 				}
 			case "close":
 				if err := sv.Close(); err != nil {
@@ -511,19 +536,22 @@ func TestDefaultStrictLockFailureHandler(t *testing.T) {
 // and internal callers can swap it without expanding the public API, and the
 // swap is actually honored.
 func TestOnStrictLockFailureSwappable(t *testing.T) {
-	orig := onStrictLockFailure
-	defer func() { onStrictLockFailure = orig }()
+	orig := onStrictLockFailure.Load()
+	defer onStrictLockFailure.Store(orig)
 
 	var (
 		called bool
 		gotErr error
 	)
-	onStrictLockFailure = func(err error) {
+	h := strictLockFailureHandler(func(err error) {
 		called = true
 		gotErr = err
-	}
+	})
+	onStrictLockFailure.Store(&h)
 
-	onStrictLockFailure(errors.New("injected"))
+	if ptr := onStrictLockFailure.Load(); ptr != nil {
+		(*ptr)(errors.New("injected"))
+	}
 
 	if !called {
 		t.Error("swapped onStrictLockFailure was not invoked")

@@ -88,11 +88,17 @@ COMSPEC, PATHEXT, SYSTEMROOT, WINDIR
 
 ```go
 cfg := env.ProductionConfig()
-cfg.Filenames = []string{"/etc/app/.env"}
+cfg.Filenames = []string{"app.env"}  // relative paths only; absolute paths are rejected
 cfg.AuditEnabled = true
 cfg.AuditHandler = env.NewJSONAuditHandler(auditFile)
 cfg.RequiredKeys = []string{"DATABASE_URL", "API_KEY"}
 ```
+
+> **Path Restriction**: For security, file paths must be relative — absolute
+> paths (`/etc/app/.env`, `C:\app\.env`), UNC paths (`\\server\share`),
+> URL-encoded paths (`%2e%2e`), and path traversal (`../`) are all rejected.
+> Use a working directory or symlink strategy to point at files outside the
+> current directory.
 
 > **Warning**: Do NOT use `os.Stdout` with `JSONAuditHandler` in production.
 > The handler's `Close()` method will close the underlying writer, which would
@@ -212,17 +218,37 @@ non-sensitive keys are logged verbatim. Optional fields (`file`, `masked`,
 Keys containing these patterns (case-insensitive) are automatically masked:
 
 ```
-PASSWORD, SECRET, TOKEN, API_KEY, APIKEY
-PRIVATE, CREDENTIAL, AUTH, ACCESS_KEY
-SECRET_KEY, PRIVATE_KEY, PASSPHRASE
-SESSION, COOKIE
+# Authentication & Authorization
+PASSWORD, SECRET, TOKEN, AUTH, CREDENTIAL, PASSPHRASE, SESSION, COOKIE
+
+# API & Keys
+API_KEY, APIKEY, ACCESS_KEY, SECRET_KEY, PRIVATE_KEY, PUBLIC_KEY
+
+# Encryption & Security
+PRIVATE, ENCRYPTION_KEY, ENCRYPT_KEY, DECRYPT_KEY, SIGNING_KEY, SIGN_KEY, VERIFY_KEY
+
+# Financial & Personal (PII)
+SSN, SOCIAL_SECURITY, CREDIT_CARD, CARD_NUMBER, CVV, CVC, CCV, PAN
+
+# Crypto & Blockchain
+MNEMONIC, SEED, RECOVERY, WALLET, PRIVATE_ADDRESS
+
+# Database & Infrastructure
+CONNECTION_STRING, CONN_STRING, DATABASE_URL, DB_PASSWORD
+
+# Cloud & Services
+AWS_SECRET, AZURE_KEY, GCP_KEY, SERVICE_ACCOUNT
 ```
+
+Matching is substring-based and case-insensitive — a key like `MY_API_KEY`
+matches because it contains `API_KEY`.
 
 ### Example
 
 ```go
 // Key: DATABASE_PASSWORD
-// Logged as: DA*** = [MASKED:16 chars]
+// In audit output (masked): [MASKED:17 chars]
+// In error messages (DefaultMaskKey): DA***
 ```
 
 ---

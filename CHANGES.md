@@ -4,6 +4,56 @@ All notable changes to the cybergodev/env library will be documented in this fil
 
 ---
 
+## v1.2.2 - Performance, Concurrency Hardening & Security (2026-08-12)
+
+### Added
+- `SecureValue.MarshalJSON()` / `MarshalText()` — redacting marshalers that prevent accidental secret exposure through `json.Marshal`, `encoding/xml`, `text/template`, and other reflection-based serializers (`String()` alone only covers `fmt`-style formatting)
+- `secureMap.Has()` — zero-allocation key-existence check (no string copy, no SecureValue read lock)
+- `secureMap.SetAllIfAbsent()` — batch insert that skips existing keys; used as a new fast path in file loading when `OverwriteExisting=false`
+- `SecureReader` pooling via `sync.Pool` (`NewSecureReader` / `ReleaseSecureReader`) — eliminates per-Parse allocation of the reader struct
+- `BufferedHandler.safeFlush()` — background flush goroutine now recovers panics from user-supplied handlers, reporting them via `OnError` instead of crashing
+- `CloseableChannelHandler` unbuffered-channel support — `Log()` blocks until a receiver is ready or the handler closes, with deadlock-free `Close()` via `sync.Once`
+- `validateRequiredKeys()` — shared required-key validation extracted from duplicated code in `.env` parser and structured (JSON/YAML) parsers
+- Structured parser key-length validation — `MaxKeyLength` is now enforced for JSON/YAML keys, consistent with the `.env` parser
+- Examples restructured into per-directory `main.go` packages (01–11), including new **09_error_handling**, **10_concurrency**, and **11_advanced** examples; added `config.json` and `config.yaml` to example data
+- Expanded sensitive-key pattern list in `docs/SECURITY.md`: `PUBLIC_KEY`, `ENCRYPTION_KEY`, `ENCRYPT_KEY`, `DECRYPT_KEY`, `SIGNING_KEY`, `SIGN_KEY`, `VERIFY_KEY`, `SSN`, `SOCIAL_SECURITY`, `CREDIT_CARD`, `CARD_NUMBER`, `CVV`, `CVC`, `CCV`, `PAN`, `MNEMONIC`, `SEED`, `RECOVERY`, `WALLET`, `PRIVATE_ADDRESS`, `CONNECTION_STRING`, `CONN_STRING`, `DATABASE_URL`, `DB_PASSWORD`, `AWS_SECRET`, `AZURE_KEY`, `GCP_KEY`, `SERVICE_ACCOUNT`
+
+### Changed
+- `accessors.go` — all value-accessor methods (`GetString`, `GetInt`, `GetBool`, `GetDuration`, `GetFloat64`, `GetUint64`, `GetSecure`, `Lookup`, `Keys`, `All`, `Len`, `IsApplied`, `LoadTime`, `Config`, `GetSliceFrom`) extracted from `env.go` into a dedicated file; `env.go` now focuses on loader lifecycle
+- `Lookup()` inlines a fast path for simple keys (no dots) to avoid function-value indirection through `ResolveKey`
+- `Config.IsZero()` now correctly accounts for `JSONMaxDepth`, `YAMLMaxDepth`, `ValidateUTF8`, and `Prefix` fields — previously these were omitted from the zero-value check
+- `Load()` no longer overwrites `cfg.Filenames` when called with no arguments, preserving `DefaultConfig()` defaults
+- `loadFileLocked` uses `Has()` (no allocation) instead of `Get()` for overwrite-policy checks; audit logging is gated behind `AuditEnabled`
+- `parseSliceElement` audit log in `GetSliceFrom` uses `Has` for existence checks where value is not needed
+- `factory.go` — removed unused private adapter methods (`lineParserValidator/Auditor/Expander`); parser accesses factory fields directly
+- `onStrictLockFailure` changed from a plain function variable to `atomic.Pointer[strictLockFailureHandler]` for race-free concurrent access from `tryLockMemory`
+- `internal/errors.go` — `ErrFileTooLarge` / `ErrLineTooLong` use `errors.New` instead of `fmt.Errorf` (no format args; proper sentinel identity)
+- `marshalToYAML` returns `(string, error)` instead of `([]byte, error)` to avoid a final allocation
+- `escapeYAMLValue` uses byte-level iteration instead of rune-range for ASCII character checks
+- Concurrent tests consolidated: five former single-scenario tests merged into one table-driven `TestLoader_Concurrent`
+- `docs/CONCURRENCY_SAFETY.md` — updated shard-hash description and consolidated test documentation
+
+### Fixed
+- TOCTOU race in `ParseInto()` / `Validate()` — now hold the read lock across the entire operation instead of check-then-act, preventing a race where `Close()` runs between the `IsClosed` check and data access
+- Deadlock in `ResetDefaultLoader()` — mutex is released before calling `Close()`, preventing deadlock if Close triggers code that needs the default loader
+- `defaultMaskSensitive` off-by-one — `s[:maxLen]` would panic on inputs of length exactly `maxLen` (50); now `s[:maxLen-3]`
+- `CloseableChannelHandler.Close()` potential deadlock — `close(done)` now runs via `sync.Once` before acquiring `closeMu`, ensuring blocked unbuffered sends are interrupted without deadlock
+- `keysToUpper()` accesses `l.vars.Keys()` directly (caller already holds read lock) to avoid nested RLock
+
+### Security
+- `SecureValue` now implements `MarshalJSON` / `MarshalText` — secrets are masked in all common serialization paths, not just `fmt`-style formatting; closes the reflection-based serializer gap documented in the project guidelines
+- `docs/SECURITY.md` clarifies that file paths must be relative (absolute, UNC, URL-encoded, and traversal paths are rejected)
+
+### Performance
+- **Audit-gated parse path** — `time.Now()` syscalls and audit log calls skipped entirely when `AuditEnabled=false`; affects `loadFilesInternal`, `loadFileLocked`, `Parse`, and `structuredParseResult`
+- **secureMap lock reduction** — removed `sv.mu.RLock`/`RUnlock` from `Get()`, `GetSecure()`, and `ToMap()`; documented that `shard.mu.RLock` is sufficient because all writes occur under `shard.mu.Lock`. This was the single largest CPU hotspot (23.6% in atomic operations)
+- **SecureReader pooling** — `sync.Pool` reuse eliminates per-Parse allocation; `defer ReleaseSecureReader()` added to parser
+- **`SecureValue.Masked()`** — replaced `fmt.Sprintf` with manual `strconv.AppendInt` into a stack-allocated buffer, eliminating reflection and interface-boxing overhead
+- **`containsIgnoreCase`** — folded non-ASCII detection into the comparison loop, halving bytes examined for ASCII strings (the common case)
+- **New `SetAllIfAbsent` fast path** — when `Prefix=""` and `OverwriteExisting=false`, file loading avoids creating an intermediate filtered map and eliminates per-key allocations
+
+---
+
 ## v1.2.1 - Reliability & Parse-Path Performance (2026-06-18)
 
 ### Added
@@ -247,7 +297,7 @@ All notable changes to the cybergodev/env library will be documented in this fil
 
 ### Requirements
 
-- Go 1.24+
+- Go 1.25+ (updated from 1.24+ in v1.2.0)
 - Zero external dependencies
 
 ---

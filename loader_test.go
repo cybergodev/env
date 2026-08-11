@@ -2082,125 +2082,50 @@ negative_val: -10
 }
 
 // ============================================================================
-// Error Type Tests - Extended
+// Error Type Tests (Table-Driven)
 // ============================================================================
 
-func TestJSONError(t *testing.T) {
-	t.Run("with path", func(t *testing.T) {
-		err := &JSONError{
-			Path:    "$.database.host",
-			Message: "invalid type",
-			Err:     errors.New("expected string"),
-		}
+func TestErrorTypes_Error(t *testing.T) {
+	tests := []struct {
+		name       string
+		err        error
+		wantUnwrap bool // if true, verify Unwrap() returns non-nil
+	}{
+		{"JSONError with path", &JSONError{
+			Path: "$.database.host", Message: "invalid type", Err: errors.New("expected string"),
+		}, true},
+		{"JSONError without path", &JSONError{Message: "parse error"}, false},
+		{"YAMLError with path and line", &YAMLError{
+			Path: "config.yaml", Line: 10, Column: 5, Message: "invalid mapping",
+		}, false},
+		{"YAMLError with line only", &YAMLError{Line: 15, Message: "indentation error"}, false},
+		{"YAMLError without location", &YAMLError{Message: "parse error"}, false},
+		{"ExpansionError with key", &ExpansionError{Key: "VAR", Depth: 10, Limit: 5}, false},
+		{"ExpansionError without key", &ExpansionError{
+			Depth: 10, Limit: 5, Chain: "A -> B -> C",
+		}, false},
+		{"SecurityError with key", &SecurityError{
+			Action: "set", Reason: "forbidden key", Key: "SECRET_KEY", Details: "key is in forbidden list",
+		}, false},
+		{"SecurityError without key", &SecurityError{
+			Action: "load", Reason: "file too large",
+		}, false},
+	}
 
-		if err.Error() == "" {
-			t.Error("JSONError.Error() should not be empty")
-		}
-
-		// Unwrap returns the underlying error
-		unwrapped := err.Unwrap()
-		if unwrapped == nil {
-			t.Error("JSONError.Unwrap() should return non-nil error")
-		}
-	})
-
-	t.Run("without path", func(t *testing.T) {
-		err := &JSONError{
-			Message: "parse error",
-		}
-
-		if err.Error() == "" {
-			t.Error("JSONError.Error() should not be empty")
-		}
-	})
-}
-
-func TestYAMLError(t *testing.T) {
-	t.Run("with path and line", func(t *testing.T) {
-		err := &YAMLError{
-			Path:    "config.yaml",
-			Line:    10,
-			Column:  5,
-			Message: "invalid mapping",
-		}
-
-		if err.Error() == "" {
-			t.Error("YAMLError.Error() should not be empty")
-		}
-	})
-
-	t.Run("with line only", func(t *testing.T) {
-		err := &YAMLError{
-			Line:    15,
-			Message: "indentation error",
-		}
-
-		if err.Error() == "" {
-			t.Error("YAMLError.Error() should not be empty")
-		}
-	})
-
-	t.Run("without location", func(t *testing.T) {
-		err := &YAMLError{
-			Message: "parse error",
-		}
-
-		if err.Error() == "" {
-			t.Error("YAMLError.Error() should not be empty")
-		}
-	})
-}
-
-func TestExpansionError(t *testing.T) {
-	t.Run("with key", func(t *testing.T) {
-		err := &ExpansionError{
-			Key:   "VAR",
-			Depth: 10,
-			Limit: 5,
-		}
-
-		if err.Error() == "" {
-			t.Error("ExpansionError.Error() should not be empty")
-		}
-	})
-
-	t.Run("without key", func(t *testing.T) {
-		err := &ExpansionError{
-			Depth: 10,
-			Limit: 5,
-			Chain: "A -> B -> C",
-		}
-
-		if err.Error() == "" {
-			t.Error("ExpansionError.Error() should not be empty")
-		}
-	})
-}
-
-func TestSecurityError(t *testing.T) {
-	t.Run("with key", func(t *testing.T) {
-		err := &SecurityError{
-			Action:  "set",
-			Reason:  "forbidden key",
-			Key:     "SECRET_KEY",
-			Details: "key is in forbidden list",
-		}
-
-		if err.Error() == "" {
-			t.Error("SecurityError.Error() should not be empty")
-		}
-	})
-
-	t.Run("without key", func(t *testing.T) {
-		err := &SecurityError{
-			Action: "load",
-			Reason: "file too large",
-		}
-
-		if err.Error() == "" {
-			t.Error("SecurityError.Error() should not be empty")
-		}
-	})
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if tt.err.Error() == "" {
+				t.Errorf("%T.Error() should not be empty", tt.err)
+			}
+			if tt.wantUnwrap {
+				if u, ok := tt.err.(interface{ Unwrap() error }); ok {
+					if u.Unwrap() == nil {
+						t.Errorf("%T.Unwrap() should return non-nil", tt.err)
+					}
+				}
+			}
+		})
+	}
 }
 
 // ============================================================================
@@ -2783,47 +2708,102 @@ func TestExpansion_EdgeCases(t *testing.T) {
 }
 
 // ============================================================================
-// SecureValue Masked Edge Cases (from coverage_test.go)
+// Env Parser Boundary Tests (table-driven)
 // ============================================================================
 
-func TestSecureValue_Masked_EdgeCases(t *testing.T) {
-	t.Run("masked after close shows CLOSED", func(t *testing.T) {
-		sv := NewSecureValue("sensitive")
-		sv.Close()
-		if m := sv.Masked(); m != "[CLOSED]" {
-			t.Errorf("Masked() after Close() = %q, want [CLOSED]", m)
-		}
-	})
+// TestParser_BoundaryConditions exercises uncovered branches in the env
+// parser's Parse method: duplicate-key skip, parse-error break, line-too-long
+// scanner error, and export-prefix handling.
+func TestParser_BoundaryConditions(t *testing.T) {
+	tests := []struct {
+		name      string
+		content   string
+		configFn  func(*Config)
+		wantErr   bool
+		wantKey   string // verify this key exists after parse
+		wantValue string // expected value for wantKey
+		wantNoKey string // verify this key does NOT exist
+	}{
+		{
+			name:      "duplicate key skipped when overwrite disabled",
+			content:   "KEY=first\nKEY=second\n",
+			configFn:  func(c *Config) { c.OverwriteExisting = false },
+			wantKey:   "KEY",
+			wantValue: "first", // second write is skipped
+		},
+		{
+			name:      "duplicate key overwritten when overwrite enabled",
+			content:   "KEY=first\nKEY=second\n",
+			configFn:  func(c *Config) { c.OverwriteExisting = true },
+			wantKey:   "KEY",
+			wantValue: "second",
+		},
+		{
+			name:     "line too long triggers scanner error",
+			content:  strings.Repeat("a", 2000) + "\n",
+			configFn: func(c *Config) { c.MaxLineLength = 100 },
+			wantErr:  true,
+		},
+		{
+			name:      "export prefix stripped",
+			content:   "export KEY=value\n",
+			wantKey:   "KEY",
+			wantValue: "value",
+		},
+		{
+			name:      "comment and empty lines skipped",
+			content:   "# comment\n\n   \nKEY=value\n",
+			wantKey:   "KEY",
+			wantValue: "value",
+			wantNoKey: "COMMENT",
+		},
+		{
+			name:     "max variables exceeded during env parse",
+			content:  "A=1\nB=2\nC=3\n",
+			configFn: func(c *Config) { c.MaxVariables = 2 },
+			wantErr:  true,
+		},
+	}
 
-	t.Run("masked with long value", func(t *testing.T) {
-		sv := NewSecureValue(strings.Repeat("x", 100))
-		m := sv.Masked()
-		if !strings.Contains(m, "100") {
-			t.Errorf("Masked() = %q, should contain byte count", m)
-		}
-	})
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			fs := newTestFileSystem()
+			fs.files["test.env"] = tt.content
 
-	t.Run("String after close returns masked", func(t *testing.T) {
-		sv := NewSecureValue("test")
-		sv.Close()
-		if s := sv.String(); s != "[CLOSED]" {
-			t.Errorf("String() after Close() = %q, want [CLOSED]", s)
-		}
-	})
+			cfg := DefaultConfig()
+			cfg.FileSystem = fs
+			cfg.Filenames = nil // don't auto-load
+			if tt.configFn != nil {
+				tt.configFn(&cfg)
+			}
 
-	t.Run("Bytes after close returns nil", func(t *testing.T) {
-		sv := NewSecureValue("test")
-		sv.Close()
-		if b := sv.Bytes(); b != nil {
-			t.Errorf("Bytes() after Close() = %v, want nil", b)
-		}
-	})
+			loader, err := New(cfg)
+			if err != nil {
+				t.Fatalf("New() error = %v", err)
+			}
+			defer loader.Close()
 
-	t.Run("Length after close returns 0", func(t *testing.T) {
-		sv := NewSecureValue("test")
-		sv.Close()
-		if l := sv.Length(); l != 0 {
-			t.Errorf("Length() after Close() = %d, want 0", l)
-		}
-	})
+			err = loader.LoadFiles("test.env")
+			if tt.wantErr {
+				if err == nil {
+					t.Fatal("LoadFiles() error = nil, want error")
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("LoadFiles() error = %v", err)
+			}
+
+			if tt.wantKey != "" {
+				if v := loader.GetString(tt.wantKey); v != tt.wantValue {
+					t.Errorf("GetString(%q) = %q, want %q", tt.wantKey, v, tt.wantValue)
+				}
+			}
+			if tt.wantNoKey != "" {
+				if _, ok := loader.Lookup(tt.wantNoKey); ok {
+					t.Errorf("Lookup(%q) should return false", tt.wantNoKey)
+				}
+			}
+		})
+	}
 }

@@ -217,11 +217,7 @@ func MarshalEnvAs(m map[string]string, format MarshalFormat, sorted bool) (strin
 		}
 		return string(data), nil
 	case FormatYAML:
-		data, err := marshalToYAML(m, sorted)
-		if err != nil {
-			return "", err
-		}
-		return string(data), nil
+		return marshalToYAML(m, sorted)
 	default:
 		return "", &MarshalError{
 			Field:   "format",
@@ -324,9 +320,9 @@ func inferJSONType(value string) interface{} {
 
 // marshalToYAML converts a map to YAML format.
 // Outputs a simple YAML document with key-value pairs.
-func marshalToYAML(m map[string]string, sorted bool) ([]byte, error) {
+func marshalToYAML(m map[string]string, sorted bool) (string, error) {
 	if len(m) == 0 {
-		return []byte(""), nil
+		return "", nil
 	}
 
 	keys := make([]string, 0, len(m))
@@ -348,7 +344,7 @@ func marshalToYAML(m map[string]string, sorted bool) ([]byte, error) {
 		buf.WriteByte('\n')
 	}
 
-	return []byte(buf.String()), nil
+	return buf.String(), nil
 }
 
 // escapeYAMLValue escapes a value for YAML format.
@@ -359,7 +355,8 @@ func escapeYAMLValue(value string) string {
 
 	// Check if quoting is needed
 	needsQuoting := false
-	for _, c := range value {
+	for i := 0; i < len(value); i++ {
+		c := value[i]
 		if c == ':' || c == '#' || c == '\n' || c == '\r' || c == '\t' ||
 			c == '"' || c == '\'' || c == '[' || c == ']' || c == '{' || c == '}' {
 			needsQuoting = true

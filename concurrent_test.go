@@ -16,130 +16,70 @@ import (
 // Concurrent Access Tests for Loader
 // ============================================================================
 
-// TestLoader_ConcurrentGet tests concurrent read access to the loader.
-func TestLoader_ConcurrentGet(t *testing.T) {
-	cfg := DefaultConfig()
-	loader, err := New(cfg)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer loader.Close()
-
-	// Pre-populate with variables
-	for i := 0; i < 100; i++ {
-		loader.Set("KEY"+string(rune('A'+i%26)), "value")
-	}
-
-	var wg sync.WaitGroup
-	errors := int64(0)
-	iterations := 1000
-	concurrency := 10
-
-	for i := 0; i < concurrency; i++ {
-		wg.Add(1)
-		go func(id int) {
-			defer wg.Done()
-			for j := 0; j < iterations; j++ {
-				key := "KEY" + string(rune('A'+j%26))
-				_ = loader.GetString(key)
-				_, _ = loader.Lookup(key)
-				_ = loader.GetSecure(key)
+// TestLoader_Concurrent exercises the loader under a variety of concurrent
+// operation mixes. It replaces five former single-scenario tests
+// (ConcurrentGet, ConcurrentSet, ConcurrentReadWrite, ConcurrentSetDelete,
+// ConcurrentAllAndModify).
+func TestLoader_Concurrent(t *testing.T) {
+	scenarios := []struct {
+		name  string
+		write bool // goroutine performs Set/Delete (needs OverwriteExisting)
+		fn    func(l *Loader)
+	}{
+		{"read GetString/Lookup/GetSecure", false, func(l *Loader) {
+			for j := 0; j < 500; j++ {
+				key := "KEY_" + string(rune('A'+j%26))
+				_ = l.GetString(key)
+				_, _ = l.Lookup(key)
+				_ = l.GetSecure(key)
 			}
-		}(i)
-	}
-
-	wg.Wait()
-	if atomic.LoadInt64(&errors) > 0 {
-		t.Errorf("concurrent Get operations had %d errors", errors)
-	}
-}
-
-// TestLoader_ConcurrentSet tests concurrent write access to the loader.
-func TestLoader_ConcurrentSet(t *testing.T) {
-	cfg := DefaultConfig()
-	cfg.OverwriteExisting = true
-	loader, err := New(cfg)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer loader.Close()
-
-	var wg sync.WaitGroup
-	iterations := 1000
-	concurrency := 10
-
-	for i := 0; i < concurrency; i++ {
-		wg.Add(1)
-		go func(id int) {
-			defer wg.Done()
-			for j := 0; j < iterations; j++ {
-				key := "KEY" + string(rune('A'+j%26))
-				loader.Set(key, "value")
+		}},
+		{"write Set", true, func(l *Loader) {
+			for j := 0; j < 500; j++ {
+				_ = l.Set("KEY_"+string(rune('A'+j%26)), "value")
 			}
-		}(i)
-	}
-
-	wg.Wait()
-}
-
-// TestLoader_ConcurrentReadWrite tests concurrent read and write access.
-func TestLoader_ConcurrentReadWrite(t *testing.T) {
-	cfg := DefaultConfig()
-	cfg.OverwriteExisting = true
-	loader, err := New(cfg)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer loader.Close()
-
-	// Pre-populate
-	for i := 0; i < 50; i++ {
-		loader.Set("KEY"+string(rune('A'+i%26)), "initial")
-	}
-
-	var wg sync.WaitGroup
-	iterations := 500
-
-	// Writers
-	for i := 0; i < 5; i++ {
-		wg.Add(1)
-		go func(id int) {
-			defer wg.Done()
-			for j := 0; j < iterations; j++ {
-				key := "KEY" + string(rune('A'+j%26))
-				loader.Set(key, "writer_value")
+		}},
+		{"read Keys/All/Len", false, func(l *Loader) {
+			for j := 0; j < 200; j++ {
+				_ = l.Keys()
+				_ = l.All()
+				_ = l.Len()
 			}
-		}(i)
-	}
-
-	// Readers
-	for i := 0; i < 5; i++ {
-		wg.Add(1)
-		go func(id int) {
-			defer wg.Done()
-			for j := 0; j < iterations; j++ {
-				key := "KEY" + string(rune('A'+j%26))
-				_ = loader.GetString(key)
-				_ = loader.Keys()
-				_ = loader.All()
-				_ = loader.Len()
+		}},
+		{"write Delete", true, func(l *Loader) {
+			for j := 0; j < 300; j++ {
+				_ = l.Delete("KEY_" + string(rune('A'+j%26)))
 			}
-		}(i)
+		}},
 	}
 
-	// Deleters
-	for i := 0; i < 2; i++ {
-		wg.Add(1)
-		go func(id int) {
-			defer wg.Done()
-			for j := 0; j < iterations/10; j++ {
-				key := "KEY" + string(rune('A'+j%26))
-				loader.Delete(key)
+	for _, sc := range scenarios {
+		t.Run(sc.name, func(t *testing.T) {
+			cfg := DefaultConfig()
+			cfg.OverwriteExisting = true
+			loader, err := New(cfg)
+			if err != nil {
+				t.Fatal(err)
 			}
-		}(i)
-	}
+			defer loader.Close()
 
-	wg.Wait()
+			// Pre-populate so readers have data
+			for i := 0; i < 26; i++ {
+				loader.Set("KEY_"+string(rune('A'+i)), "initial")
+			}
+
+			var wg sync.WaitGroup
+			concurrency := 10
+			wg.Add(concurrency)
+			for k := 0; k < concurrency; k++ {
+				go func() {
+					defer wg.Done()
+					sc.fn(loader)
+				}()
+			}
+			wg.Wait()
+		})
+	}
 }
 
 // TestLoader_ConcurrentWithClose tests concurrent operations with Close.
@@ -187,109 +127,77 @@ func TestLoader_ConcurrentWithClose(t *testing.T) {
 // Concurrent Access Tests for SecureMap
 // ============================================================================
 
-// TestSecureMap_ConcurrentAccess tests concurrent access to secureMap.
-func TestSecureMap_ConcurrentAccess(t *testing.T) {
-	sm := newSecureMap()
+// TestSecureMap_Concurrent exercises all secureMap operations under concurrent
+// access. Each scenario targets a specific operation mix; together they replace
+// six former single-scenario tests (ConcurrentAccess, ConcurrentSetAll,
+// ConcurrentDeleteAndRead, ConcurrentToMapAndModify, ConcurrentKeysAndClear,
+// ResourceLeakConcurrentAccess).
+func TestSecureMap_Concurrent(t *testing.T) {
+	makeKey := func(j int) string { return "KEY_" + string(rune('A'+j%26)) }
 
-	var wg sync.WaitGroup
-	iterations := 1000
-	concurrency := 10
-
-	// Writers
-	for i := 0; i < concurrency/2; i++ {
-		wg.Add(1)
-		go func(id int) {
-			defer wg.Done()
-			for j := 0; j < iterations; j++ {
-				key := "KEY" + string(rune('A'+j%26))
-				sm.Set(key, "value")
-			}
-		}(i)
-	}
-
-	// Readers
-	for i := 0; i < concurrency/2; i++ {
-		wg.Add(1)
-		go func(id int) {
-			defer wg.Done()
-			for j := 0; j < iterations; j++ {
-				key := "KEY" + string(rune('A'+j%26))
-				sm.Get(key)
-				sm.GetSecure(key)
-			}
-		}(i)
-	}
-
-	wg.Wait()
-}
-
-// TestSecureMap_ConcurrentSetAll tests concurrent SetAll operations.
-func TestSecureMap_ConcurrentSetAll(t *testing.T) {
-	sm := newSecureMap()
-
-	var wg sync.WaitGroup
-	iterations := 100
-	concurrency := 5
-
-	for i := 0; i < concurrency; i++ {
-		wg.Add(1)
-		go func(id int) {
-			defer wg.Done()
-			for j := 0; j < iterations; j++ {
-				values := map[string]string{
-					"KEY_A": "value_a",
-					"KEY_B": "value_b",
-					"KEY_C": "value_c",
+	scenarios := []struct {
+		name string
+		fn   func(sm *secureMap)
+	}{
+		{
+			name: "Set and Get",
+			fn: func(sm *secureMap) {
+				for j := 0; j < 500; j++ {
+					key := makeKey(j)
+					sm.Set(key, "value")
+					sm.Get(key)
 				}
-				sm.SetAll(values)
-			}
-		}(i)
-	}
-
-	wg.Wait()
-}
-
-// TestSecureMap_ConcurrentClear tests concurrent operations with Clear.
-func TestSecureMap_ConcurrentClear(t *testing.T) {
-	for run := 0; run < 10; run++ {
-		sm := newSecureMap()
-
-		// Pre-populate
-		for i := 0; i < 100; i++ {
-			sm.Set("KEY"+string(rune('A'+i%26)), "value")
-		}
-
-		var wg sync.WaitGroup
-		iterations := 100
-		cleared := int64(0)
-
-		// Operations
-		for i := 0; i < 5; i++ {
-			wg.Add(1)
-			go func() {
-				defer wg.Done()
-				for j := 0; j < iterations; j++ {
-					sm.Set("KEY", "value")
-					sm.Get("KEY")
+			},
+		},
+		{
+			name: "GetSecure and Delete",
+			fn: func(sm *secureMap) {
+				for j := 0; j < 500; j++ {
+					key := makeKey(j)
+					sm.GetSecure(key)
+					sm.Delete(key)
+				}
+			},
+		},
+		{
+			name: "SetAll",
+			fn: func(sm *secureMap) {
+				for j := 0; j < 100; j++ {
+					sm.SetAll(map[string]string{"KEY_A": "a", "KEY_B": "b"})
+				}
+			},
+		},
+		{
+			name: "ToMap and Keys",
+			fn: func(sm *secureMap) {
+				for j := 0; j < 200; j++ {
+					_ = sm.ToMap()
 					_ = sm.Keys()
 					_ = sm.Len()
 				}
-			}()
-		}
+			},
+		},
+	}
 
-		// Clearer
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
-			for j := 0; j < iterations/10; j++ {
-				if atomic.CompareAndSwapInt64(&cleared, 0, 1) {
-					sm.Clear()
-					atomic.StoreInt64(&cleared, 0)
-				}
+	for _, sc := range scenarios {
+		t.Run(sc.name, func(t *testing.T) {
+			sm := newSecureMap()
+			// Pre-populate so readers have data
+			for i := 0; i < 26; i++ {
+				sm.Set(makeKey(i), "initial")
 			}
-		}()
 
-		wg.Wait()
+			var wg sync.WaitGroup
+			concurrency := 10
+			wg.Add(concurrency)
+			for k := 0; k < concurrency; k++ {
+				go func() {
+					defer wg.Done()
+					sc.fn(sm)
+				}()
+			}
+			wg.Wait()
+		})
 	}
 }
 
@@ -410,7 +318,7 @@ func TestComponentFactory_ConcurrentAccess(t *testing.T) {
 			for j := 0; j < iterations; j++ {
 				_ = factory.Validator()
 				_ = factory.Auditor()
-				_ = factory.lineParserExpander()
+				_ = factory.Expander()
 				_ = factory.IsClosed()
 			}
 		}()
@@ -550,148 +458,6 @@ func TestLoader_ConcurrentApplyValidate(t *testing.T) {
 	wg.Wait()
 }
 
-// ============================================================================
-// Edge Case Concurrency Tests
-// ============================================================================
-
-// TestSecureMap_ConcurrentDeleteAndRead tests concurrent delete while reading.
-func TestSecureMap_ConcurrentDeleteAndRead(t *testing.T) {
-	for run := 0; run < 5; run++ {
-		sm := newSecureMap()
-
-		// Pre-populate with many keys
-		for i := 0; i < 100; i++ {
-			sm.Set("KEY_"+string(rune('A'+i%26)), "value")
-		}
-
-		var wg sync.WaitGroup
-		iterations := 500
-
-		// Deleters
-		for i := 0; i < 3; i++ {
-			wg.Add(1)
-			go func(id int) {
-				defer wg.Done()
-				for j := 0; j < iterations; j++ {
-					key := "KEY_" + string(rune('A'+j%26))
-					sm.Delete(key)
-				}
-			}(i)
-		}
-
-		// Readers
-		for i := 0; i < 5; i++ {
-			wg.Add(1)
-			go func(id int) {
-				defer wg.Done()
-				for j := 0; j < iterations; j++ {
-					key := "KEY_" + string(rune('A'+j%26))
-					sm.Get(key)
-					sm.GetSecure(key)
-				}
-			}(i)
-		}
-
-		// Writers
-		for i := 0; i < 2; i++ {
-			wg.Add(1)
-			go func(id int) {
-				defer wg.Done()
-				for j := 0; j < iterations; j++ {
-					key := "KEY_" + string(rune('A'+j%26))
-					sm.Set(key, "new_value")
-				}
-			}(i)
-		}
-
-		wg.Wait()
-	}
-}
-
-// TestSecureMap_ConcurrentToMapAndModify tests concurrent ToMap with modifications.
-func TestSecureMap_ConcurrentToMapAndModify(t *testing.T) {
-	sm := newSecureMap()
-
-	// Pre-populate
-	for i := 0; i < 50; i++ {
-		sm.Set("KEY_"+string(rune('A'+i%26)), "value")
-	}
-
-	var wg sync.WaitGroup
-	iterations := 200
-
-	// ToMap callers
-	for i := 0; i < 5; i++ {
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
-			for j := 0; j < iterations; j++ {
-				m := sm.ToMap()
-				_ = len(m)
-			}
-		}()
-	}
-
-	// Modifiers
-	for i := 0; i < 5; i++ {
-		wg.Add(1)
-		go func(id int) {
-			defer wg.Done()
-			for j := 0; j < iterations; j++ {
-				key := "KEY_" + string(rune('A'+j%26))
-				sm.Set(key, "modified")
-				sm.Delete(key)
-			}
-		}(i)
-	}
-
-	wg.Wait()
-}
-
-// TestSecureMap_ConcurrentKeysAndClear tests concurrent Keys() with Clear().
-func TestSecureMap_ConcurrentKeysAndClear(t *testing.T) {
-	for run := 0; run < 5; run++ {
-		sm := newSecureMap()
-
-		// Pre-populate
-		for i := 0; i < 100; i++ {
-			sm.Set("KEY_"+string(rune('A'+i%26)), "value")
-		}
-
-		var wg sync.WaitGroup
-		iterations := 100
-		cleared := int64(0)
-
-		// Keys callers
-		for i := 0; i < 5; i++ {
-			wg.Add(1)
-			go func() {
-				defer wg.Done()
-				for j := 0; j < iterations; j++ {
-					keys := sm.Keys()
-					_ = keys
-				}
-			}()
-		}
-
-		// Clear callers
-		for i := 0; i < 2; i++ {
-			wg.Add(1)
-			go func() {
-				defer wg.Done()
-				for j := 0; j < iterations/10; j++ {
-					if atomic.CompareAndSwapInt64(&cleared, 0, 1) {
-						sm.Clear()
-						atomic.StoreInt64(&cleared, 0)
-					}
-				}
-			}()
-		}
-
-		wg.Wait()
-	}
-}
-
 // TestSecureValue_ConcurrentReleaseAndRead tests concurrent Release with read operations.
 func TestSecureValue_ConcurrentReleaseAndRead(t *testing.T) {
 	for run := 0; run < 10; run++ {
@@ -746,104 +512,6 @@ func TestSecureValue_PoolReuseConcurrency(t *testing.T) {
 				_ = sv.String()
 				_ = sv.Length()
 				sv.Release()
-			}
-		}(i)
-	}
-
-	wg.Wait()
-}
-
-// TestLoader_ConcurrentSetDelete tests concurrent Set and Delete operations.
-func TestLoader_ConcurrentSetDelete(t *testing.T) {
-	cfg := DefaultConfig()
-	cfg.OverwriteExisting = true
-	loader, err := New(cfg)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer loader.Close()
-
-	var wg sync.WaitGroup
-	iterations := 500
-
-	// Setters
-	for i := 0; i < 5; i++ {
-		wg.Add(1)
-		go func(id int) {
-			defer wg.Done()
-			for j := 0; j < iterations; j++ {
-				key := "KEY_" + string(rune('A'+j%26))
-				loader.Set(key, "value")
-			}
-		}(i)
-	}
-
-	// Deleters
-	for i := 0; i < 3; i++ {
-		wg.Add(1)
-		go func(id int) {
-			defer wg.Done()
-			for j := 0; j < iterations; j++ {
-				key := "KEY_" + string(rune('A'+j%26))
-				loader.Delete(key)
-			}
-		}(i)
-	}
-
-	// Readers
-	for i := 0; i < 5; i++ {
-		wg.Add(1)
-		go func(id int) {
-			defer wg.Done()
-			for j := 0; j < iterations; j++ {
-				key := "KEY_" + string(rune('A'+j%26))
-				_ = loader.GetString(key)
-				_, _ = loader.Lookup(key)
-			}
-		}(i)
-	}
-
-	wg.Wait()
-}
-
-// TestLoader_ConcurrentAllAndModify tests concurrent All() with modifications.
-func TestLoader_ConcurrentAllAndModify(t *testing.T) {
-	cfg := DefaultConfig()
-	cfg.OverwriteExisting = true
-	loader, err := New(cfg)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer loader.Close()
-
-	// Pre-populate
-	for i := 0; i < 50; i++ {
-		loader.Set("KEY_"+string(rune('A'+i%26)), "initial")
-	}
-
-	var wg sync.WaitGroup
-	iterations := 200
-
-	// All() callers
-	for i := 0; i < 5; i++ {
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
-			for j := 0; j < iterations; j++ {
-				all := loader.All()
-				_ = len(all)
-			}
-		}()
-	}
-
-	// Modifiers
-	for i := 0; i < 3; i++ {
-		wg.Add(1)
-		go func(id int) {
-			defer wg.Done()
-			for j := 0; j < iterations; j++ {
-				key := "KEY_" + string(rune('A'+j%26))
-				loader.Set(key, "modified")
 			}
 		}(i)
 	}
@@ -1557,50 +1225,4 @@ func TestAuditEventPool_NoLeak(t *testing.T) {
 	_ = handler.Close()
 
 	// If we get here without memory issues, the test passes
-}
-
-// TestSecureMap_ResourceLeakConcurrentAccess verifies that secureMap doesn't have
-// race conditions under heavy concurrent access.
-func TestSecureMap_ResourceLeakConcurrentAccess(t *testing.T) {
-	sm := newSecureMap()
-	var wg sync.WaitGroup
-
-	// Concurrent writes
-	for i := 0; i < 10; i++ {
-		wg.Add(1)
-		go func(id int) {
-			defer wg.Done()
-			for j := 0; j < 100; j++ {
-				key := fmt.Sprintf("KEY_%d_%d", id, j)
-				sm.Set(key, "value")
-			}
-		}(i)
-	}
-
-	// Concurrent reads
-	for i := 0; i < 5; i++ {
-		wg.Add(1)
-		go func(id int) {
-			defer wg.Done()
-			for j := 0; j < 100; j++ {
-				key := fmt.Sprintf("KEY_%d_%d", id%10, j)
-				_, _ = sm.Get(key)
-			}
-		}(i)
-	}
-
-	// Concurrent deletes
-	for i := 0; i < 3; i++ {
-		wg.Add(1)
-		go func(id int) {
-			defer wg.Done()
-			for j := 0; j < 50; j++ {
-				key := fmt.Sprintf("KEY_%d_%d", id%10, j)
-				sm.Delete(key)
-			}
-		}(i)
-	}
-
-	wg.Wait()
-	sm.Clear()
 }

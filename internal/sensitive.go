@@ -68,9 +68,8 @@ var Patterns = []string{
 	"SERVICE_ACCOUNT",
 }
 
-// upperPatterns contains pre-uppercased patterns for faster matching.
-// This avoids calling strings.ToUpper for each pattern during IsKey.
-var upperPatterns = Patterns // Already uppercase
+// Patterns are already uppercase, so IsKey uses them directly for
+// case-insensitive matching without an additional ToUpper pass.
 
 // sanitizePatterns contains lowercase patterns for sanitizing logs.
 // These patterns are used to detect and mask sensitive key=value pairs.
@@ -125,7 +124,7 @@ func IsKey(key string) bool {
 	}
 
 	// Check each pattern using zero-allocation case-insensitive matching
-	for _, pattern := range upperPatterns {
+	for _, pattern := range Patterns {
 		if containsIgnoreCase(key, pattern) {
 			return true
 		}
@@ -143,18 +142,18 @@ func containsIgnoreCase(s, pattern string) bool {
 		return false
 	}
 
-	// Quick scan for non-ASCII — exit early to fallback path
-	for i := 0; i < sLen; i++ {
-		if s[i] >= 0x80 {
-			return strings.Contains(strings.ToUpper(s), pattern)
-		}
-	}
-
-	// ASCII-only fast path: slide window through s
+	// ASCII-only fast path: slide window through s.
+	// Non-ASCII detection is folded into the comparison loop to avoid a
+	// separate O(n) pre-scan — for ASCII strings (the common case) this
+	// halves the number of bytes examined.
 	for i := 0; i <= sLen-patternLen; i++ {
 		match := true
 		for j := 0; j < patternLen; j++ {
 			c := s[i+j]
+			if c >= 0x80 {
+				// Non-ASCII: fall back to Unicode-aware matching
+				return strings.Contains(strings.ToUpper(s), pattern)
+			}
 			if c >= 'a' && c <= 'z' {
 				c -= 32
 			}
