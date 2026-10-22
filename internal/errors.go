@@ -1,4 +1,5 @@
-// Package internal provides shared internal types and utilities.
+// Provides shared internal types and utilities.
+
 package internal
 
 import (
@@ -31,6 +32,19 @@ var (
 	// ErrMaxVariables indicates the maximum number of variables has been reached.
 	// Matches the max-variables ValidationError (Rule "max_variables") via errors.Is.
 	ErrMaxVariables = errors.New("maximum number of variables exceeded")
+
+	// ErrDuplicateKey indicates a duplicate key was encountered. Matches, via
+	// errors.Is, the parse errors returned under the DuplicateKeyError policy
+	// (.env / YAML / JSON, including inline JSON inside YAML) and the always-on
+	// flat-key collision errors from the YAML/JSON flatteners.
+	ErrDuplicateKey = errors.New("duplicate key encountered")
+
+	// ErrAuditFailed indicates an audit event was lost while fail-closed
+	// auditing was enabled (Config.AuditFailClosed): the handler errored,
+	// panicked, or dropped the event on a full channel. The operation that
+	// lost its audit trail reports this error instead of succeeding
+	// silently.
+	ErrAuditFailed = errors.New("audit logging failed")
 
 	// ErrMissingRequired indicates a required key is missing.
 	// Matches the required-keys ValidationError (Rule "required") via errors.Is.
@@ -184,11 +198,24 @@ type ExpansionError struct {
 // SECURITY: Key names are masked to prevent sensitive information leakage.
 // Only the first 2 characters of the key are shown followed by "***".
 func (e *ExpansionError) Error() string {
+	// Mask the key to prevent leaking sensitive key names in error messages
+	maskedKey := maskKeyName(e.Key)
+	if e.Kind == ExpansionRequiredKind {
+		return fmt.Sprintf("expansion error: required variable %q is not set", maskedKey)
+	}
 	if e.Key == "" {
 		return fmt.Sprintf("expansion error: depth limit exceeded (%d/%d), chain: %s", e.Depth, e.Limit, e.Chain)
 	}
-	// Mask the key to prevent leaking sensitive key names in error messages
-	maskedKey := maskKeyName(e.Key)
+	if e.Depth == 0 && e.Limit == 0 && e.Chain != "" {
+		// Cycle-detection error from ExpandAllInMap: no depth was actually
+		// exceeded — rendering it as "exceeded depth limit (0/0)" (the old
+		// behavior for every Key-carrying error) misdiagnosed the cause and
+		// dropped the chain.
+		return fmt.Sprintf("expansion error: key %q: %s", maskedKey, e.Chain)
+	}
+	if e.Chain != "" {
+		return fmt.Sprintf("expansion error: key %q exceeded depth limit (%d/%d), chain: %s", maskedKey, e.Depth, e.Limit, e.Chain)
+	}
 	return fmt.Sprintf("expansion error: key %q exceeded depth limit (%d/%d)", maskedKey, e.Depth, e.Limit)
 }
 

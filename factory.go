@@ -93,12 +93,6 @@ func (f *ComponentFactory) Expander() VariableExpander {
 	return f.expander
 }
 
-// buildComponentFactory creates a new ComponentFactory from the configuration.
-// It uses the default OS file system for environment variable lookup.
-func (c *Config) buildComponentFactory() *ComponentFactory {
-	return c.buildComponentFactoryWithFS(DefaultFileSystem)
-}
-
 // buildComponentFactoryWithFS creates a new ComponentFactory from the configuration
 // using the provided FileSystem for environment variable lookup.
 // If fs is nil, DefaultFileSystem is used.
@@ -114,9 +108,7 @@ func (c *Config) buildComponentFactoryWithFS(fs FileSystem) *ComponentFactory {
 		handler = internal.DefaultHandler()
 	}
 
-	lookup := func(key string) (string, bool) {
-		return fs.LookupEnv(key)
-	}
+	lookup := fs.LookupEnv
 	// SECURITY (SEC-03): in file-only scope the expander must not fall back
 	// to the process environment — a less-trusted config file could
 	// otherwise capture unrelated process secrets (${AWS_SECRET_...}) into
@@ -137,8 +129,8 @@ func (c *Config) buildComponentFactoryWithFS(fs FileSystem) *ComponentFactory {
 
 	// Use custom validator if provided, otherwise create default
 	if c.CustomValidator != nil {
-		// Since KeyValidator = types.KeyValidator = internal.LineKeyValidator,
-		// we can directly use the custom validator
+		// KeyValidator and internal.LineKeyValidator are the same type via
+		// aliases, so the custom validator is assigned directly.
 		factory.validator = c.CustomValidator
 	} else {
 		factory.validator = internal.NewValidator(internal.ValidatorConfig{
@@ -157,17 +149,21 @@ func (c *Config) buildComponentFactoryWithFS(fs FileSystem) *ComponentFactory {
 
 	// Use custom auditor if provided, otherwise create default
 	if c.CustomAuditor != nil {
-		// Since AuditLogger = types.AuditLogger = internal.LineAuditLogger,
-		// we can directly use the custom auditor
+		// AuditLogger and internal.LineAuditLogger are the same type via
+		// aliases, so the custom auditor is assigned directly.
 		factory.auditor = c.CustomAuditor
 	} else {
-		factory.auditor = internal.NewAuditor(handler, IsSensitiveKey, MaskValue, c.AuditEnabled)
+		auditor := internal.NewAuditor(handler, IsSensitiveKey, MaskValue, c.AuditEnabled)
+		// GEN-001 fail-closed auditing: arm the sticky failure latch so the
+		// Loader can surface lost events at the end of top-level operations.
+		auditor.SetFailClosed(c.AuditFailClosed)
+		factory.auditor = auditor
 	}
 
 	// Use custom expander if provided, otherwise create default
 	if c.CustomExpander != nil {
-		// Since VariableExpander = types.VariableExpander = internal.LineExpander,
-		// we can directly use the custom expander
+		// VariableExpander and internal.LineExpander are the same type via
+		// aliases, so the custom expander is assigned directly.
 		factory.expander = c.CustomExpander
 	} else {
 		factory.expander = internal.NewExpander(internal.ExpanderConfig{
@@ -175,6 +171,10 @@ func (c *Config) buildComponentFactoryWithFS(fs FileSystem) *ComponentFactory {
 			Lookup:     lookup,
 			Mode:       internal.ModeAll,
 			KeyPattern: c.KeyPattern,
+			// Bound expanded output to the configured value limit — raw
+			// values are checked at parse time, but multi-reference
+			// expansion can otherwise amplify far past it (GEN-001).
+			MaxValueLength: c.MaxValueLength,
 		})
 	}
 
@@ -195,11 +195,12 @@ func (f *ComponentFactory) buildValidatorAdapter() Validator {
 	}
 }
 
-// buildAuditorAdapter creates the public FullAuditLogger adapter from the internal auditor.
+// buildAuditorAdapter creates the public FullAuditLogger view from the
+// internal auditor. The built-in *internal.Auditor satisfies FullAuditLogger
+// directly (AuditAction is an alias of internal.Action), so it is returned
+// unwrapped; only minimal LogError-only auditors get wrapped.
 func (f *ComponentFactory) buildAuditorAdapter() FullAuditLogger {
 	switch a := f.auditor.(type) {
-	case *internal.Auditor:
-		return newAuditorAdapter(a)
 	case FullAuditLogger:
 		return a
 	default:

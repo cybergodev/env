@@ -17,30 +17,25 @@ var _ EnvParser = (*jsonParser)(nil)
 
 // newJSONParserWithFactory creates a new jsonParser with a ComponentFactory.
 func newJSONParserWithFactory(cfg Config, factory *ComponentFactory) (*jsonParser, error) {
-	maxDepth := cfg.JSONMaxDepth
-	if maxDepth <= 0 {
-		maxDepth = defaultStructuredMaxDepth
-	}
-
 	flattenCfg := internal.JSONFlattenConfig{
 		KeyDelimiter:     "_",
 		ArrayIndexFormat: "underscore",
 		NullAsEmpty:      cfg.JSONNullAsEmpty,
 		NumberAsString:   cfg.JSONNumberAsString,
 		BoolAsString:     cfg.JSONBoolAsString,
-		MaxDepth:         maxDepth,
+		MaxDepth:         normalizeStructuredDepth(cfg.JSONMaxDepth),
+		DuplicateKey:     cfg.DuplicateKeyPolicy,
 	}
 	return &jsonParser{
-		structuredParserConfig: structuredParserConfig{
-			config:    cfg,
-			validator: factory.Validator(),
-			auditor:   factory.Auditor(),
-		},
-		flatten: flattenCfg,
+		structuredParserConfig: newStructuredParserConfig(cfg, factory),
+		flatten:                flattenCfg,
 	}, nil
 }
 
-// Parse reads and parses JSON content from an io.Reader.
+// Parse reads and parses JSON content from an io.Reader. Duplicate object
+// keys resolve per the configured DuplicateKeyPolicy (default: last
+// occurrence wins, following encoding/json). Flat-key collisions from
+// different source paths always error (see internal.FlattenJSON).
 func (p *jsonParser) Parse(r io.Reader, filename string) (map[string]string, error) {
 	return p.structuredParseResult(r, filename, "JSON", func(data []byte) (map[string]string, error) {
 		return internal.FlattenJSON(data, p.flatten)

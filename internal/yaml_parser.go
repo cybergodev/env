@@ -1,4 +1,5 @@
-// Package internal provides YAML parsing utilities.
+// Provides YAML parsing utilities.
+
 package internal
 
 import (
@@ -30,6 +31,13 @@ type Value struct {
 	// YAML semantics: quoted scalars are always strings — no null/bool/number
 	// coercion, and interior whitespace (including trailing) is significant.
 	Quoted bool
+	// pooled marks a *Value that ReleaseValue has already returned to
+	// valuePool. Constructors clear it on Get; a second ReleaseValue sees
+	// it set and returns without putting the node back again — a double
+	// Put would leave the same pointer in the pool twice, and a later
+	// ParseYAML could then draw one object for two tree positions and
+	// build a cycle that ReleaseValue cannot walk.
+	pooled bool
 }
 
 // valuePool pools *Value nodes to reduce allocation pressure during YAML parsing.
@@ -42,6 +50,7 @@ var valuePool = sync.Pool{
 // NewScalarValue creates a new scalar value (from pool).
 func NewScalarValue(s string, line, col int) *Value {
 	v := valuePool.Get().(*Value)
+	v.pooled = false
 	v.Type = ValueTypeScalar
 	v.Scalar = s
 	v.Line = line
@@ -59,6 +68,7 @@ func NewMapValue(line, col int) *Value {
 // document root where the entry count is estimable from the token count.
 func newMapValueCap(line, col, size int) *Value {
 	v := valuePool.Get().(*Value)
+	v.pooled = false
 	v.Type = ValueTypeMap
 	if v.Map == nil {
 		v.Map = make(map[string]*Value, size)
@@ -74,6 +84,7 @@ func newMapValueCap(line, col, size int) *Value {
 // NewArrayValue creates a new array value with pre-allocated capacity (from pool).
 func NewArrayValue(line, col int) *Value {
 	v := valuePool.Get().(*Value)
+	v.pooled = false
 	v.Type = ValueTypeArray
 	if v.Array == nil {
 		v.Array = make([]*Value, 0, 4)
@@ -87,19 +98,32 @@ func NewArrayValue(line, col int) *Value {
 
 // Parser parses YAML tokens into a Value tree.
 type Parser struct {
-	tokens   []Token
-	pos      int
-	maxDepth int
+	tokens    []Token
+	pos       int
+	maxDepth  int
+	dupPolicy DuplicateKeyPolicy
 }
 
-// NewYAMLParser creates a new YAML parser.
+// NewYAMLParser creates a new YAML parser with the DuplicateKeyInherit
+// policy (each format's historical duplicate-key behavior). Callers that
+// need an explicit policy use NewYAMLParserWithPolicy.
 func NewYAMLParser(tokens []Token, maxDepth int) *Parser {
+	return NewYAMLParserWithPolicy(tokens, maxDepth, DuplicateKeyInherit)
+}
+
+// NewYAMLParserWithPolicy creates a new YAML parser. The dupPolicy governs
+// duplicate mapping keys within one document (see DuplicateKeyPolicy); the
+// zero value keeps the historical last-occurrence-wins behavior.
+func NewYAMLParserWithPolicy(tokens []Token, maxDepth int, dupPolicy DuplicateKeyPolicy) *Parser {
 	if maxDepth <= 0 {
-		maxDepth = 10
+		// Defensive fallback for direct internal callers; the root package's
+		// parsers already substitute defaultStructuredMaxDepth before calling.
+		maxDepth = 16
 	}
 	return &Parser{
-		tokens:   tokens,
-		maxDepth: maxDepth,
+		tokens:    tokens,
+		maxDepth:  maxDepth,
+		dupPolicy: dupPolicy,
 	}
 }
 
@@ -126,8 +150,39 @@ func (p *Parser) parseDocument(depth int) (*Value, error) {
 		return NewMapValue(1, 1), nil
 	}
 
+	// A root-level sequence ("- a\n- b") is not a mapping: parseMap would
+	// fall into its TokenDash "shouldn't happen" break and silently return
+	// an EMPTY map, loading the whole document as zero variables with no
+	// error. Fail loudly instead. (JSON flattens root arrays to _0.._N
+	// keys; giving YAML sequences the same treatment would be a larger
+	// semantic change.)
+	if p.current().Type == TokenDash {
+		return nil, &YAMLError{
+			Line:    p.current().Line,
+			Column:  p.current().Column,
+			Message: "YAML document root must be a mapping, not a sequence",
+		}
+	}
+
 	// Parse root level
-	return p.parseMap(depth, 0)
+	root, err := p.parseMap(depth, 0)
+	if err != nil {
+		return nil, err
+	}
+
+	// GEN-001: a '---' separator after the first document previously broke
+	// the map loop and every later document was dropped silently — the load
+	// reported success while holding a fraction of the file. Fail loudly
+	// instead, mirroring the explicit root-sequence rejection above.
+	if p.current().Type == TokenDocumentStart {
+		return nil, &YAMLError{
+			Line:    p.current().Line,
+			Column:  p.current().Column,
+			Message: "multiple YAML documents are not supported; load one document per file (found a second '---' separator)",
+		}
+	}
+
+	return root, nil
 }
 
 // parseMap parses a YAML map.
@@ -136,9 +191,13 @@ func (p *Parser) parseMap(depth, expectedIndent int) (*Value, error) {
 	if depth == 0 {
 		// Root document map: pre-size from the token count (~3 tokens per
 		// entry: newline, key, value) so large flat documents don't pay for
-		// repeated map growth. Nested maps keep the small default — depth 0
-		// is reachable only from parseDocument.
-		root = newMapValueCap(p.currentLine(), p.currentColumn(), len(p.tokens)/3)
+		// repeated map growth. The hint is clamped to HardMaxVariables: a
+		// deeply nested document can hold up to HardMaxYAMLTokens tokens
+		// under a handful of root keys, and the flattened key count the
+		// loader accepts is bounded by MaxVariables anyway. Nested maps keep
+		// the small default — depth 0 is reachable only from parseDocument.
+		root = newMapValueCap(p.currentLine(), p.currentColumn(),
+			min(len(p.tokens)/3, HardMaxVariables))
 	} else {
 		root = NewMapValue(p.currentLine(), p.currentColumn())
 	}
@@ -178,6 +237,7 @@ func (p *Parser) parseMap(depth, expectedIndent int) (*Value, error) {
 		// Parse key-value pair or array item
 		if p.current().Type == TokenKey {
 			key := p.current().Value
+			keyLine := p.current().Line
 			p.advance()
 
 			// Skip newlines after colon
@@ -217,10 +277,39 @@ func (p *Parser) parseMap(depth, expectedIndent int) (*Value, error) {
 				return nil, err
 			}
 
+			// Resolve duplicate mapping keys per the configured policy.
+			// Inherit and LastWins keep the historical last-occurrence-wins
+			// behavior (plain map assignment); FirstWins keeps the existing
+			// entry and Error rejects the document.
+			if _, exists := root.Map[key]; exists {
+				switch p.dupPolicy {
+				case DuplicateKeyError:
+					return nil, &YAMLError{
+						Path:    key,
+						Line:    keyLine,
+						Message: "duplicate mapping key",
+						Err:     ErrDuplicateKey,
+					}
+				case DuplicateKeyFirstWins:
+					// Return the freshly parsed (losing) subtree to the pool;
+					// it is a disjoint tree from the kept value.
+					ReleaseValue(value)
+					continue
+				}
+			}
+
 			root.Map[key] = value
 		} else if p.current().Type == TokenDash {
-			// This shouldn't happen at map level without a key
-			break
+			// A sequence item at mapping level is malformed YAML — the
+			// root case ("- a" as the first token, covered by the dedicated
+			// check in parseDocument) and the mid-document case
+			// ("key: 1\n- b") both land here. parseMap previously broke,
+			// silently dropping the item and everything after it.
+			return nil, &YAMLError{
+				Line:    p.current().Line,
+				Column:  p.current().Column,
+				Message: "sequence item not allowed in mapping context (YAML root must be a mapping)",
+			}
 		} else if p.current().Type == TokenComment {
 			p.advance()
 		} else {
@@ -476,35 +565,67 @@ func (p *Parser) skipDocumentStarts() {
 	}
 }
 
+// maxPooledValueChildren bounds the container a pooled Value node may retain
+// after ReleaseValue. Re-making the per-node map was a measurable share of
+// YAML parse allocations (every map/array node allocated a fresh container on
+// its next use); retaining the CLEARED container makes the next NewMapValue /
+// NewArrayValue reuse it. Larger containers are dropped so one huge document
+// cannot inflate every pooled node permanently.
+const maxPooledValueChildren = 64
+
 // ReleaseValue recursively returns a Value tree to the pool.
 // After calling this, the Value and all its children must not be accessed.
+//
+// SECURITY: retained maps and arrays are fully cleared — clear() removes every
+// key string (file content) from the map, and the array's whole capacity is
+// zeroed so no stale *Value pins a pooled (possibly reused) node.
 func ReleaseValue(v *Value) {
-	if v == nil {
+	if v == nil || v.pooled {
 		return
 	}
 	switch v.Type {
 	case ValueTypeMap:
-		for key, child := range v.Map {
+		for _, child := range v.Map {
 			ReleaseValue(child)
-			delete(v.Map, key)
 		}
-		v.Map = nil
+		if len(v.Map) > maxPooledValueChildren {
+			v.Map = nil
+		} else {
+			clear(v.Map)
+		}
 	case ValueTypeArray:
 		for _, child := range v.Array {
 			ReleaseValue(child)
 		}
-		v.Array = nil
+		if cap(v.Array) > maxPooledValueChildren {
+			v.Array = nil
+		} else {
+			clear(v.Array[:cap(v.Array)])
+			v.Array = v.Array[:0]
+		}
 	}
 	v.Scalar = ""
 	v.Quoted = false
 	v.Type = ValueTypeScalar
+	v.pooled = true
 	valuePool.Put(v)
 }
 
 // ParseYAML parses YAML input and returns a Value tree.
 // The caller MUST call ReleaseValue on the returned tree when done
 // to return nodes to the pool and prevent memory growth.
+//
+// Duplicate mapping keys resolve to the last occurrence. The YAML
+// specification requires an error here; this parser is deliberately lenient
+// (the .env parser similarly tolerates duplicates, skipping them). Use
+// ParseYAMLWithPolicy to select a different resolution.
 func ParseYAML(data []byte, maxDepth int) (*Value, error) {
+	return ParseYAMLWithPolicy(data, maxDepth, DuplicateKeyInherit)
+}
+
+// ParseYAMLWithPolicy parses YAML input with an explicit duplicate-key
+// policy (see DuplicateKeyPolicy). Release rules match ParseYAML.
+func ParseYAMLWithPolicy(data []byte, maxDepth int, dupPolicy DuplicateKeyPolicy) (*Value, error) {
 	// Lex directly over the caller's buffer (no full-file copy): every token
 	// value is copied out as an independent string during tokenization, and
 	// the Value tree holds only those copies, so aliasing data is safe for
@@ -521,7 +642,7 @@ func ParseYAML(data []byte, maxDepth int) (*Value, error) {
 		return nil, err
 	}
 
-	parser := NewYAMLParser(tokens, maxDepth)
+	parser := NewYAMLParserWithPolicy(tokens, maxDepth, dupPolicy)
 	value, perr := parser.Parse()
 	putTokenSlice(tokensPtr)
 	if perr != nil {

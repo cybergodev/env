@@ -2,6 +2,10 @@ package env
 
 import (
 	"errors"
+	"os"
+	"path/filepath"
+	"reflect"
+	"strconv"
 	"testing"
 	"time"
 )
@@ -37,43 +41,53 @@ func resetDefaultLoader() {
 
 func TestConvenienceGet(t *testing.T) {
 	tests := []struct {
-		name       string
-		key        string
-		value      string
-		getter     string // "string", "int", "bool", "duration", "uint64", "float64"
-		defaultVal interface{}
-		wantValue  interface{}
+		name  string
+		key   string
+		value string // stored value; empty means the key is not set
+		call  func(key string) any
+		want  any
 	}{
-		// String tests
-		{"get string existing", "KEY", "value", "string", nil, "value"},
-		{"get string with default", "MISSING", "", "string", "default_value", "default_value"},
-		{"get string missing no default", "MISSING", "", "string", nil, ""},
+		// String
+		{"get string existing", "KEY", "value", func(key string) any { return GetString(key) }, "value"},
+		{"get string with default", "MISSING", "", func(key string) any { return GetString(key, "default_value") }, "default_value"},
+		{"get string missing no default", "MISSING", "", func(key string) any { return GetString(key) }, ""},
 
-		// Int tests
-		{"get int existing", "PORT", "8080", "int", nil, int64(8080)},
-		{"get int with default", "MISSING", "", "int", int64(9999), int64(9999)},
-		{"get int missing no default", "NOT_EXISTS", "", "int", nil, int64(0)},
+		// Int
+		{"get int existing", "PORT", "8080", func(key string) any { return GetInt(key) }, int64(8080)},
+		{"get int with default", "MISSING", "", func(key string) any { return GetInt(key, 9999) }, int64(9999)},
+		{"get int missing no default", "NOT_EXISTS", "", func(key string) any { return GetInt(key) }, int64(0)},
+		// A stored value that fails to parse falls back to the default — or to
+		// the zero value when none is given (getWithDefault in accessors.go).
+		{"get int invalid stored value falls back to default", "BAD", "abc", func(key string) any { return GetInt(key, 9999) }, int64(9999)},
+		{"get int invalid stored value no default is zero", "BAD", "abc", func(key string) any { return GetInt(key) }, int64(0)},
+		// firstOrZero (utils.go) takes the FIRST variadic default, ignoring
+		// the rest.
+		{"get int multiple defaults uses the first", "MISSING", "", func(key string) any { return GetInt(key, 1, 2) }, int64(1)},
 
-		// Bool tests
-		{"get bool true", "DEBUG", "true", "bool", nil, true},
-		{"get bool false", "DEBUG", "false", "bool", nil, false},
-		{"get bool with default", "MISSING", "", "bool", true, true},
-		{"get bool missing no default", "NOT_EXISTS", "", "bool", nil, false},
+		// Bool
+		{"get bool true", "DEBUG", "true", func(key string) any { return GetBool(key) }, true},
+		{"get bool false", "DEBUG", "false", func(key string) any { return GetBool(key) }, false},
+		{"get bool with default", "MISSING", "", func(key string) any { return GetBool(key, true) }, true},
+		{"get bool missing no default", "NOT_EXISTS", "", func(key string) any { return GetBool(key) }, false},
+		{"get bool invalid stored value falls back to default", "BAD", "maybe", func(key string) any { return GetBool(key, true) }, true},
 
-		// Duration tests
-		{"get duration existing", "TIMEOUT", "30s", "duration", nil, 30 * time.Second},
-		{"get duration with default", "MISSING", "", "duration", 5 * time.Minute, 5 * time.Minute},
-		{"get duration missing no default", "NOT_EXISTS", "", "duration", nil, time.Duration(0)},
+		// Duration
+		{"get duration existing", "TIMEOUT", "30s", func(key string) any { return GetDuration(key) }, 30 * time.Second},
+		{"get duration with default", "MISSING", "", func(key string) any { return GetDuration(key, 5*time.Minute) }, 5 * time.Minute},
+		{"get duration missing no default", "NOT_EXISTS", "", func(key string) any { return GetDuration(key) }, time.Duration(0)},
+		{"get duration invalid stored value falls back to default", "BAD", "not_a_duration", func(key string) any { return GetDuration(key, 5*time.Minute) }, 5 * time.Minute},
 
-		// Uint64 tests
-		{"get uint64 existing", "PORT", "8080", "uint64", nil, uint64(8080)},
-		{"get uint64 with default", "MISSING", "", "uint64", uint64(9999), uint64(9999)},
-		{"get uint64 missing no default", "NOT_EXISTS", "", "uint64", nil, uint64(0)},
+		// Uint64
+		{"get uint64 existing", "PORT", "8080", func(key string) any { return GetUint64(key) }, uint64(8080)},
+		{"get uint64 with default", "MISSING", "", func(key string) any { return GetUint64(key, 9999) }, uint64(9999)},
+		{"get uint64 missing no default", "NOT_EXISTS", "", func(key string) any { return GetUint64(key) }, uint64(0)},
+		{"get uint64 invalid stored value falls back to default", "BAD", "abc", func(key string) any { return GetUint64(key, 9999) }, uint64(9999)},
 
-		// Float64 tests
-		{"get float64 existing", "RATE", "3.14", "float64", nil, 3.14},
-		{"get float64 with default", "MISSING", "", "float64", 0.5, 0.5},
-		{"get float64 missing no default", "NOT_EXISTS", "", "float64", nil, 0.0},
+		// Float64
+		{"get float64 existing", "RATE", "3.14", func(key string) any { return GetFloat64(key) }, 3.14},
+		{"get float64 with default", "MISSING", "", func(key string) any { return GetFloat64(key, 0.5) }, 0.5},
+		{"get float64 missing no default", "NOT_EXISTS", "", func(key string) any { return GetFloat64(key) }, 0.0},
+		{"get float64 invalid stored value falls back to default", "BAD", "abc", func(key string) any { return GetFloat64(key, 0.5) }, 0.5},
 	}
 
 	for _, tt := range tests {
@@ -91,72 +105,8 @@ func TestConvenienceGet(t *testing.T) {
 				t.Fatalf("setDefaultLoader() error = %v", err)
 			}
 
-			switch tt.getter {
-			case "string":
-				var got string
-				if tt.defaultVal != nil {
-					got = GetString(tt.key, tt.defaultVal.(string))
-				} else {
-					got = GetString(tt.key)
-				}
-				if got != tt.wantValue.(string) {
-					t.Errorf("GetString() = %v, want %v", got, tt.wantValue)
-				}
-
-			case "int":
-				var got int64
-				if tt.defaultVal != nil {
-					got = GetInt(tt.key, tt.defaultVal.(int64))
-				} else {
-					got = GetInt(tt.key)
-				}
-				if got != tt.wantValue.(int64) {
-					t.Errorf("GetInt() = %v, want %v", got, tt.wantValue)
-				}
-
-			case "bool":
-				var got bool
-				if tt.defaultVal != nil {
-					got = GetBool(tt.key, tt.defaultVal.(bool))
-				} else {
-					got = GetBool(tt.key)
-				}
-				if got != tt.wantValue.(bool) {
-					t.Errorf("GetBool() = %v, want %v", got, tt.wantValue)
-				}
-
-			case "duration":
-				var got time.Duration
-				if tt.defaultVal != nil {
-					got = GetDuration(tt.key, tt.defaultVal.(time.Duration))
-				} else {
-					got = GetDuration(tt.key)
-				}
-				if got != tt.wantValue.(time.Duration) {
-					t.Errorf("GetDuration() = %v, want %v", got, tt.wantValue)
-				}
-
-			case "uint64":
-				var got uint64
-				if tt.defaultVal != nil {
-					got = GetUint64(tt.key, tt.defaultVal.(uint64))
-				} else {
-					got = GetUint64(tt.key)
-				}
-				if got != tt.wantValue.(uint64) {
-					t.Errorf("GetUint64() = %v, want %v", got, tt.wantValue)
-				}
-
-			case "float64":
-				var got float64
-				if tt.defaultVal != nil {
-					got = GetFloat64(tt.key, tt.defaultVal.(float64))
-				} else {
-					got = GetFloat64(tt.key)
-				}
-				if got != tt.wantValue.(float64) {
-					t.Errorf("GetFloat64() = %v, want %v", got, tt.wantValue)
-				}
+			if got := tt.call(tt.key); got != tt.want {
+				t.Errorf("call(%q) = %v, want %v", tt.key, got, tt.want)
 			}
 		})
 	}
@@ -187,6 +137,13 @@ func TestConvenienceLookup(t *testing.T) {
 	if ok {
 		t.Error("Lookup(\"MISSING\") ok = true, want false")
 	}
+
+	// Empty key is a miss, not an error
+	t.Run("empty key is a miss", func(t *testing.T) {
+		if value, ok := Lookup(""); ok || value != "" {
+			t.Errorf("Lookup(\"\") = (%q, %v), want (\"\", false)", value, ok)
+		}
+	})
 }
 
 func TestConvenienceSet(t *testing.T) {
@@ -263,6 +220,15 @@ func TestConvenienceNoLoader(t *testing.T) {
 		}
 	})
 
+	// From the former TestGetSlice_NoLoaderReturnsDefault: the caller's
+	// default comes back verbatim without a loader.
+	t.Run("GetSlice returns the default", func(t *testing.T) {
+		got := GetSlice[string]("KEY", []string{"fallback"})
+		if !sliceEqual(got, []string{"fallback"}) {
+			t.Errorf("GetSlice[string]() with no loader = %v, want [fallback]", got)
+		}
+	})
+
 	t.Run("Lookup returns empty and false", func(t *testing.T) {
 		if value, ok := Lookup("KEY"); ok || value != "" {
 			t.Errorf("Lookup() with no loader = (%q, %v), want (\"\", false)", value, ok)
@@ -320,6 +286,33 @@ func TestConvenienceNoLoader(t *testing.T) {
 	})
 }
 
+// TestGetSlice_WithDefaultLoader pins the WITH-loader branch of the
+// package-level GetSlice (convenience.go): with an initialized default
+// loader, the indexed key family is resolved against it.
+func TestGetSlice_WithDefaultLoader(t *testing.T) {
+	resetDefaultLoader()
+	defer resetDefaultLoader()
+
+	loader, err := New(DefaultConfig())
+	if err != nil {
+		t.Fatalf("New() error = %v", err)
+	}
+	defer func() { _ = loader.Close() }() // best-effort cleanup
+	for _, kv := range [][2]string{{"HOSTS_0", "a"}, {"HOSTS_1", "b"}} {
+		if err := loader.Set(kv[0], kv[1]); err != nil {
+			t.Fatalf("Set(%q) error = %v", kv[0], err)
+		}
+	}
+	if err := setDefaultLoader(loader); err != nil {
+		t.Fatalf("setDefaultLoader() error = %v", err)
+	}
+
+	got := GetSlice[string]("HOSTS")
+	if !sliceEqual(got, []string{"a", "b"}) {
+		t.Errorf("GetSlice[string](HOSTS) = %v, want [a b]", got)
+	}
+}
+
 // ============================================================================
 // Load Function Tests
 // ============================================================================
@@ -338,17 +331,23 @@ func TestLoadFiles_ThroughDefaultLoader(t *testing.T) {
 		verify   func(t *testing.T)
 	}{
 		{
-			name:  "dotenv file",
-			files: map[string]string{".env": "LOAD_KEY=load_value"},
+			// One row for both dotenv wiring paths: loadArgs nil means
+			// LoadFiles() with no arguments, which defaults to ".env" — the
+			// explicit-arguments path is exercised by the rows below.
+			name:  "dotenv file via the default filename",
+			files: map[string]string{".env": "LOAD_KEY=load_value\nDEFAULT_KEY=default_value"},
 			cfgFn: func() Config {
 				cfg := DefaultConfig()
 				cfg.AutoApply = true
 				return cfg
 			},
-			loadArgs: []string{".env"},
+			loadArgs: nil,
 			verify: func(t *testing.T) {
 				if got := GetString("LOAD_KEY"); got != "load_value" {
 					t.Errorf("GetString(\"LOAD_KEY\") = %q, want %q", got, "load_value")
+				}
+				if got := GetString("DEFAULT_KEY"); got != "default_value" {
+					t.Errorf("GetString(\"DEFAULT_KEY\") = %q, want %q", got, "default_value")
 				}
 			},
 		},
@@ -386,22 +385,11 @@ func TestLoadFiles_ThroughDefaultLoader(t *testing.T) {
 			},
 		},
 		{
-			name:  "default filename when no files specified",
-			files: map[string]string{".env": "DEFAULT_KEY=default_value"},
-			cfgFn: func() Config {
-				cfg := DefaultConfig()
-				cfg.AutoApply = true
-				return cfg
-			},
-			loadArgs: nil,
-			verify: func(t *testing.T) {
-				if got := GetString("DEFAULT_KEY"); got != "default_value" {
-					t.Errorf("GetString(\"DEFAULT_KEY\") = %q, want %q", got, "default_value")
-				}
-			},
-		},
-		{
-			name:  "json file flattened and uppercased",
+			// Wiring-only row: the structured file reaches the package-level
+			// accessors flattened and uppercased. The full flatten semantics
+			// (nesting, arrays, collisions) are covered by the edge-case
+			// tables in loader_test.go.
+			name:  "json file wiring: flattened and uppercased",
 			files: map[string]string{"config.json": `{"database": {"host": "db.example.com", "port": 3306}}`},
 			cfgFn: func() Config {
 				cfg := DefaultConfig()
@@ -413,13 +401,11 @@ func TestLoadFiles_ThroughDefaultLoader(t *testing.T) {
 				if got := GetString("DATABASE_HOST"); got != "db.example.com" {
 					t.Errorf("GetString(\"DATABASE_HOST\") = %q, want %q", got, "db.example.com")
 				}
-				if got := GetInt("DATABASE_PORT"); got != 3306 {
-					t.Errorf("GetInt(\"DATABASE_PORT\") = %d, want 3306", got)
-				}
 			},
 		},
 		{
-			name:  "yaml file flattened and uppercased",
+			// Wiring-only row, YAML counterpart of the JSON row above.
+			name:  "yaml file wiring: flattened and uppercased",
 			files: map[string]string{"config.yaml": "server:\n  host: yaml.example.com\n  port: 8443"},
 			cfgFn: func() Config {
 				cfg := DefaultConfig()
@@ -431,8 +417,28 @@ func TestLoadFiles_ThroughDefaultLoader(t *testing.T) {
 				if got := GetString("SERVER_HOST"); got != "yaml.example.com" {
 					t.Errorf("GetString(\"SERVER_HOST\") = %q, want %q", got, "yaml.example.com")
 				}
-				if got := GetInt("SERVER_PORT"); got != 8443 {
-					t.Errorf("GetInt(\"SERVER_PORT\") = %d, want 8443", got)
+			},
+		},
+		{
+			// Regression: keys containing literal dots (stored verbatim, e.g.
+			// "APNEWS.COM") must be reachable through Lookup, not only via
+			// All(). The value is a cookie-style string whose embedded JSON
+			// contains quotes, braces and commas — all plain-scalar data.
+			name:  "yaml dotted key with cookie-style value",
+			files: map[string]string{"config.yaml": "apnews.com: Code=scivqvknmzlrlloi; Visitor=scivqvknmzlrlloi; g_state={\"i_l\":0,\"i_e\":{\"enable_itp_optimization\":24},\"i_t\":1792402790803}"},
+			cfgFn: func() Config {
+				cfg := DefaultConfig()
+				cfg.AutoApply = true
+				return cfg
+			},
+			loadArgs: []string{"config.yaml"},
+			verify: func(t *testing.T) {
+				want := `Code=scivqvknmzlrlloi; Visitor=scivqvknmzlrlloi; g_state={"i_l":0,"i_e":{"enable_itp_optimization":24},"i_t":1792402790803}`
+				if got := GetString("apnews.com"); got != want {
+					t.Errorf("GetString(\"apnews.com\") = %q, want %q", got, want)
+				}
+				if got := GetString("APNEWS.COM"); got != want {
+					t.Errorf("GetString(\"APNEWS.COM\") = %q, want %q", got, want)
 				}
 			},
 		},
@@ -473,187 +479,141 @@ func TestLoadFiles_ThroughDefaultLoader(t *testing.T) {
 // ParseInto Function Tests
 // ============================================================================
 
+// TestParseInto consolidates the package-level ParseInto variants in one
+// table: plain env tags, inline envDefault fallbacks, and lowercase/dotted
+// tag resolution.
 func TestParseInto(t *testing.T) {
-	resetDefaultLoader()
-	defer resetDefaultLoader()
-
-	cfg := DefaultConfig()
-	loader, err := New(cfg)
-	if err != nil {
-		t.Fatalf("New() error = %v", err)
-	}
-
-	if err := loader.Set("APP_HOST", "localhost"); err != nil {
-		t.Fatalf("Set() error = %v", err)
-	}
-	if err := loader.Set("APP_PORT", "8080"); err != nil {
-		t.Fatalf("Set() error = %v", err)
-	}
-	if err := loader.Set("APP_DEBUG", "true"); err != nil {
-		t.Fatalf("Set() error = %v", err)
-	}
-
-	if err := setDefaultLoader(loader); err != nil {
-		t.Fatalf("setDefaultLoader() error = %v", err)
-	}
-
-	type AppConfig struct {
+	type appConfig struct {
 		Host  string `env:"APP_HOST"`
 		Port  int    `env:"APP_PORT"`
 		Debug bool   `env:"APP_DEBUG"`
 	}
-
-	var appCfg AppConfig
-	if err := ParseInto(&appCfg); err != nil {
-		t.Fatalf("ParseInto() error = %v", err)
-	}
-
-	if appCfg.Host != "localhost" {
-		t.Errorf("Host = %q, want %q", appCfg.Host, "localhost")
-	}
-	if appCfg.Port != 8080 {
-		t.Errorf("Port = %d, want 8080", appCfg.Port)
-	}
-	if appCfg.Debug != true {
-		t.Errorf("Debug = %v, want true", appCfg.Debug)
-	}
-}
-
-func TestParseInto_WithInlineDefault(t *testing.T) {
-	resetDefaultLoader()
-	defer resetDefaultLoader()
-
-	cfg := DefaultConfig()
-	loader, err := New(cfg)
-	if err != nil {
-		t.Fatalf("New() error = %v", err)
-	}
-
-	if err := setDefaultLoader(loader); err != nil {
-		t.Fatalf("setDefaultLoader() error = %v", err)
-	}
-
-	type Config struct {
+	type dbConfig struct {
 		Host string `env:"DB_HOST,envDefault:localhost"`
 		Port int    `env:"DB_PORT,envDefault:5432"`
 	}
-
-	var c Config
-	if err := ParseInto(&c); err != nil {
-		t.Fatalf("ParseInto() error = %v", err)
-	}
-
-	if c.Host != "localhost" {
-		t.Errorf("Host = %q, want %q", c.Host, "localhost")
-	}
-	if c.Port != 5432 {
-		t.Errorf("Port = %d, want 5432", c.Port)
-	}
-}
-
-func TestParseInto_LowercaseTag(t *testing.T) {
-	resetDefaultLoader()
-	defer resetDefaultLoader()
-
-	cfg := DefaultConfig()
-	loader, err := New(cfg)
-	if err != nil {
-		t.Fatalf("New() error = %v", err)
-	}
-
-	if err := loader.Set("DEEPSEEK_KEY", "sk-test-123"); err != nil {
-		t.Fatalf("Set() error = %v", err)
-	}
-	if err := loader.Set("DATABASE_HOST", "db.example.com"); err != nil {
-		t.Fatalf("Set() error = %v", err)
-	}
-
-	if err := setDefaultLoader(loader); err != nil {
-		t.Fatalf("setDefaultLoader() error = %v", err)
-	}
-
-	type Config struct {
+	type taggedConfig struct {
 		APIKey string `env:"deepseek_key"`
 		DBHost string `env:"database.host"`
 	}
 
-	var c Config
-	if err := ParseInto(&c); err != nil {
-		t.Fatalf("ParseInto() error = %v", err)
+	tests := []struct {
+		name      string
+		vars      map[string]string
+		newTarget func() any
+		check     func(t *testing.T, v any)
+	}{
+		{
+			name: "typed fields from env tags",
+			vars: map[string]string{"APP_HOST": "localhost", "APP_PORT": "8080", "APP_DEBUG": "true"},
+			newTarget: func() any {
+				return &appConfig{}
+			},
+			check: func(t *testing.T, v any) {
+				c := v.(*appConfig)
+				if c.Host != "localhost" {
+					t.Errorf("Host = %q, want %q", c.Host, "localhost")
+				}
+				if c.Port != 8080 {
+					t.Errorf("Port = %d, want 8080", c.Port)
+				}
+				if !c.Debug {
+					t.Errorf("Debug = %v, want true", c.Debug)
+				}
+			},
+		},
+		{
+			name: "inline envDefault applied when key missing",
+			vars: map[string]string{},
+			newTarget: func() any {
+				return &dbConfig{}
+			},
+			check: func(t *testing.T, v any) {
+				c := v.(*dbConfig)
+				if c.Host != "localhost" {
+					t.Errorf("Host = %q, want %q", c.Host, "localhost")
+				}
+				if c.Port != 5432 {
+					t.Errorf("Port = %d, want 5432", c.Port)
+				}
+			},
+		},
+		{
+			name: "lowercase and dotted tags resolve case-insensitively",
+			vars: map[string]string{"DEEPSEEK_KEY": "sk-test-123", "DATABASE_HOST": "db.example.com"},
+			newTarget: func() any {
+				return &taggedConfig{}
+			},
+			check: func(t *testing.T, v any) {
+				c := v.(*taggedConfig)
+				if c.APIKey != "sk-test-123" {
+					t.Errorf("APIKey = %q, want %q", c.APIKey, "sk-test-123")
+				}
+				if c.DBHost != "db.example.com" {
+					t.Errorf("DBHost = %q, want %q", c.DBHost, "db.example.com")
+				}
+			},
+		},
 	}
 
-	if c.APIKey != "sk-test-123" {
-		t.Errorf("APIKey = %q, want %q", c.APIKey, "sk-test-123")
-	}
-	if c.DBHost != "db.example.com" {
-		t.Errorf("DBHost = %q, want %q", c.DBHost, "db.example.com")
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			resetDefaultLoader()
+			defer resetDefaultLoader()
+
+			loader, err := New(DefaultConfig())
+			if err != nil {
+				t.Fatalf("New() error = %v", err)
+			}
+			for k, v := range tt.vars {
+				if err := loader.Set(k, v); err != nil {
+					t.Fatalf("Set(%q) error = %v", k, err)
+				}
+			}
+			if err := setDefaultLoader(loader); err != nil {
+				t.Fatalf("setDefaultLoader() error = %v", err)
+			}
+
+			target := tt.newTarget()
+			if err := ParseInto(target); err != nil {
+				t.Fatalf("ParseInto() error = %v", err)
+			}
+			tt.check(t, target)
+		})
 	}
 }
 
+// TestParseInto_EdgeCases covers the invalid-target shapes: each must return
+// an error instead of panicking.
 func TestParseInto_EdgeCases(t *testing.T) {
-	t.Run("nil target", func(t *testing.T) {
-		resetDefaultLoader()
-		defer resetDefaultLoader()
-
-		cfg := DefaultConfig()
-		loader, err := New(cfg)
-		if err != nil {
-			t.Fatalf("New() error = %v", err)
-		}
-		if err := setDefaultLoader(loader); err != nil {
-			t.Fatalf("setDefaultLoader() error = %v", err)
-		}
-
-		err = ParseInto(nil)
-		if err == nil {
-			t.Error("ParseInto(nil) should return error")
-		}
-	})
-
-	t.Run("non-pointer target", func(t *testing.T) {
-		resetDefaultLoader()
-		defer resetDefaultLoader()
-
-		cfg := DefaultConfig()
-		loader, err := New(cfg)
-		if err != nil {
-			t.Fatalf("New() error = %v", err)
-		}
-		if err := setDefaultLoader(loader); err != nil {
-			t.Fatalf("setDefaultLoader() error = %v", err)
-		}
-
-		type ConfigStruct struct {
-			Key string `env:"KEY"`
-		}
-		var c ConfigStruct
-
-		// Using loader.ParseInto with non-pointer should error
-		err = loader.ParseInto(c) // Not a pointer
-		if err == nil {
-			t.Error("ParseInto(non-pointer) should return error")
-		}
-	})
-
-	t.Run("pointer to non-struct", func(t *testing.T) {
-		resetDefaultLoader()
-		defer resetDefaultLoader()
-
-		cfg := DefaultConfig()
-		loader, err := New(cfg)
-		if err != nil {
-			t.Fatalf("New() error = %v", err)
-		}
-		if err := setDefaultLoader(loader); err != nil {
-			t.Fatalf("setDefaultLoader() error = %v", err)
-		}
-
-		var str string
-		err = loader.ParseInto(&str)
-		if err == nil {
-			t.Error("ParseInto(pointer to string) should return error")
-		}
-	})
+	tests := []struct {
+		name string
+		call func(l *Loader) error
+	}{
+		{"nil target", func(l *Loader) error { return l.ParseInto(nil) }},
+		{"non-pointer target", func(l *Loader) error {
+			type configStruct struct {
+				Key string `env:"KEY"`
+			}
+			var c configStruct
+			return l.ParseInto(c) // not a pointer
+		}},
+		{"pointer to non-struct", func(l *Loader) error {
+			var str string
+			return l.ParseInto(&str)
+		}},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			loader, err := New(DefaultConfig())
+			if err != nil {
+				t.Fatalf("New() error = %v", err)
+			}
+			if err := tt.call(loader); err == nil {
+				t.Errorf("ParseInto(%s) should return error", tt.name)
+			}
+		})
+	}
 }
 
 // ============================================================================
@@ -684,46 +644,245 @@ func TestInitWithConfig(t *testing.T) {
 	if v := GetString("CUSTOM_KEY"); v != "custom_value" {
 		t.Errorf("GetString(CUSTOM_KEY) = %q, want %q", v, "custom_value")
 	}
-
-	t.Run("already initialized error", func(t *testing.T) {
-		// Second call should fail
-		err := LoadWithConfig(cfg)
-		if err == nil {
-			t.Error("LoadWithConfig() should fail when already initialized")
-		}
-		if !errors.Is(err, ErrAlreadyInitialized) {
-			t.Errorf("LoadWithConfig() error = %v, want ErrAlreadyInitialized", err)
-		}
-	})
 }
 
 // ============================================================================
-// Load() Function Tests
+// Overload Tests
 // ============================================================================
 
-func TestLoad_AlreadyInitialized(t *testing.T) {
+// newRelativeTempDir creates a temporary directory INSIDE the package
+// directory and removes it when the test completes. The path validator
+// rejects absolute paths (drive letters, leading '/'), so t.TempDir() —
+// which is absolute — cannot be used for files fed to Load/Overload.
+func newRelativeTempDir(t *testing.T) string {
+	t.Helper()
+	dir, err := os.MkdirTemp(".", "envtest_")
+	if err != nil {
+		t.Fatalf("MkdirTemp: %v", err)
+	}
+	t.Cleanup(func() { _ = os.RemoveAll(dir) }) // test artifacts only
+	return dir
+}
+
+// TestOverload_MultiFileLastWins pins Overload's cross-file merge semantics
+// end to end through the public API, against Load's first-file-wins default
+// in the same scenario: with Overload a later file overrides an earlier one,
+// while keys unique to the earlier file still load.
+func TestOverload_MultiFileLastWins(t *testing.T) {
+	dir := newRelativeTempDir(t)
+	base := filepath.Join(dir, "base.env")
+	override := filepath.Join(dir, "override.env")
+	if err := os.WriteFile(base, []byte("SHARED_KEY=from_base\nONLY_BASE=base_value\n"), 0o600); err != nil {
+		t.Fatalf("WriteFile base.env: %v", err)
+	}
+	if err := os.WriteFile(override, []byte("SHARED_KEY=from_override\n"), 0o600); err != nil {
+		t.Fatalf("WriteFile override.env: %v", err)
+	}
+	// Load/Overload auto-apply to the real os.Environ and Close() does not
+	// unset applied variables; restore the process env for later tests.
+	t.Cleanup(func() {
+		_ = os.Unsetenv("SHARED_KEY") // best-effort test cleanup
+		_ = os.Unsetenv("ONLY_BASE")
+	})
+
+	// Load: the first file to set a key wins.
+	resetDefaultLoader()
+	defer resetDefaultLoader()
+	if err := Load(base, override); err != nil {
+		t.Fatalf("Load() error = %v", err)
+	}
+	if got := GetString("SHARED_KEY", ""); got != "from_base" {
+		t.Errorf("Load: SHARED_KEY = %q, want %q (first file wins)", got, "from_base")
+	}
+
+	// Overload: the later file wins; unique keys still load.
+	resetDefaultLoader()
+	if err := Overload(base, override); err != nil {
+		t.Fatalf("Overload() error = %v", err)
+	}
+	if got := GetString("SHARED_KEY", ""); got != "from_override" {
+		t.Errorf("Overload: SHARED_KEY = %q, want %q (later file wins)", got, "from_override")
+	}
+	if got := GetString("ONLY_BASE", ""); got != "base_value" {
+		t.Errorf("Overload: ONLY_BASE = %q, want %q (unique keys still load)", got, "base_value")
+	}
+}
+
+// TestOverload_JSONThenYAML mirrors the motivating use case: a JSON base
+// configuration refined by a YAML file. Structured keys flatten into one
+// key space, so the YAML value wins for shared keys and JSON-only keys
+// survive.
+func TestOverload_JSONThenYAML(t *testing.T) {
+	dir := newRelativeTempDir(t)
+	jsonFile := filepath.Join(dir, "config.json")
+	yamlFile := filepath.Join(dir, "config.yaml")
+	jsonDoc := `{"deepseek": {"key": "from_json", "model": "deepseek-v4-pro"}, "moonshot": {"key": "mk"}}`
+	yamlDoc := "deepseek:\n  key: from_yaml\n"
+	if err := os.WriteFile(jsonFile, []byte(jsonDoc), 0o600); err != nil {
+		t.Fatalf("WriteFile config.json: %v", err)
+	}
+	if err := os.WriteFile(yamlFile, []byte(yamlDoc), 0o600); err != nil {
+		t.Fatalf("WriteFile config.yaml: %v", err)
+	}
+	// Overload auto-applies to the real os.Environ; restore it for later
+	// tests. The applied names are the flattened "_"-joined forms.
+	t.Cleanup(func() {
+		_ = os.Unsetenv("DEEPSEEK_KEY") // best-effort test cleanup
+		_ = os.Unsetenv("DEEPSEEK_MODEL")
+		_ = os.Unsetenv("MOONSHOT_KEY")
+	})
+
+	resetDefaultLoader()
+	defer resetDefaultLoader()
+	if err := Overload(jsonFile, yamlFile); err != nil {
+		t.Fatalf("Overload() error = %v", err)
+	}
+	if got := GetString("deepseek.key", ""); got != "from_yaml" {
+		t.Errorf("deepseek.key = %q, want %q (YAML overrides JSON)", got, "from_yaml")
+	}
+	// The same value under its stored form: nested keys flatten with "_"
+	// (deepseek.key → DEEPSEEK_KEY), which is also the name applied to
+	// os.Environ — see the cleanup below.
+	if got := GetString("DEEPSEEK_KEY", ""); got != "from_yaml" {
+		t.Errorf("DEEPSEEK_KEY = %q, want %q (flattened storage form)", got, "from_yaml")
+	}
+	if got := GetString("deepseek.model", ""); got != "deepseek-v4-pro" {
+		t.Errorf("deepseek.model = %q, want %q (JSON-only key survives)", got, "deepseek-v4-pro")
+	}
+	if got := GetString("moonshot.key", ""); got != "mk" {
+		t.Errorf("moonshot.key = %q, want %q", got, "mk")
+	}
+}
+
+// TestOverload_ReplacesProcessEnv verifies the process-environment half of
+// the Overload contract: loaded values REPLACE variables already present in
+// os.Environ, where Load leaves existing process variables untouched.
+func TestOverload_ReplacesProcessEnv(t *testing.T) {
+	dir := newRelativeTempDir(t)
+	file := filepath.Join(dir, "overload.env")
+	if err := os.WriteFile(file, []byte("ENVTEST_OVERLOAD_KEY=from_file\n"), 0o600); err != nil {
+		t.Fatalf("WriteFile overload.env: %v", err)
+	}
+
+	// t.Setenv restores the original (unset) state after the test, once the
+	// deferred resetDefaultLoader has closed the loaders.
+	t.Setenv("ENVTEST_OVERLOAD_KEY", "from_process")
+
 	resetDefaultLoader()
 	defer resetDefaultLoader()
 
-	// First, initialize the default loader
-	cfg := DefaultConfig()
-	loader, err := New(cfg)
-	if err != nil {
-		t.Fatalf("New() error = %v", err)
+	// Load leaves the existing process variable untouched.
+	if err := Load(file); err != nil {
+		t.Fatalf("Load() error = %v", err)
+	}
+	if got := os.Getenv("ENVTEST_OVERLOAD_KEY"); got != "from_process" {
+		t.Errorf("process env after Load = %q, want %q (left untouched)", got, "from_process")
 	}
 
-	if err := setDefaultLoader(loader); err != nil {
-		t.Fatalf("setDefaultLoader() error = %v", err)
+	// Overload replaces it with the file value.
+	resetDefaultLoader()
+	if err := Overload(file); err != nil {
+		t.Fatalf("Overload() error = %v", err)
+	}
+	if got := os.Getenv("ENVTEST_OVERLOAD_KEY"); got != "from_file" {
+		t.Errorf("process env after Overload = %q, want %q (replaced by file value)", got, "from_file")
+	}
+}
+
+// TestDefaultLoaderAlreadyInitialized unifies the already-initialized
+// coverage: Load, Overload and LoadWithConfig share one default loader, so
+// whichever entrance initialized it, every later initialization call fails
+// with ErrAlreadyInitialized.
+func TestDefaultLoaderAlreadyInitialized(t *testing.T) {
+	// The file does not exist; FailOnMissingFile defaults to false, so the
+	// first initialization succeeds silently (see
+	// TestLoadMissingFileBehavior for the FailOnMissingFile matrix).
+	const missing = "envtest_no_such_file.env"
+
+	withMissingFile := func() Config {
+		cfg := DefaultConfig()
+		cfg.Filenames = []string{missing}
+		return cfg
 	}
 
-	// Now try to call Load() - should fail with ErrAlreadyInitialized
-	err = Load("test.env")
-	if err == nil {
-		t.Error("Load() should return error when default loader already initialized")
+	tests := []struct {
+		name   string
+		init   func() error // first call: must succeed
+		reinit func() error // second call: must fail with ErrAlreadyInitialized
+	}{
+		{"Load twice",
+			func() error { return Load(missing) },
+			func() error { return Load(missing) }},
+		{"Overload twice",
+			func() error { return Overload(missing) },
+			func() error { return Overload(missing) }},
+		{"Load after Overload",
+			func() error { return Overload(missing) },
+			func() error { return Load(missing) }},
+		{"LoadWithConfig twice",
+			func() error { return LoadWithConfig(withMissingFile()) },
+			func() error { return LoadWithConfig(withMissingFile()) }},
 	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			resetDefaultLoader()
+			defer resetDefaultLoader()
 
-	if err != ErrAlreadyInitialized {
-		t.Errorf("Load() error = %v, want ErrAlreadyInitialized", err)
+			if err := tt.init(); err != nil {
+				t.Fatalf("initial call error = %v, want nil", err)
+			}
+			if err := tt.reinit(); !errors.Is(err, ErrAlreadyInitialized) {
+				t.Errorf("second call error = %v, want ErrAlreadyInitialized", err)
+			}
+		})
+	}
+}
+
+// TestLoadMissingFileBehavior pins the FailOnMissingFile matrix across the
+// initialization entrances: with the default false a missing file is skipped
+// silently; FailOnMissingFile=true (only reachable through LoadWithConfig)
+// surfaces ErrFileNotFound.
+func TestLoadMissingFileBehavior(t *testing.T) {
+	const missing = "envtest_no_such_file.env"
+
+	tests := []struct {
+		name    string
+		init    func() error
+		wantErr bool
+	}{
+		{"Load with missing file succeeds silently",
+			func() error { return Load(missing) }, false},
+		{"Overload with missing file succeeds silently",
+			func() error { return Overload(missing) }, false},
+		{"LoadWithConfig with FailOnMissingFile=false succeeds silently", func() error {
+			cfg := DefaultConfig()
+			cfg.Filenames = []string{missing}
+			cfg.FailOnMissingFile = false
+			return LoadWithConfig(cfg)
+		}, false},
+		{"LoadWithConfig with FailOnMissingFile=true errors", func() error {
+			cfg := DefaultConfig()
+			cfg.Filenames = []string{missing}
+			cfg.FailOnMissingFile = true
+			return LoadWithConfig(cfg)
+		}, true},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			resetDefaultLoader()
+			defer resetDefaultLoader()
+
+			err := tt.init()
+			if tt.wantErr {
+				if !errors.Is(err, ErrFileNotFound) {
+					t.Errorf("error = %v, want ErrFileNotFound", err)
+				}
+				return
+			}
+			if err != nil {
+				t.Errorf("error = %v, want nil (missing file skipped)", err)
+			}
+		})
 	}
 }
 
@@ -827,6 +986,9 @@ func TestDelete(t *testing.T) {
 // GetSecure/Validate Function Tests
 // ============================================================================
 
+// TestGetSecure covers the package-level GetSecure in table form: a hit
+// returns a SecureValue whose Reveal exposes the secret, while any miss —
+// unknown or empty key — returns nil.
 func TestGetSecure(t *testing.T) {
 	resetDefaultLoader()
 	defer resetDefaultLoader()
@@ -845,36 +1007,33 @@ func TestGetSecure(t *testing.T) {
 		t.Fatalf("setDefaultLoader() error = %v", err)
 	}
 
-	sv := GetSecure("SECRET_KEY")
-	if sv == nil {
-		t.Fatal("GetSecure() returned nil, want non-nil")
+	tests := []struct {
+		name    string
+		key     string
+		wantNil bool
+	}{
+		{"existing key returns secure value", "SECRET_KEY", false},
+		{"non-existent key returns nil", "NON_EXISTENT_KEY", true},
+		{"empty key returns nil", "", true},
 	}
-
-	if sv.Reveal() != "secret_value" {
-		t.Errorf("GetSecure().Reveal() = %q, want %q", sv.Reveal(), "secret_value")
-	}
-
-	// Clean up
-	sv.Release()
-}
-
-func TestGetSecure_NotFound(t *testing.T) {
-	resetDefaultLoader()
-	defer resetDefaultLoader()
-
-	cfg := DefaultConfig()
-	loader, err := New(cfg)
-	if err != nil {
-		t.Fatalf("New() error = %v", err)
-	}
-
-	if err := setDefaultLoader(loader); err != nil {
-		t.Fatalf("setDefaultLoader() error = %v", err)
-	}
-
-	sv := GetSecure("NON_EXISTENT_KEY")
-	if sv != nil {
-		t.Errorf("GetSecure() for non-existent key = %v, want nil", sv)
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			sv := GetSecure(tt.key)
+			if tt.wantNil {
+				if sv != nil {
+					t.Errorf("GetSecure(%q) = %v, want nil", tt.key, sv)
+				}
+				return
+			}
+			if sv == nil {
+				t.Fatalf("GetSecure(%q) returned nil, want non-nil", tt.key)
+			}
+			if got := sv.Reveal(); got != "secret_value" {
+				t.Errorf("GetSecure(%q).Reveal() = %q, want %q", tt.key, got, "secret_value")
+			}
+			// Clean up
+			sv.Release()
+		})
 	}
 }
 
@@ -928,149 +1087,237 @@ func TestValidateRequiredKeys(t *testing.T) {
 	})
 }
 
+// TestGetSliceFrom drives every element type and resolution strategy through
+// one closure table. want is compared with reflect.DeepEqual, so a nil want
+// must be spelled as a typed nil slice ([]string(nil)) — DeepEqual
+// distinguishes nil from empty.
 func TestGetSliceFrom(t *testing.T) {
 	tests := []struct {
-		name         string
-		setupVars    map[string]string
-		key          string
-		wantString   []string
-		wantInt      []int
-		wantInt64    []int64
-		wantUint     []uint
-		wantUint64   []uint64
-		wantBool     []bool
-		wantFloat64  []float64
-		wantDuration []time.Duration
-		wantNil      bool
-		defaultStr   []string
-		defaultInt   []int
+		name      string
+		setupVars map[string]string
+		key       string
+		call      func(l *Loader, key string) any
+		want      any
 	}{
 		{
-			name:       "indexed keys string",
-			setupVars:  map[string]string{"PORTS_0": "8080", "PORTS_1": "8081", "PORTS_2": "8082"},
-			key:        "PORTS",
-			wantString: []string{"8080", "8081", "8082"},
+			name:      "indexed keys string",
+			setupVars: map[string]string{"PORTS_0": "8080", "PORTS_1": "8081", "PORTS_2": "8082"},
+			key:       "PORTS",
+			call:      func(l *Loader, key string) any { return GetSliceFrom[string](l, key) },
+			want:      []string{"8080", "8081", "8082"},
 		},
 		{
 			name:      "indexed keys int",
 			setupVars: map[string]string{"NUMBERS_0": "1", "NUMBERS_1": "2", "NUMBERS_2": "3"},
 			key:       "NUMBERS",
-			wantInt:   []int{1, 2, 3},
+			call:      func(l *Loader, key string) any { return GetSliceFrom[int](l, key) },
+			want:      []int{1, 2, 3},
 		},
 		{
 			name:      "indexed keys int64",
 			setupVars: map[string]string{"BIGS_0": "100", "BIGS_1": "200"},
 			key:       "BIGS",
-			wantInt64: []int64{100, 200},
+			call:      func(l *Loader, key string) any { return GetSliceFrom[int64](l, key) },
+			want:      []int64{100, 200},
 		},
 		{
 			name:      "indexed keys uint",
 			setupVars: map[string]string{"UNS_0": "10", "UNS_1": "20"},
 			key:       "UNS",
-			wantUint:  []uint{10, 20},
+			call:      func(l *Loader, key string) any { return GetSliceFrom[uint](l, key) },
+			want:      []uint{10, 20},
 		},
 		{
-			name:       "indexed keys uint64",
-			setupVars:  map[string]string{"U64S_0": "100", "U64S_1": "200"},
-			key:        "U64S",
-			wantUint64: []uint64{100, 200},
+			name:      "indexed keys uint64",
+			setupVars: map[string]string{"U64S_0": "100", "U64S_1": "200"},
+			key:       "U64S",
+			call:      func(l *Loader, key string) any { return GetSliceFrom[uint64](l, key) },
+			want:      []uint64{100, 200},
 		},
 		{
 			name:      "indexed keys bool",
 			setupVars: map[string]string{"FLAGS_0": "true", "FLAGS_1": "false", "FLAGS_2": "yes"},
 			key:       "FLAGS",
-			wantBool:  []bool{true, false, true},
+			call:      func(l *Loader, key string) any { return GetSliceFrom[bool](l, key) },
+			want:      []bool{true, false, true},
 		},
 		{
-			name:        "indexed keys float64",
-			setupVars:   map[string]string{"RATES_0": "1.5", "RATES_1": "2.5"},
-			key:         "RATES",
-			wantFloat64: []float64{1.5, 2.5},
+			name:      "indexed keys float64",
+			setupVars: map[string]string{"RATES_0": "1.5", "RATES_1": "2.5"},
+			key:       "RATES",
+			call:      func(l *Loader, key string) any { return GetSliceFrom[float64](l, key) },
+			want:      []float64{1.5, 2.5},
 		},
 		{
-			name:         "indexed keys duration",
-			setupVars:    map[string]string{"TIMES_0": "5s", "TIMES_1": "10m"},
-			key:          "TIMES",
-			wantDuration: []time.Duration{5 * time.Second, 10 * time.Minute},
+			name:      "indexed keys duration",
+			setupVars: map[string]string{"TIMES_0": "5s", "TIMES_1": "10m"},
+			key:       "TIMES",
+			call:      func(l *Loader, key string) any { return GetSliceFrom[time.Duration](l, key) },
+			want:      []time.Duration{5 * time.Second, 10 * time.Minute},
 		},
 		{
-			name:       "comma-separated string",
-			setupVars:  map[string]string{"HOSTS": "localhost,127.0.0.1,example.com"},
-			key:        "HOSTS",
-			wantString: []string{"localhost", "127.0.0.1", "example.com"},
+			name:      "comma-separated string",
+			setupVars: map[string]string{"HOSTS": "localhost,127.0.0.1,example.com"},
+			key:       "HOSTS",
+			call:      func(l *Loader, key string) any { return GetSliceFrom[string](l, key) },
+			want:      []string{"localhost", "127.0.0.1", "example.com"},
 		},
 		{
 			name:      "comma-separated int",
 			setupVars: map[string]string{"PORTS": "80,443,8080"},
 			key:       "PORTS",
-			wantInt:   []int{80, 443, 8080},
+			call:      func(l *Loader, key string) any { return GetSliceFrom[int](l, key) },
+			want:      []int{80, 443, 8080},
 		},
 		{
-			name:       "comma-separated with spaces",
-			setupVars:  map[string]string{"NAMES": "  alice , bob ,  charlie  "},
-			key:        "NAMES",
-			wantString: []string{"alice", "bob", "charlie"},
+			name:      "comma-separated with spaces",
+			setupVars: map[string]string{"NAMES": "  alice , bob ,  charlie  "},
+			key:       "NAMES",
+			call:      func(l *Loader, key string) any { return GetSliceFrom[string](l, key) },
+			want:      []string{"alice", "bob", "charlie"},
 		},
 		{
-			name:       "comma-separated empty parts skipped",
-			setupVars:  map[string]string{"ITEMS": "a,,b,,,c"},
-			key:        "ITEMS",
-			wantString: []string{"a", "b", "c"},
+			name:      "comma-separated empty parts skipped",
+			setupVars: map[string]string{"ITEMS": "a,,b,,,c"},
+			key:       "ITEMS",
+			call:      func(l *Loader, key string) any { return GetSliceFrom[string](l, key) },
+			want:      []string{"a", "b", "c"},
 		},
 		{
-			name:       "not found with default",
-			setupVars:  map[string]string{},
-			key:        "MISSING",
-			wantString: []string{"default1", "default2"},
-			defaultStr: []string{"default1", "default2"},
+			name:      "not found with default",
+			setupVars: map[string]string{},
+			key:       "MISSING",
+			call:      func(l *Loader, key string) any { return GetSliceFrom[string](l, key, []string{"default1", "default2"}) },
+			want:      []string{"default1", "default2"},
 		},
 		{
 			name:      "not found without default returns nil",
 			setupVars: map[string]string{},
 			key:       "MISSING",
-			wantNil:   true,
+			call:      func(l *Loader, key string) any { return GetSliceFrom[string](l, key) },
+			want:      []string(nil),
+		},
+		{
+			// GEN-001: a miss on the first candidate (the literal key) used to
+			// return the default from getSliceFromIndexedKeys, short-circuiting
+			// the candidate loop so data under the dot-notation candidate was
+			// never probed and the default shadowed real data.
+			name:      "default does not shadow dot-notation candidate data",
+			setupVars: map[string]string{"SERVICE_CORS_ALLOW_ORIGINS_0": "https://a.com", "SERVICE_CORS_ALLOW_ORIGINS_1": "https://b.com"},
+			key:       "service.cors.allow_origins",
+			call:      func(l *Loader, key string) any { return GetSliceFrom[string](l, key, []string{"fallback"}) },
+			want:      []string{"https://a.com", "https://b.com"},
+		},
+		{
+			// GEN-001, uppercase-path variant: the literal "DATABASE.PORTS"
+			// misses; the underscore-joined candidate holds the data.
+			name:      "default does not shadow uppercase-path candidate data",
+			setupVars: map[string]string{"DATABASE_PORTS_0": "3306"},
+			key:       "DATABASE.PORTS",
+			call:      func(l *Loader, key string) any { return GetSliceFrom[int](l, key, []int{5432}) },
+			want:      []int{3306},
+		},
+		{
+			// A comma-separated value under the first candidate is found data:
+			// it must win over the default exactly as it did before the fix.
+			name:      "comma value with default still wins",
+			setupVars: map[string]string{"HOSTS": "a,b"},
+			key:       "HOSTS",
+			call:      func(l *Loader, key string) any { return GetSliceFrom[string](l, key, []string{"fallback"}) },
+			want:      []string{"a", "b"},
+		},
+		{
+			// An existing-but-empty comma value falls back to the default via
+			// parseCommaSeparated("") while still counting as found.
+			name:      "empty comma value with default returns default",
+			setupVars: map[string]string{"EMPTY": ""},
+			key:       "EMPTY",
+			call:      func(l *Loader, key string) any { return GetSliceFrom[string](l, key, []string{"fallback"}) },
+			want:      []string{"fallback"},
+		},
+		{
+			// A comma value whose elements fail to parse discards the list and
+			// returns the default (documented semantics, unchanged by the fix).
+			name:      "comma parse failure with default returns default",
+			setupVars: map[string]string{"NUMS": "1,bad,3"},
+			key:       "NUMS",
+			call:      func(l *Loader, key string) any { return GetSliceFrom[int](l, key, []int{7}) },
+			want:      []int{7},
 		},
 		{
 			name:      "empty value returns nil",
 			setupVars: map[string]string{"EMPTY": ""},
 			key:       "EMPTY",
-			wantNil:   true,
+			call:      func(l *Loader, key string) any { return GetSliceFrom[string](l, key) },
+			want:      []string(nil),
 		},
 		{
-			name:       "parse error returns default",
-			setupVars:  map[string]string{"BAD_INT_0": "not_a_number"},
-			key:        "BAD_INT",
-			wantInt:    []int{42},
-			defaultInt: []int{42},
+			// A parse failure in the comma-separated fallback discards the
+			// whole list and returns the default.
+			name:      "parse error returns default",
+			setupVars: map[string]string{"BAD_INT_0": "not_a_number"},
+			key:       "BAD_INT",
+			call:      func(l *Loader, key string) any { return GetSliceFrom[int](l, key, []int{42}) },
+			want:      []int{42},
 		},
 		{
-			name:       "indexed keys take precedence over comma",
-			setupVars:  map[string]string{"KEY": "comma,separated", "KEY_0": "indexed0", "KEY_1": "indexed1"},
-			key:        "KEY",
-			wantString: []string{"indexed0", "indexed1"},
+			name:      "indexed keys take precedence over comma",
+			setupVars: map[string]string{"KEY": "comma,separated", "KEY_0": "indexed0", "KEY_1": "indexed1"},
+			key:       "KEY",
+			call:      func(l *Loader, key string) any { return GetSliceFrom[string](l, key) },
+			want:      []string{"indexed0", "indexed1"},
 		},
 		{
-			name:       "dot-notation path resolution",
-			setupVars:  map[string]string{"SERVICE_CORS_ALLOW_ORIGINS_0": "https://a.com", "SERVICE_CORS_ALLOW_ORIGINS_1": "https://b.com"},
-			key:        "service.cors.allow_origins",
-			wantString: []string{"https://a.com", "https://b.com"},
+			name:      "dot-notation path resolution",
+			setupVars: map[string]string{"SERVICE_CORS_ALLOW_ORIGINS_0": "https://a.com", "SERVICE_CORS_ALLOW_ORIGINS_1": "https://b.com"},
+			key:       "service.cors.allow_origins",
+			call:      func(l *Loader, key string) any { return GetSliceFrom[string](l, key) },
+			want:      []string{"https://a.com", "https://b.com"},
 		},
 		{
-			name:       "dot-notation with uppercase key",
-			setupVars:  map[string]string{"DATABASE_PORTS_0": "3306", "DATABASE_PORTS_1": "3307"},
-			key:        "DATABASE.PORTS",
-			wantString: []string{"3306", "3307"},
+			name:      "dot-notation with uppercase key",
+			setupVars: map[string]string{"DATABASE_PORTS_0": "3306", "DATABASE_PORTS_1": "3307"},
+			key:       "DATABASE.PORTS",
+			call:      func(l *Loader, key string) any { return GetSliceFrom[string](l, key) },
+			want:      []string{"3306", "3307"},
+		},
+		{
+			// Pinned from accessors.go getSliceFromIndexedKeys: the loop
+			// breaks at the first missing index, so only the elements before
+			// the gap are returned (SPARSE_2 is unreachable).
+			name:      "sparse index stops at the first gap",
+			setupVars: map[string]string{"SPARSE_0": "a", "SPARSE_2": "c"},
+			key:       "SPARSE",
+			call:      func(l *Loader, key string) any { return GetSliceFrom[string](l, key) },
+			want:      []string{"a"},
+		},
+		{
+			// Pinned from accessors.go (~L318-321): an indexed element that
+			// fails to parse is skipped while the remaining elements are
+			// kept — unlike the comma-separated fallback (see the
+			// "parse error returns default" row).
+			name:      "indexed element parse failure skipped, rest kept",
+			setupVars: map[string]string{"MIX_0": "1", "MIX_1": "bad", "MIX_2": "3"},
+			key:       "MIX",
+			call:      func(l *Loader, key string) any { return GetSliceFrom[int](l, key) },
+			want:      []int{1, 3},
+		},
+		{
+			name:      "empty key is a miss",
+			setupVars: map[string]string{},
+			key:       "",
+			call:      func(l *Loader, key string) any { return GetSliceFrom[string](l, key) },
+			want:      []string(nil),
 		},
 	}
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			cfg := DefaultConfig()
-			loader, err := New(cfg)
+			loader, err := New(DefaultConfig())
 			if err != nil {
 				t.Fatalf("New() error = %v", err)
 			}
-			defer loader.Close()
+			defer func() { _ = loader.Close() }() // best-effort cleanup
 
 			// Setup variables
 			for k, v := range tt.setupVars {
@@ -1079,112 +1326,130 @@ func TestGetSliceFrom(t *testing.T) {
 				}
 			}
 
-			// Test based on expected type
-			if tt.wantString != nil || tt.defaultStr != nil {
-				var got []string
-				if tt.defaultStr != nil {
-					got = GetSliceFrom[string](loader, tt.key, tt.defaultStr)
-				} else {
-					got = GetSliceFrom[string](loader, tt.key)
-				}
-				if !sliceEqual(got, tt.wantString) {
-					t.Errorf("GetSliceFrom[string]() = %v, want %v", got, tt.wantString)
-				}
-			}
-
-			if tt.wantInt != nil || tt.defaultInt != nil {
-				var got []int
-				if tt.defaultInt != nil {
-					got = GetSliceFrom[int](loader, tt.key, tt.defaultInt)
-				} else {
-					got = GetSliceFrom[int](loader, tt.key)
-				}
-				if !sliceEqual(got, tt.wantInt) {
-					t.Errorf("GetSliceFrom[int]() = %v, want %v", got, tt.wantInt)
-				}
-			}
-
-			if tt.wantInt64 != nil {
-				got := GetSliceFrom[int64](loader, tt.key)
-				if !sliceEqual(got, tt.wantInt64) {
-					t.Errorf("GetSliceFrom[int64]() = %v, want %v", got, tt.wantInt64)
-				}
-			}
-
-			if tt.wantUint != nil {
-				got := GetSliceFrom[uint](loader, tt.key)
-				if !sliceEqual(got, tt.wantUint) {
-					t.Errorf("GetSliceFrom[uint]() = %v, want %v", got, tt.wantUint)
-				}
-			}
-
-			if tt.wantUint64 != nil {
-				got := GetSliceFrom[uint64](loader, tt.key)
-				if !sliceEqual(got, tt.wantUint64) {
-					t.Errorf("GetSliceFrom[uint64]() = %v, want %v", got, tt.wantUint64)
-				}
-			}
-
-			if tt.wantBool != nil {
-				got := GetSliceFrom[bool](loader, tt.key)
-				if !sliceEqual(got, tt.wantBool) {
-					t.Errorf("GetSliceFrom[bool]() = %v, want %v", got, tt.wantBool)
-				}
-			}
-
-			if tt.wantFloat64 != nil {
-				got := GetSliceFrom[float64](loader, tt.key)
-				if !sliceEqual(got, tt.wantFloat64) {
-					t.Errorf("GetSliceFrom[float64]() = %v, want %v", got, tt.wantFloat64)
-				}
-			}
-
-			if tt.wantDuration != nil {
-				got := GetSliceFrom[time.Duration](loader, tt.key)
-				if !sliceEqual(got, tt.wantDuration) {
-					t.Errorf("GetSliceFrom[time.Duration]() = %v, want %v", got, tt.wantDuration)
-				}
-			}
-
-			if tt.wantNil {
-				got := GetSliceFrom[string](loader, tt.key)
-				if got != nil {
-					t.Errorf("GetSliceFrom[string]() = %v, want nil", got)
-				}
+			if got := tt.call(loader, tt.key); !reflect.DeepEqual(got, tt.want) {
+				t.Errorf("GetSliceFrom(%q) = %v, want %v", tt.key, got, tt.want)
 			}
 		})
 	}
 }
 
-func TestGetSliceFrom_NilLoader(t *testing.T) {
-	result := GetSliceFrom[string](nil, "KEY", []string{"default"})
-	if !sliceEqual(result, []string{"default"}) {
-		t.Errorf("GetSliceFrom with nil loader = %v, want [default]", result)
+// TestGetSliceFrom_MaxSliceSizeCap pins the DoS bound in
+// getSliceFromIndexedKeys (accessors.go): iteration stops at maxSliceSize
+// (10000) indexed keys even when all of them exist, so the returned slice is
+// capped at exactly that length.
+func TestGetSliceFrom_MaxSliceSizeCap(t *testing.T) {
+	const wantCap = 10000
+
+	loader, err := New(DefaultConfig())
+	if err != nil {
+		t.Fatalf("New() error = %v", err)
+	}
+	defer func() { _ = loader.Close() }() // best-effort cleanup
+
+	for i := 0; i < wantCap; i++ {
+		if err := loader.Set("CAPS_"+strconv.Itoa(i), strconv.Itoa(i)); err != nil {
+			t.Fatalf("Set(CAPS_%d) error = %v", i, err)
+		}
 	}
 
-	result = GetSliceFrom[string](nil, "KEY")
-	if result != nil {
-		t.Errorf("GetSliceFrom with nil loader and no default = %v, want nil", result)
+	got := GetSliceFrom[int](loader, "CAPS")
+	if len(got) != wantCap {
+		t.Fatalf("len(GetSliceFrom[int](loader, \"CAPS\")) = %d, want %d (maxSliceSize cap)", len(got), wantCap)
+	}
+	if got[0] != 0 || got[wantCap-1] != wantCap-1 {
+		t.Errorf("boundary elements = [%d, %d], want [0, %d]", got[0], got[wantCap-1], wantCap-1)
 	}
 }
 
-func TestGetSliceFrom_ClosedLoader(t *testing.T) {
+// TestGetSliceFrom_LiteralDottedKeys verifies slice access for keys that
+// literally contain dots. A YAML "apnews.com" array flattens to
+// APNEWS.COM_0/APNEWS.COM_1; before the ResolveBaseKeys fix GetSliceFrom
+// only probed the underscore-joined form (APNEWS_COM_0) and never found it.
+// The fixture loads from YAML because loader.Set rejects dotted keys under
+// the default key pattern (file loads allow them via IsValidJSONKey).
+func TestGetSliceFrom_LiteralDottedKeys(t *testing.T) {
+	fs := newTestFileSystem()
+	fs.files["config.yaml"] = "apnews.com:\n  - alpha\n  - beta\n  - gamma\n" +
+		"feeds.example.com: one, two, three\n" +
+		"database:\n  hosts:\n    - db1\n    - db2\n"
+
 	cfg := DefaultConfig()
+	cfg.FileSystem = fs
 	loader, err := New(cfg)
 	if err != nil {
 		t.Fatalf("New() error = %v", err)
 	}
-
-	loader.Close()
-
-	result := GetSliceFrom[string](loader, "KEY", []string{"default"})
-	if !sliceEqual(result, []string{"default"}) {
-		t.Errorf("GetSliceFrom with closed loader = %v, want [default]", result)
+	defer func() { _ = loader.Close() }() // best-effort cleanup
+	if err := loader.LoadFiles("config.yaml"); err != nil {
+		t.Fatalf("LoadFiles() error = %v", err)
 	}
 
-	result = GetSliceFrom[string](loader, "KEY")
-	if result != nil {
-		t.Errorf("GetSliceFrom with closed loader and no default = %v, want nil", result)
+	t.Run("indexed keys under literal dotted key", func(t *testing.T) {
+		got := GetSliceFrom[string](loader, "apnews.com")
+		if !sliceEqual(got, []string{"alpha", "beta", "gamma"}) {
+			t.Errorf("GetSliceFrom(\"apnews.com\") = %v, want [alpha beta gamma]", got)
+		}
+	})
+
+	t.Run("uppercase form of literal dotted key", func(t *testing.T) {
+		got := GetSliceFrom[string](loader, "APNEWS.COM")
+		if !sliceEqual(got, []string{"alpha", "beta", "gamma"}) {
+			t.Errorf("GetSliceFrom(\"APNEWS.COM\") = %v, want [alpha beta gamma]", got)
+		}
+	})
+
+	t.Run("comma-separated fallback under literal dotted key", func(t *testing.T) {
+		got := GetSliceFrom[string](loader, "feeds.example.com")
+		if !sliceEqual(got, []string{"one", "two", "three"}) {
+			t.Errorf("GetSliceFrom(\"feeds.example.com\") = %v, want [one two three]", got)
+		}
+	})
+
+	t.Run("nested dot-notation path still resolves", func(t *testing.T) {
+		got := GetSliceFrom[string](loader, "database.hosts")
+		if !sliceEqual(got, []string{"db1", "db2"}) {
+			t.Errorf("GetSliceFrom(\"database.hosts\") = %v, want [db1 db2]", got)
+		}
+	})
+
+	t.Run("missing dotted key returns default", func(t *testing.T) {
+		got := GetSliceFrom[string](loader, "nope.example", []string{"fallback"})
+		if !sliceEqual(got, []string{"fallback"}) {
+			t.Errorf("GetSliceFrom(\"nope.example\") = %v, want [fallback]", got)
+		}
+	})
+}
+
+// TestGetSliceFrom_UnavailableLoader covers both degenerate loaders in one
+// table: a nil loader and a closed loader behave like a miss — the default
+// when one is provided, nil otherwise.
+func TestGetSliceFrom_UnavailableLoader(t *testing.T) {
+	tests := []struct {
+		name     string
+		loaderFn func(t *testing.T) *Loader
+	}{
+		{"nil loader", func(t *testing.T) *Loader { return nil }},
+		{"closed loader", func(t *testing.T) *Loader {
+			t.Helper()
+			loader, err := New(DefaultConfig())
+			if err != nil {
+				t.Fatalf("New() error = %v", err)
+			}
+			_ = loader.Close() // best-effort cleanup
+			return loader
+		}},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			loader := tt.loaderFn(t)
+
+			if got := GetSliceFrom[string](loader, "KEY", []string{"default"}); !sliceEqual(got, []string{"default"}) {
+				t.Errorf("GetSliceFrom with default = %v, want [default]", got)
+			}
+			if got := GetSliceFrom[string](loader, "KEY"); got != nil {
+				t.Errorf("GetSliceFrom without default = %v, want nil", got)
+			}
+		})
 	}
 }
 
@@ -1201,6 +1466,11 @@ func sliceEqual[T comparable](a, b []T) bool {
 	return true
 }
 
+// TestLookup_CommaSeparatedFallback keeps the integration-representative
+// rows of the instance Lookup's indexed-access fallback (index-0 hit,
+// index-1 fallback, out-of-range miss); the full comma semantics matrix
+// (precedence, whitespace, non-indexed paths) lives in
+// internal/lookup_test.go.
 func TestLookup_CommaSeparatedFallback(t *testing.T) {
 	tests := []struct {
 		name      string
@@ -1210,21 +1480,14 @@ func TestLookup_CommaSeparatedFallback(t *testing.T) {
 		wantOK    bool
 	}{
 		{
-			name:      "indexed key takes precedence",
-			setupVars: map[string]string{"ORIGINS_0": "first", "ORIGINS": "second,third"},
-			key:       "origins.0",
-			wantValue: "first",
-			wantOK:    true,
-		},
-		{
-			name:      "comma-separated fallback",
+			name:      "comma-separated fallback index 0",
 			setupVars: map[string]string{"SERVICE_CORS_ALLOW_ORIGINS": "https://www.example.com,https://admin.example.com"},
 			key:       "service.cors.allow_origins.0",
 			wantValue: "https://www.example.com",
 			wantOK:    true,
 		},
 		{
-			name:      "comma-separated fallback second element",
+			name:      "comma-separated fallback index 1",
 			setupVars: map[string]string{"SERVICE_CORS_ALLOW_ORIGINS": "https://www.example.com,https://admin.example.com"},
 			key:       "service.cors.allow_origins.1",
 			wantValue: "https://admin.example.com",
@@ -1236,27 +1499,6 @@ func TestLookup_CommaSeparatedFallback(t *testing.T) {
 			key:       "service.cors.allow_origins.5",
 			wantValue: "",
 			wantOK:    false,
-		},
-		{
-			name:      "no indexed key and no comma-separated",
-			setupVars: map[string]string{},
-			key:       "service.cors.origins.0",
-			wantValue: "",
-			wantOK:    false,
-		},
-		{
-			name:      "comma-separated with whitespace",
-			setupVars: map[string]string{"SERVERS": "  host1 , host2 , host3  "},
-			key:       "servers.1",
-			wantValue: "host2",
-			wantOK:    true,
-		},
-		{
-			name:      "non-indexed path returns original value",
-			setupVars: map[string]string{"DATABASE_HOST": "localhost"},
-			key:       "database.host",
-			wantValue: "localhost",
-			wantOK:    true,
 		},
 	}
 
@@ -1280,46 +1522,5 @@ func TestLookup_CommaSeparatedFallback(t *testing.T) {
 					tt.key, gotValue, gotOK, tt.wantValue, tt.wantOK)
 			}
 		})
-	}
-}
-
-// TestGetSlice_WithDefaultLoader tests the GetSlice convenience function through the default loader.
-func TestGetSlice_WithDefaultLoader(t *testing.T) {
-	resetDefaultLoader()
-	defer resetDefaultLoader()
-
-	cfg := DefaultConfig()
-	loader, err := New(cfg)
-	if err != nil {
-		t.Fatalf("New() error = %v", err)
-	}
-
-	if err := loader.Set("PORTS_0", "8080"); err != nil {
-		t.Fatalf("Set() error = %v", err)
-	}
-	if err := loader.Set("PORTS_1", "8081"); err != nil {
-		t.Fatalf("Set() error = %v", err)
-	}
-
-	if err := setDefaultLoader(loader); err != nil {
-		t.Fatalf("setDefaultLoader() error = %v", err)
-	}
-
-	result := GetSlice[int]("PORTS")
-	if len(result) != 2 || result[0] != 8080 || result[1] != 8081 {
-		t.Errorf("GetSlice[int]() = %v, want [8080 8081]", result)
-	}
-
-	// Test with missing key returns default
-	resultDefault := GetSlice[int]("MISSING", []int{42})
-	if len(resultDefault) != 1 || resultDefault[0] != 42 {
-		t.Errorf("GetSlice[int]() with default = %v, want [42]", resultDefault)
-	}
-
-	// Test with no loader returns default
-	resetDefaultLoader()
-	noLoaderResult := GetSlice[string]("KEY", []string{"fallback"})
-	if len(noLoaderResult) != 1 || noLoaderResult[0] != "fallback" {
-		t.Errorf("GetSlice[string]() no loader = %v, want [fallback]", noLoaderResult)
 	}
 }

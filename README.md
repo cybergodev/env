@@ -21,7 +21,7 @@
 | 🚀 **One-Line Setup** | `env.Load(".env")` loads and applies to `os.Environ` |
 | 🔒 **Type Safety** | `GetString`, `GetInt`, `GetBool`, `GetDuration`, `GetSlice[T]` |
 | 📁 **Multi-Format** | Auto-detect `.env`, `.json`, `.yaml` files |
-| ⚡ **Thread Safety** | Sharded storage (8 shards) + RWMutex for high concurrency |
+| ⚡ **Thread Safety** | Sharded storage (32 shards) + RWMutex for high concurrency |
 | 🛡️ **Secure Memory** | `SecureValue` auto-zeroes sensitive data with memory pooling |
 | 🔄 **Variable Expansion** | Full `${VAR}` syntax with default values |
 | 📝 **Audit Logging** | Built-in JSON/Log/Channel handlers for compliance |
@@ -96,8 +96,15 @@ func main() {
 
 ```go
 // Load multiple files (with the default config the first value wins;
-// set cfg.OverwriteExisting = true to let later files override)
+// use Overload below to let later files override)
 if err := env.Load(".env", "config.json", ".env.local"); err != nil {
+    log.Fatal(err)
+}
+
+// Or: later files override earlier ones AND existing process env vars
+// (godotenv Overload convention — prefer Load when deployment-injected
+// variables must keep precedence over file values)
+if err := env.Overload("config.json", "config.yaml"); err != nil {
     log.Fatal(err)
 }
 
@@ -115,12 +122,58 @@ all := env.All()                  // Get all variables as map
 count := env.Len()                // Variable count
 ```
 
-> **Note:** Package-level functions (`GetString`, `Set`, `Lookup`, ...) require `Load()`
-> or `LoadWithConfig()` to be called first. Before initialization, `Get*`/`Lookup`/
+> **Note:** Package-level functions (`GetString`, `Set`, `Lookup`, ...) require `Load()`,
+> `Overload()` or `LoadWithConfig()` to be called first. Before initialization, `Get*`/`Lookup`/
 > `Keys`/`All`/`Len`/`GetSecure` silently return defaults/zero values, while `Set`,
 > `Delete`, `Validate`, and `ParseInto` return `ErrNotInitialized`.
-> `Load()` initializes the default loader exactly once; a second call returns
+> `Load()` initializes the default loader exactly once (the three initializers share one
+> default loader); a second call returns
 > `ErrAlreadyInitialized`. To reinitialize (e.g., between tests), call `ResetDefaultLoader()` first.
+
+### Duplicate Keys & Merge Order
+
+**Across files** (any mix of `.env`/`.json`/`.yaml` — nested keys flatten into one
+uppercased key space, so `DATABASE_HOST` in `.env` and `database: {host: ...}` in
+YAML are the same key): files load in list order. With the default
+(`OverwriteExisting = false`) the **first file wins** and later duplicates are
+skipped; with `true` later files override. The package-level `Overload`
+initializer is the shorthand for that setting (godotenv convention) — note
+that it also replaces variables already present in the process environment,
+which `Load` never does.
+
+**Within one file**, the default resolution is format-specific:
+
+| Format | Duplicate `KEY` resolves to |
+|--------|------------------------------|
+| `.env` | first occurrence when `OverwriteExisting=false` (default), last when `true` |
+| YAML | last occurrence (regardless of `OverwriteExisting`) |
+| JSON | last occurrence — `encoding/json` decode order (regardless of `OverwriteExisting`) |
+
+Set a `DuplicateKeyPolicy` to make this uniform or strict:
+
+```go
+cfg := env.DefaultConfig()
+cfg.DuplicateKeyPolicy = env.DuplicateKeyError // reject duplicate keys with env.ErrDuplicateKey
+// also available: DuplicateKeyFirstWins, DuplicateKeyLastWins, DuplicateKeyInherit (default)
+```
+
+Notes:
+
+- `DuplicateKeyFirstWins` applies to `.env` and YAML. For JSON data (including
+  inline JSON in YAML) a document that actually contains duplicate keys is
+  rejected — `encoding/json` discards earlier occurrences, so the policy cannot
+  be honored for it — while JSON documents without duplicates load unchanged.
+  Under `DuplicateKeyError` (and for the FirstWins check), JSON duplicates are
+  found by a conservative pre-scan that compares raw key bytes; escape-equivalent
+  spellings of the same key are not detected.
+- **Flat-key collisions always error** (any policy): two different source paths
+  that flatten to the same key (`a_b: 1` next to `a: {b: 2}`, a literal `a_0`
+  next to an array `a`, or keys differing only in case) previously resolved
+  nondeterministically by map iteration order; they now fail with
+  `env.ErrDuplicateKey`.
+- **Case:** YAML/JSON keys are uppercased when flattened; `.env` keys are stored
+  as written, so keys differing only in case do not collide across formats.
+  Lookups try the exact key first, then its uppercase form (see `Lookup`).
 
 ### Type Access
 
@@ -321,7 +374,8 @@ URL=${HOST}:${PORT}                    # → "localhost:8080"
 # Default value if unset (empty string is preserved)
 TIMEOUT=${TIMEOUT:-30s}
 
-# Assign default if unset (same behavior as :- in this library)
+# Assign default if unset — the assigned value becomes a real variable,
+# visible to later references in the same file and to Get/Apply
 NAME=${NAME:=default_value}
 
 # Required variable — error if unset or empty
@@ -330,6 +384,21 @@ API_KEY=${API_KEY:?API_KEY must be set}
 # Combined expansion
 FULL_URL=https://${HOST}:${PORT:-443}
 ```
+
+Two deliberate divergences from POSIX shell behavior:
+
+- **`${EMPTY:-default}` keeps the empty string** when `EMPTY` is set to "".
+  The `:-` default fires only when the variable is UNSET (an empty string is
+  a valid explicit value), unlike POSIX where `:-` fires on empty too.
+- **`${}` expands to the literal `{}`** rather than erroring with bash's
+  "bad substitution".
+
+`:=` assignment semantics: during a file load the expanded default is
+assigned to the variable — it becomes visible to references in keys that
+follow in the pass (keys are processed in sorted order, so the outcome is
+deterministic) and it materializes in the loaded map like any parsed
+variable. A variable that is already set (in the file or in the process
+environment) is never reassigned.
 
 ---
 
@@ -411,9 +480,9 @@ if err := loader.LoadFiles("app.env"); err != nil {
     log.Fatal(err)
 }
 // Output: {"timestamp":"...","action":"parse","reason":"parsed: app.env","success":true,"duration_ns":150000}
-//         {"timestamp":"...","action":"set","key":"[MASKED:7 chars]","reason":"loaded","success":true,"masked":true}
+//         {"timestamp":"...","action":"set","key":"[MASKED]","reason":"loaded","success":true,"masked":true}
 //
-// Sensitive keys (e.g. API_KEY) are masked as [MASKED:<len> chars] in audit output.
+// Sensitive keys (e.g. API_KEY) are masked as [MASKED] in audit output.
 ```
 
 **Built-in Handlers:**
@@ -464,12 +533,12 @@ func TestMain(m *testing.M) {
 env.IsSensitiveKey("API_SECRET")  // true
 env.IsSensitiveKey("HOST")        // false
 
-// Value masking — sensitive keys become "[MASKED:n chars]";
+// Value masking — sensitive keys become "[MASKED]";
 // non-sensitive values ≤ 20 chars pass through, longer ones are truncated + "..."
-env.MaskValue("API_KEY", "secret123")  // "[MASKED:9 chars]"
+env.MaskValue("API_KEY", "secret123")  // "[MASKED]"
 
-// Key masking for logging — keeps the first 2 chars + "***" (≤3 chars → "***")
-env.MaskKey("DB_PASSWORD")  // "DB***"
+// Key masking for logging — sensitive keys become "[MASKED]" (fixed token)
+env.MaskKey("DB_PASSWORD")  // "[MASKED]"
 
 // String sanitization
 safe := env.SanitizeForLog(userInput)
@@ -494,9 +563,11 @@ database_url, db_password, ssn, credit_card,
 mnemonic, seed, recovery, wallet, service_account
 ```
 
-> **Note:** This is a representative subset. The full list contains 40+ patterns.
-> Matching is substring-based and case-insensitive — a key like `MY_API_KEY`
-> matches because it contains `API_KEY`.
+> **Note:** This is a representative subset. The full list contains 50 patterns.
+> Matching is case-insensitive; most patterns match as substrings (a key like
+> `MY_API_KEY` matches because it contains `API_KEY`), while four short tokens
+> (`AUTH`, `PAN`, `PWD`, `USERNAME`) match only at identifier boundaries, so
+> keys like `AUTHOR` or `EXPAND` are not flagged.
 
 ---
 
@@ -519,8 +590,8 @@ env.ProductionConfig()  // Strict security + audit
 | `OverwriteExisting` | false | **true** | **true** | false |
 | `ValidateValues` | **true** | **true** | **true** | **true** |
 | `AuditEnabled` | false | false | false | **true** |
-| `MaxFileSize` | 2 MB | 10 MB | 64 KB | 64 KB |
-| `MaxVariables` | 500 | 500 | 50 | 50 |
+| `MaxFileSize` | 8 MB | 10 MB | 64 KB | 64 KB |
+| `MaxVariables` | 1,000 | 1,000 | 50 | 50 |
 
 ### Full Configuration Options
 
@@ -539,35 +610,41 @@ cfg.AllowedKeys    = []string{"PORT", "DEBUG"}  // Empty = allow all
 cfg.ForbiddenKeys  = []string{"PATH"}           // Block dangerous keys
 cfg.ValidateValues = true
 cfg.ValidateUTF8   = true
+cfg.KeyPattern     = nil                  // nil = DefaultKeyPattern
 
 // === Security Limits (LimitsConfig) ===
-cfg.MaxFileSize       = 2 << 20   // 2 MB
-cfg.MaxVariables      = 500
-cfg.MaxLineLength     = 1024
-cfg.MaxKeyLength      = 64
-cfg.MaxValueLength    = 4096
+cfg.MaxFileSize       = 8 << 20   // 8 MB
+cfg.MaxVariables      = 1000
+cfg.MaxLineLength     = 8192
+cfg.MaxKeyLength      = 128
+cfg.MaxValueLength    = 8192
 cfg.MaxExpansionDepth = 5
 
 // === Parsing (ParsingConfig) ===
-cfg.AllowExportPrefix = true    // Allow "export KEY=value"
-cfg.AllowYamlSyntax   = false   // YAML-style values in .env
-cfg.ExpandVariables   = true    // Expand ${VAR} references
+cfg.AllowExportPrefix  = true                     // Allow "export KEY=value"
+cfg.AllowYamlSyntax    = false                    // YAML-style values in .env
+cfg.ExpandVariables    = true                     // Expand ${VAR} (.env only; JSON/YAML never expand)
+cfg.DuplicateKeyPolicy = env.DuplicateKeyInherit  // Inherit / FirstWins / LastWins / Error
+cfg.ExpansionScope     = env.ExpansionFileOnly    // ${VAR} resolves from file variables only (SEC-03)
 
 // === JSON Options (JSONConfig) ===
 cfg.JSONNullAsEmpty    = true
 cfg.JSONNumberAsString = true
 cfg.JSONBoolAsString   = true
-cfg.JSONMaxDepth       = 10
+cfg.JSONMaxDepth       = 16
 
 // === YAML Options (YAMLConfig) ===
 cfg.YAMLNullAsEmpty    = true
 cfg.YAMLNumberAsString = true
 cfg.YAMLBoolAsString   = true
-cfg.YAMLMaxDepth       = 10
+cfg.YAMLMaxDepth       = 16
 
 // === Advanced (ComponentConfig) ===
-cfg.Prefix     = "APP_"      // Only load keys with prefix
-cfg.FileSystem = nil         // nil = OS filesystem
+cfg.Prefix          = "APP_"  // Only load keys with prefix
+cfg.FileSystem      = nil     // nil = OS filesystem
+cfg.CustomValidator = nil     // Replace built-in key/value validator
+cfg.CustomExpander  = nil     // Replace built-in variable expander
+cfg.CustomAuditor   = nil     // Replace built-in audit logger
 
 // === Audit Logging (ComponentConfig) ===
 cfg.AuditEnabled = true
@@ -578,16 +655,36 @@ cfg.AuditHandler = env.NewJSONAuditHandler(os.Stdout) // demo only; prefer a fil
 > `JSONConfig`, `YAMLConfig`, `ParsingConfig`, `ComponentConfig`) with field promotion.
 > You can access fields directly (`cfg.Filenames`) or explicitly (`cfg.FileConfig.Filenames`).
 
+> **Configuration style (API contract):** the `Config` struct is the single
+> configuration channel — the library has no functional options, and every
+> field has an explicit default in `DefaultConfig()`. Zero-value semantics:
+> a fully zero `Config{}` is treated as `DefaultConfig()` by `New`; a
+> partially-set Config is *not* auto-completed (unset limits fail `Validate`
+> with `ErrInvalidConfig`) — always start from `DefaultConfig()` or a preset.
+> A few process-wide knobs are deliberately not Config fields:
+> `SetMemoryLockEnabled` / `SetMemoryLockStrict`, `RegisterParser` /
+> `ForceRegisterParser`, and the `DefaultFileSystem` variable — set them at
+> program init.
+
 ### Default Limits
 
 | Setting | Default | Hard Limit |
 |---------|---------|------------|
-| MaxFileSize | 2 MB | 100 MB |
-| MaxLineLength | 1,024 chars | 64 KB |
-| MaxKeyLength | 64 chars | 1,024 chars |
-| MaxValueLength | 4,096 chars | 1 MB |
-| MaxVariables | 500 | 10,000 |
+| MaxFileSize | 8 MB | 100 MB |
+| MaxLineLength | 8,192 chars | 64 KB |
+| MaxKeyLength | 128 chars | 1,024 chars |
+| MaxValueLength | 8,192 chars | 1 MB |
+| MaxVariables | 1,000 | 10,000 |
 | MaxExpansionDepth | 5 | 20 |
+| JSONMaxDepth / YAMLMaxDepth | 16 | 100 |
+
+> **Line-length scope:** `MaxLineLength` applies to ALL formats, including JSON
+> and YAML. A minified (single-line) JSON document is one line for this purpose
+> and must fit within the limit — its hard cap is 64 KB, so a larger minified
+> document cannot be loaded by raising the config alone; pretty-print it instead.
+> The `.env` parser enforces `MaxVariables` mid-parse; JSON/YAML check the
+> flattened key count after parsing (memory during parsing is bounded by the
+> YAML token / JSON node caps instead).
 
 ---
 
@@ -616,7 +713,7 @@ if errors.As(err, &parseErr) {
 **Sentinel errors:** `ErrFileNotFound`, `ErrFileTooLarge`, `ErrLineTooLong`, `ErrInvalidKey`,
 `ErrForbiddenKey`, `ErrSecurityViolation`, `ErrInvalidValue`, `ErrMissingRequired`,
 `ErrMaxVariables`, `ErrExpansionDepth`, `ErrClosed`, `ErrInvalidConfig`,
-`ErrNotInitialized`, `ErrAlreadyInitialized`, `ErrDuplicateKey`
+`ErrNotInitialized`, `ErrAlreadyInitialized`, `ErrDuplicateKey`, `ErrAuditFailed`
 
 **Structured error types:** `ParseError` (file/line), `ValidationError`, `SecurityError`,
 `FileError`, `ExpansionError`, `JSONError`, `YAMLError`, `MarshalError` — check with
@@ -628,11 +725,21 @@ See [examples/09_error_handling](examples/09_error_handling/) for a runnable dem
 
 ## 📖 API Reference
 
+The two layers mirror each other: every package-level function below is a
+thin proxy for the same-named `Loader` method with the same signature
+(`env.GetString` ↔ `loader.GetString`, `env.Set` ↔ `loader.Set`, …). The
+exceptions: `Load` / `Overload` / `LoadWithConfig` initialize the shared
+default loader (instance counterpart: `New`); `GetSlice` pairs with
+`GetSliceFrom` (Go methods cannot take type parameters); and the stateless
+parse / marshal / utility / memory-lock / parser-registry families have no
+instance counterpart by design.
+
 ### Package Functions
 
 | Function | Description |
 |:---------|:------------|
 | `Load(files...)` | Load files and apply to `os.Environ` (one-time; see note above) |
+| `Overload(files...)` | Like `Load`, but later files override earlier ones and existing process env vars |
 | `LoadWithConfig(cfg)` | Load with custom config (forces `AutoApply = true`) |
 | `GetString(key, def...)` | Get string value |
 | `GetInt(key, def...)` | Get `int64` value |
@@ -653,7 +760,9 @@ See [examples/09_error_handling](examples/09_error_handling/) for a runnable dem
 | `ParseInto(&struct)` | Populate struct from env vars |
 | `Marshal(data, format?)` | Convert map/struct to format string |
 | `UnmarshalMap(string, format?)` | Parse format string to map |
+| `UnmarshalMapWithConfig(cfg, string, format?)` | One-shot parse with full Config semantics (policy, limits, validation) |
 | `UnmarshalStruct(string, &struct, format?)` | Parse string to struct |
+| `UnmarshalStructWithConfig(cfg, string, &struct, format?)` | Parse to struct with full Config semantics |
 | `UnmarshalInto(map, &struct)` | Populate struct from map |
 | `MarshalStruct(struct)` | Convert struct to map |
 | `IsMarshalError(err)` | Check if error is a marshal error |
@@ -661,7 +770,7 @@ See [examples/09_error_handling](examples/09_error_handling/) for a runnable dem
 | `DevelopmentConfig()` | Relaxed limits + overwrite enabled |
 | `TestingConfig()` | Tight limits, isolated testing |
 | `ProductionConfig()` | Strict security + audit enabled |
-| `New(cfg...)` | Create new loader (cfg optional; zero value → defaults) |
+| `New(cfg...)` | Create loader (at most 1 Config — passing more returns `ErrInvalidConfig`; fully-zero `Config{}` → `DefaultConfig()`; partial Config must start from `DefaultConfig()`) |
 | `NewSecureValue(string)` | Create SecureValue from string |
 | `NewSecureValueStrict(string)` | Create SecureValue with error on lock failure |
 | `ResetDefaultLoader()` | Reset singleton for testing (returns error) |
@@ -779,7 +888,7 @@ err := env.ForceRegisterParser(env.FormatEnv, customFactory)
 
 | Metric | Value |
 |:-------|:------|
-| **Sharded Concurrency** | 8 shards for parallel access |
+| **Sharded Concurrency** | 32 shards for parallel access |
 | **Memory Pooling** | Reusable SecureValue, Builder, Scanner pools |
 | **Zero Allocations** | Fast path for simple key lookups |
 | **Benchmarks** | Run `go test -bench=. -benchmem` |
@@ -795,15 +904,17 @@ Each example is a self-contained program in its own directory.
 |:--------|:------------|
 | [01_quickstart](examples/01_quickstart/) | Global mode basics: `Load`, typed accessors, `Lookup`, `Set` |
 | [02_loader_config](examples/02_loader_config/) | Instance mode, config presets, prefix filter, required keys, lifecycle |
-| [03_type_access](examples/03_type_access/) | All typed getters: string, int, bool, duration, float, uint, slice |
+| [03_type_access](examples/03_type_access/) | All typed getters: string, int, bool, duration, float, uint, slice (global + instance) |
 | [04_struct_mapping](examples/04_struct_mapping/) | Struct unmarshal/marshal with `env` tags, nested structs, defaults |
-| [05_secure_values](examples/05_secure_values/) | `SecureValue` lifecycle, `Close` vs `Release`, memory locking |
-| [06_audit_logging](examples/06_audit_logging/) | JSON, Channel, and Log audit handlers |
-| [07_marshal_unmarshal](examples/07_marshal_unmarshal/) | Format conversion: map ↔ string, struct ↔ map, multi-format output |
+| [05_secure_values](examples/05_secure_values/) | `SecureValue` lifecycle, `Close` vs `Release`, masked JSON, memory locking |
+| [06_audit_logging](examples/06_audit_logging/) | JSON, Channel, and Log audit handlers; `AuditEvent` fields |
+| [07_marshal_unmarshal](examples/07_marshal_unmarshal/) | Format conversion: map ↔ string, struct ↔ map, multi-format output, duplicate-key policy |
 | [08_utilities](examples/08_utilities/) | Introspection (`Keys`/`All`/`Len`), masking, format detection |
-| [09_error_handling](examples/09_error_handling/) | Sentinel errors (`errors.Is`), typed errors (`errors.As`) |
+| [09_error_handling](examples/09_error_handling/) | Sentinel errors (`errors.Is`), typed errors (`errors.As`), key policy, expansion errors |
 | [10_concurrency](examples/10_concurrency/) | Concurrent reads, writes, and mixed access |
-| [11_advanced](examples/11_advanced/) | Variable expansion, multiple file override, prefix filter |
+| [11_advanced](examples/11_advanced/) | Variable expansion (incl. file-only scope), multiple file override, prefix filter, global loader control |
+| [12_extensibility](examples/12_extensibility/) | Custom parser registration (`RegisterParser`), interface-based consumption (`EnvGetter`), custom components |
+| [13_customization](examples/13_customization/) | Custom `Validator`/`Expander`/`FileSystem`, fail-closed audit (`ErrAuditFailed`), custom `Marshaler`/`Unmarshaler`, brace operators |
 
 Shared data files for the examples live in [`examples/data/`](examples/data/).
 

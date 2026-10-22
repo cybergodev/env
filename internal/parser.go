@@ -1,4 +1,5 @@
-// Package internal provides internal line parsing utilities.
+// Provides internal line parsing utilities.
+
 package internal
 
 import (
@@ -6,13 +7,19 @@ import (
 	"strings"
 )
 
-// LineParserConfig holds the configuration needed for parsing.
+// LineParserConfig holds the configuration needed for line parsing.
+// Variable-count limits, the overwrite policy and expansion are enforced by
+// the callers that own the whole-file view (the root parser checks
+// MaxVariables over the parsed map, the loader applies the overwrite policy
+// when merging, and expansion runs as a separate pass); per-line parsing
+// needs only the two syntax switches below.
 type LineParserConfig struct {
 	AllowExportPrefix bool
 	AllowYamlSyntax   bool
-	OverwriteExisting bool
-	MaxVariables      int
-	ExpandVariables   bool
+	// ExpandVariables mirrors the root Config flag: the line parser needs it
+	// to know whether a double-quoted "\$" must survive as "$$" for the
+	// later expansion pass (see parseDoubleQuotedBytes).
+	ExpandVariables bool
 }
 
 // LineParser handles parsing of individual lines.
@@ -27,7 +34,11 @@ type LineParser struct {
 // NewLineParser creates a new LineParser.
 // The validators, auditor, and expander parameters accept interfaces rather than concrete types,
 // allowing for better testability and flexibility.
-// For the keyValidator parameter, you can pass the same object as valueValidator if it implements both interfaces.
+//
+// Value validation follows the keyValidator's capabilities: when it also
+// implements LineValueValidator (as the full internal Validator does), value
+// checks run; a keyValidator that does not leaves value validation off
+// entirely — construct through a full Validator to get both.
 func NewLineParser(cfg LineParserConfig, keyValidator LineKeyValidator, auditor LineAuditLogger, expander LineExpander) *LineParser {
 	// If keyValidator also implements LineValueValidator, use it for both
 	var valueValidator LineValueValidator
@@ -44,25 +55,47 @@ func NewLineParser(cfg LineParserConfig, keyValidator LineKeyValidator, auditor 
 	}
 }
 
-// SetValueValidator sets a separate value validator if needed.
-// This is useful when key and value validation are handled by different objects.
-func (p *LineParser) SetValueValidator(v LineValueValidator) {
-	p.valueValidator = v
+// hasNonSpace reports whether the line contains any byte other than space or
+// tab. Used to keep the no-separator audit quiet for whitespace-only input.
+func hasNonSpace(line []byte) bool {
+	for i := 0; i < len(line); i++ {
+		if line[i] != ' ' && line[i] != '\t' {
+			return true
+		}
+	}
+	return false
 }
 
 // ParseLineBytes parses a single line from a byte slice and returns the key and value.
 // This version avoids string allocation by working directly with bytes.
 func (p *LineParser) ParseLineBytes(line []byte) (string, string, error) {
+	key, value, _, err := p.parseLineBytes(line)
+	return key, value, err
+}
+
+// ParseLineBytesQuote is ParseLineBytes that additionally reports whether the
+// value was single-quoted. Single-quoted .env values are literal (bash '...'
+// semantics): the caller must exempt them from variable expansion, and a '$'
+// inside them stays a literal dollar.
+func (p *LineParser) ParseLineBytesQuote(line []byte) (string, string, bool, error) {
+	return p.parseLineBytes(line)
+}
+
+// parseLineBytes is the shared line-parsing core behind ParseLineBytes and
+// ParseLineBytesQuote.
+func (p *LineParser) parseLineBytes(line []byte) (string, string, bool, error) {
 	// Fast path for empty or very short lines
 	if len(line) == 0 {
-		return "", "", nil
+		return "", "", false, nil
 	}
 
 	// Handle export prefix - use byte-level comparison to avoid string allocation
 	if p.config.AllowExportPrefix && len(line) > 7 {
-		// Check for "export " prefix (7 characters: e-x-p-o-r-t-space)
+		// Check for "export " prefix (7 characters: e-x-p-o-r-t plus a
+		// space OR a tab — bash accepts both after export)
 		if line[0] == 'e' && line[1] == 'x' && line[2] == 'p' &&
-			line[3] == 'o' && line[4] == 'r' && line[5] == 't' && line[6] == ' ' {
+			line[3] == 'o' && line[4] == 'r' && line[5] == 't' &&
+			(line[6] == ' ' || line[6] == '\t') {
 			line = line[7:]
 		}
 	}
@@ -73,13 +106,28 @@ func (p *LineParser) ParseLineBytes(line []byte) (string, string, error) {
 	// the per-byte comparison cost at that length.
 	sepIdx := -1
 	for i := 0; i < len(line); i++ {
-		if line[i] == '=' || line[i] == ':' {
+		if line[i] == '=' {
+			sepIdx = i
+			break
+		}
+		// ':' separates only in YAML-syntax mode. With the flag off (the
+		// default), prose lines like "See: https://example.com" previously
+		// parsed as a variable named "See"; they are now dropped (and
+		// audited) as no-separator lines, matching peer .env parsers.
+		if line[i] == ':' && p.config.AllowYamlSyntax {
 			sepIdx = i
 			break
 		}
 	}
 	if sepIdx == -1 {
-		return "", "", nil // No assignment on this line
+		// A non-blank line without a separator is dropped by contract
+		// (empty key, caller skips it). Audit the drop so a typo like a
+		// missing '=' is observable when auditing is enabled — the line
+		// content goes through MaskInString, never in raw form.
+		if hasNonSpace(line) {
+			_ = p.auditor.LogError(ActionParse, "", "no separator, line skipped: "+MaskInString(string(line)))
+		}
+		return "", "", false, nil // No assignment on this line
 	}
 
 	// Trim key using byte-level operations
@@ -103,32 +151,39 @@ func (p *LineParser) ParseLineBytes(line []byte) (string, string, error) {
 
 	// Validate key
 	if err := p.keyValidator.ValidateKey(key); err != nil {
-		return "", "", err
+		return "", "", false, err
 	}
 
 	// Parse the value
 	value := line[sepIdx+1:]
-	parsedValue, err := p.ParseValueBytes(value)
+	parsedValue, singleQuoted, err := p.parseValueBytes(value)
 	if err != nil {
-		return "", "", err
+		return "", "", false, err
 	}
 
 	// Validate value
 	if p.valueValidator != nil {
 		if err := p.valueValidator.ValidateValue(parsedValue); err != nil {
-			return "", "", err
+			return "", "", false, err
 		}
 	}
 
-	return key, parsedValue, nil
+	return key, parsedValue, singleQuoted, nil
 }
 
 // ParseValueBytes parses a value from a byte slice handling quotes and escapes.
 // This version avoids string allocation until the final result.
 func (p *LineParser) ParseValueBytes(value []byte) (string, error) {
+	s, _, err := p.parseValueBytes(value)
+	return s, err
+}
+
+// parseValueBytes is ParseValueBytes that additionally reports whether the
+// value was single-quoted (see ParseLineBytesQuote for why callers need this).
+func (p *LineParser) parseValueBytes(value []byte) (string, bool, error) {
 	// Fast path for empty value
 	if len(value) == 0 {
-		return "", nil
+		return "", false, nil
 	}
 
 	// Fast byte-level trim for leading/trailing whitespace
@@ -143,30 +198,51 @@ func (p *LineParser) ParseValueBytes(value []byte) (string, error) {
 	value = value[start:end]
 
 	if len(value) == 0 {
-		return "", nil
+		return "", false, nil
 	}
 
-	// Handle quoted values
+	// Handle quoted values. A closing quote followed by whitespace and an
+	// inline '#' comment is accepted — KEY="v" # note previously failed the
+	// whole file because the quoted parsers demanded the final byte be the
+	// quote.
 	switch value[0] {
-	case '"':
-		return ParseDoubleQuotedBytes(value)
-	case '\'':
-		return ParseSingleQuotedBytes(value)
+	case '"', '\'':
+		quote := value[0]
+		end := findClosingQuote(value, quote)
+		if end == -1 {
+			return "", false, ErrInvalidValue
+		}
+		rest := value[end+1:]
+		j := 0
+		for j < len(rest) && (rest[j] == ' ' || rest[j] == '\t') {
+			j++
+		}
+		if j < len(rest) && (rest[j] != '#' || j == 0) {
+			return "", false, ErrInvalidValue // junk after the closing quote
+		}
+		if quote == '\'' {
+			s, err := ParseSingleQuotedBytes(value[:end+1])
+			return s, true, err
+		}
+		s, err := parseDoubleQuotedBytes(value[:end+1], p.config.ExpandVariables)
+		return s, false, err
 	}
 
 	// Handle YAML-style values if enabled
 	if p.config.AllowYamlSyntax {
 		if unquoted, ok := TryParseYamlValueBytes(value); ok {
-			return unquoted, nil
+			return unquoted, false, nil
 		}
 	}
 
 	// Unquoted value - remove inline comments using byte-level search
-	// Find " #" pattern (need at least 2 characters for this pattern)
+	// Find the " #" pattern — a '#' preceded by a space OR a tab (bash
+	// starts comments after any whitespace; the tab form previously stayed
+	// in the value).
 	commentIdx := -1
 	if len(value) >= 2 {
 		for i := 0; i < len(value)-1; i++ {
-			if value[i] == ' ' && value[i+1] == '#' {
+			if (value[i] == ' ' || value[i] == '\t') && value[i+1] == '#' {
 				commentIdx = i
 				break
 			}
@@ -187,7 +263,56 @@ func (p *LineParser) ParseValueBytes(value []byte) (string, error) {
 	// overwritten on the next Scan() call. Without this copy, the returned
 	// string would become corrupted when the buffer is reused.
 	// The allocation cost is necessary for memory safety.
-	return string(value), nil
+	return string(value), false, nil
+}
+
+// ParseBoolLoose is the library-wide boolean grammar, shared by the typed
+// getters (GetBool, GetSlice[bool]) and the struct mapper (ParseInto /
+// UnmarshalInto / []bool fields): 1/0, no/on, yes/off, true/false,
+// enabled/disabled, ASCII case-insensitive. Previously the two layers used
+// two grammars — accessors accepted "yes" while struct mapping (strict
+// strconv.ParseBool) rejected it — so the same string parsed differently
+// depending on the API. ok is false for anything else; the caller decides
+// the error shape.
+func ParseBoolLoose(s string) (value bool, ok bool) {
+	n := len(s)
+	switch n {
+	case 1:
+		if s[0] == '1' || s[0] == '0' {
+			return s[0] == '1', true
+		}
+	case 2:
+		if EqualFoldASCII(s, "no") {
+			return false, true
+		}
+		if EqualFoldASCII(s, "on") {
+			return true, true
+		}
+	case 3:
+		if EqualFoldASCII(s, "yes") {
+			return true, true
+		}
+		if EqualFoldASCII(s, "off") {
+			return false, true
+		}
+	case 4:
+		if EqualFoldASCII(s, "true") {
+			return true, true
+		}
+	case 5:
+		if EqualFoldASCII(s, "false") {
+			return false, true
+		}
+	case 7:
+		if EqualFoldASCII(s, "enabled") {
+			return true, true
+		}
+	case 8:
+		if EqualFoldASCII(s, "disabled") {
+			return false, true
+		}
+	}
+	return false, false
 }
 
 // escapeTable provides O(1) lookup for escape sequence translation.
@@ -200,6 +325,16 @@ var escapeTable = [256]byte{
 
 // ParseDoubleQuotedBytes handles double-quoted values from a byte slice with escape sequences.
 func ParseDoubleQuotedBytes(value []byte) (string, error) {
+	return parseDoubleQuotedBytes(value, false)
+}
+
+// parseDoubleQuotedBytes is ParseDoubleQuotedBytes with a mode for values
+// that will later pass through variable expansion: keepDollarEscape re-emits
+// an escaped dollar as "$$", which the expander folds back to one literal
+// dollar. Without it the unescape below would turn "\$5" into "$5" and the
+// expansion pass would then treat the $5 as a reference — the exact escape
+// the syntax exists to provide would be destroyed by the two-pass design.
+func parseDoubleQuotedBytes(value []byte, keepDollarEscape bool) (string, error) {
 	if len(value) < 2 || value[len(value)-1] != '"' {
 		return "", ErrInvalidValue
 	}
@@ -236,11 +371,21 @@ func ParseDoubleQuotedBytes(value []byte) (string, error) {
 		c := content[i]
 		if c == '\\' && i+1 < len(content) {
 			escaped := content[i+1]
+			if escaped == '$' && keepDollarEscape {
+				// Preserve the escape across the later expansion pass (see
+				// the function comment).
+				*buf = append(*buf, '$', '$')
+				i += 2
+				continue
+			}
 			// Use lookup table for O(1) escape translation
 			if translated := escapeTable[escaped]; translated != 0 {
 				*buf = append(*buf, translated)
 			} else {
-				*buf = append(*buf, escaped)
+				// Unknown escape keeps its backslash (bash semantics):
+				// "C:\Users\foo" previously lost every backslash, and
+				// "\temp" turned into a TAB.
+				*buf = append(*buf, '\\', escaped)
 			}
 			i += 2
 		} else {
@@ -253,6 +398,25 @@ func ParseDoubleQuotedBytes(value []byte) (string, error) {
 	// returned to the pool and potentially reused by other goroutines.
 	// Using bytesToString here would cause data corruption when the buffer is reused.
 	return string(*buf), nil
+}
+
+// findClosingQuote returns the index of the quote character that closes the
+// quoted value opening at value[0], or -1 when unterminated. Double-quoted
+// content skips \<char> escape pairs; single-quoted content has no escapes,
+// so the first quote closes (the historical last-byte-is-a-quote check
+// mis-parsed pathological inputs such as "'a'b'" as a'b).
+func findClosingQuote(value []byte, quote byte) int {
+	for i := 1; i < len(value); i++ {
+		c := value[i]
+		if quote == '"' && c == '\\' {
+			i++ // skip the escaped character
+			continue
+		}
+		if c == quote {
+			return i
+		}
+	}
+	return -1
 }
 
 // ParseSingleQuotedBytes handles single-quoted values from a byte slice (no escape processing).
@@ -319,18 +483,29 @@ func IsYamlNumberBytes(s []byte) bool {
 	return hasDigit
 }
 
-// ExpandAll expands all variables in the map.
+// ExpandAll expands all variables in the map. The noExpand set names keys
+// whose values were single-quoted and must pass through literally (nil
+// expands everything). Exempt values still serve as lookup sources for
+// other references — expansion inserts looked-up text without rescanning it.
 // Returns the original map if no expansion is needed, avoiding unnecessary allocations.
 // This method delegates to Expander.ExpandAllInMap for the actual expansion logic.
-func (p *LineParser) ExpandAll(vars map[string]string) (map[string]string, error) {
+func (p *LineParser) ExpandAll(vars map[string]string, noExpand map[string]struct{}) (map[string]string, error) {
 	// Type assert to concrete Expander type to access optimized ExpandAllInMap
 	// This is safe because we always use *Expander internally
 	if expander, ok := p.expander.(*Expander); ok {
-		result, err := expander.ExpandAllInMap(vars)
+		result, err := expander.ExpandAllInMap(vars, noExpand)
 		if err != nil {
-			// Log cycle detection errors
+			// Log the failure with its actual cause — ":?" required-variable
+			// and depth errors previously all logged as "cycle detected".
 			if expErr, ok := err.(*ExpansionError); ok && expErr.Key != "" {
-				_ = p.auditor.LogError(ActionExpand, expErr.Key, "cycle detected")
+				msg := "expansion depth exceeded"
+				switch {
+				case expErr.Kind == ExpansionRequiredKind:
+					msg = "required variable not set"
+				case strings.Contains(expErr.Chain, "cycle"):
+					msg = "cycle detected"
+				}
+				_ = p.auditor.LogError(ActionExpand, expErr.Key, msg)
 			}
 			return nil, err
 		}
@@ -338,12 +513,12 @@ func (p *LineParser) ExpandAll(vars map[string]string) (map[string]string, error
 	}
 
 	// Fallback: expand manually using the interface method
-	return p.expandAllUsingInterface(vars)
+	return p.expandAllUsingInterface(vars, noExpand)
 }
 
 // expandAllUsingInterface expands all variables using the VariableExpander interface.
 // This is used when the expander is not the built-in *Expander type.
-func (p *LineParser) expandAllUsingInterface(vars map[string]string) (map[string]string, error) {
+func (p *LineParser) expandAllUsingInterface(vars map[string]string, noExpand map[string]struct{}) (map[string]string, error) {
 	// Fast path: check if any values need expansion
 	needsExpansion := false
 	for _, value := range vars {
@@ -361,6 +536,11 @@ func (p *LineParser) expandAllUsingInterface(vars map[string]string) (map[string
 	// Expand all values using the interface method
 	result := make(map[string]string, len(vars))
 	for key, value := range vars {
+		// Single-quoted values are literal for custom expanders too.
+		if _, literal := noExpand[key]; literal {
+			result[key] = value
+			continue
+		}
 		expanded, err := p.expander.Expand(value)
 		if err != nil {
 			_ = p.auditor.LogError(ActionExpand, key, err.Error())

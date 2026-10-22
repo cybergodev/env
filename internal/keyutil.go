@@ -1,8 +1,11 @@
-// Package internal provides key validation utilities.
+// Provides key validation utilities.
+
 package internal
 
 import (
+	"strings"
 	"sync"
+	"sync/atomic"
 )
 
 // Hash constant for multiplicative hashing.
@@ -21,20 +24,31 @@ const (
 	numShards       = 8 // Increased from 4 for better concurrency on modern CPUs
 )
 
+// internEntry is the immutable unit stored in both the shard maps and the
+// front-cache slots. The cache maps hold *internEntry (not bare strings) so
+// publishing a hit into a front slot reuses the existing pointer: taking the
+// address of a string local to make a *string would force that local to
+// escape, and the compiler would heap-allocate it on EVERY slow-path call —
+// measured as +16 B/op on parses whose keys lost their slot to a collision —
+// even on calls that never store.
+type internEntry struct {
+	key string
+}
+
 // internShard represents a single shard of the intern cache.
 // Uses a single mutex (not RWMutex) for better cache locality and
 // simpler lock management. The cache is small enough that RWMutex
 // overhead outweighs its benefits.
 type internShard struct {
 	mu    sync.Mutex
-	cache map[string]string
+	cache map[string]*internEntry
 }
 
 var internShards [numShards]internShard
 
 func init() {
 	for i := range numShards {
-		internShards[i].cache = make(map[string]string, maxInternSize)
+		internShards[i].cache = make(map[string]*internEntry, maxInternSize)
 	}
 }
 
@@ -47,8 +61,28 @@ func init() {
 // Performance notes:
 //   - For keys 1-4 chars (the common case) the bytes are combined with fixed
 //     indexing rather than a loop.
-//   - shards==8 (the only value used in this package) maps to a single AND.
+//   - Power-of-two shard counts (the only values used in this package) map to
+//     a single AND.
 func HashKey(key string, shards int) uint32 {
+	hash := hashKeyRaw(key)
+
+	// Defensive: shards <= 0 has no valid answer; returning 0 keeps this a
+	// total function instead of panicking on the modulo below. All current
+	// callers pass power-of-two constants (8, 32), so this arm is latent.
+	if shards <= 0 {
+		return 0
+	}
+	// Power-of-two shard counts (all current callers) reduce to a single AND,
+	// which the compiler constant-folds when shards is a constant argument.
+	if shards&(shards-1) == 0 {
+		return hash & uint32(shards-1)
+	}
+	return hash % uint32(shards)
+}
+
+// hashKeyRaw is HashKey before the shard-range reduction: the full 32-bit hash
+// from which both the shard index and the intern front-cache slot are derived.
+func hashKeyRaw(key string) uint32 {
 	keyLen := len(key)
 	if keyLen == 0 {
 		return 0
@@ -105,12 +139,7 @@ func HashKey(key string, shards int) uint32 {
 			}
 		}
 	}
-
-	// Single optimization point for shards==8
-	if shards == 8 {
-		return hash & 7
-	}
-	return hash % uint32(shards)
+	return hash
 }
 
 // getShard returns the shard for a given key using HashKey.
@@ -118,15 +147,65 @@ func getShard(key string) *internShard {
 	return &internShards[HashKey(key, numShards)]
 }
 
+// internFrontSlots is the slot count of the lock-free front cache in front of
+// the sharded intern maps. It must be a power of two (slot selection masks).
+// Slots are filled once and never displaced (see InternKeyBytes), so the
+// count is sized to keep fill-time collisions rare for realistic key counts
+// (~5 colliding pairs per 100 keys at 1024 slots; 8KB of static storage).
+const internFrontSlots = 1024
+
+// internFront is a direct-mapped atomic cache indexed by an independent
+// position-dependent hash of the key bytes. A hit returns without touching the
+// shard mutex; a miss falls through to the locked sharded map, which remains
+// the authoritative store. Profiling showed the shard lock + map probe at
+// ~11% of .env parse CPU with all-hits traffic, dominated by the mutex
+// round-trip; the atomic load removes it.
+//
+// Concurrency: entries are immutable once published, so readers only need the
+// atomic load/store ordering. A slot may point at an entry that the sharded
+// map has since evicted — the string is still valid, stable memory, which is
+// all the interning contract requires.
+var internFront [internFrontSlots]atomic.Pointer[internEntry]
+
+// internSlotHash is the front-cache slot hash (FNV-1a over the key bytes),
+// deliberately independent of hashKeyRaw: the short-key multiplicative hash
+// XORs position-4..7 bytes against the SAME multiplier, so byte-swapped keys
+// ("VAR_19" vs "VAR_91") collide in it. That is harmless for shard selection
+// (the shard map compares full keys) but fatal for a direct-mapped slot
+// cache, where such a pair would evict each other on every call.
+func internSlotHash(b []byte) uint32 {
+	h := uint32(2166136261) // FNV offset basis
+	for i := 0; i < len(b); i++ {
+		h ^= uint32(b[i])
+		h *= 16777619 // FNV prime
+	}
+	return h
+}
+
+// equalStringBytes compares s and b without allocating (a manual loop rather
+// than relying on the compiler eliding string(b) in comparisons).
+func equalStringBytes(s string, b []byte) bool {
+	if len(s) != len(b) {
+		return false
+	}
+	for i := range b {
+		if s[i] != b[i] {
+			return false
+		}
+	}
+	return true
+}
+
 // InternKeyBytes interns a key supplied as a byte slice, returning a stable
 // interned string. This reduces allocations when the same keys are parsed
 // repeatedly, which matters on hot parse paths where keys arrive as []byte
 // slices into a reusable buffer.
 //
-// Why this avoids an allocation on a cache hit: the compiler optimizes both
+// Why this avoids an allocation on a cache hit: the compiler optimizes the
 // string(b) conversions away:
-//   - getShard(string(b)): escape analysis proves the converted string does not
-//     escape (getShard -> HashKey only read its bytes), so no allocation occurs.
+//   - getShard(string(b)) on the slow path: escape analysis proves the
+//     converted string does not escape (HashKey only reads its bytes), so no
+//     allocation occurs.
 //   - shard.cache[string(b)]: the documented compiler elision for
 //     map[string]V[string([]byte)] index expressions allocates nothing.
 //
@@ -135,27 +214,44 @@ func getShard(key string) *internShard {
 // independent of b, so it stays valid after b is reused — this preserves the
 // scanner-buffer-safety invariant required by ParseLineBytes.
 //
-// The intern cache uses sharded sync.Mutex storage (not RWMutex): the cache is
-// small (128 entries per shard), so lookup is fast enough that RWMutex overhead
-// outweighs its benefit, and simpler lock management improves cache locality.
+// Read path: a lock-free direct-mapped front cache (see internFront) absorbs
+// repeated keys before the shard mutex is taken. The sharded maps remain the
+// authoritative bounded store (sync.Mutex, not RWMutex: the cache is small —
+// 128 entries per shard — so lookup is fast enough that RWMutex overhead
+// outweighs its benefit, and simpler lock management improves cache locality).
 func InternKeyBytes(b []byte) string {
 	if len(b) == 0 || len(b) > maxInternKeyLen {
 		return string(b) // Don't intern empty or very long keys; must copy
+	}
+
+	slot := &internFront[internSlotHash(b)&(internFrontSlots-1)]
+	if hit := slot.Load(); hit != nil && equalStringBytes(hit.key, b) {
+		return hit.key
 	}
 
 	shard := getShard(string(b))
 	shard.mu.Lock()
 	defer shard.mu.Unlock()
 
-	if interned, ok := shard.cache[string(b)]; ok {
-		return interned
+	var entry *internEntry
+	if cached, ok := shard.cache[string(b)]; ok {
+		entry = cached
+	} else {
+		entry = storeInterned(shard, string(b))
 	}
-
-	return storeInterned(shard, string(b))
+	// Fill the front slot only when empty. Displacing an occupied slot would
+	// churn whenever the hot-key set exceeds the slot count; leaving the
+	// incumbent in place keeps the steady state allocation-free and simply
+	// routes the colliding key down the locked path. The stored pointer is
+	// the map's own entry, so publishing allocates nothing (see internEntry).
+	if slot.Load() == nil {
+		slot.Store(entry)
+	}
+	return entry.key
 }
 
 // storeInterned inserts key into the shard's cache (with bounded eviction) and
-// returns the stored string. The caller must already hold shard.mu and must
+// returns the stored entry. The caller must already hold shard.mu and must
 // have confirmed the key is absent.
 //
 // Bounded cache: when full, evict a single entry. Go randomizes map iteration
@@ -163,7 +259,7 @@ func InternKeyBytes(b []byte) string {
 // simple and sufficient for a small interning cache. The previous FIFO
 // circular-buffer machinery produced the same observable behavior (bounded
 // cache, correct interning) with far more moving parts.
-func storeInterned(shard *internShard, key string) string {
+func storeInterned(shard *internShard, key string) *internEntry {
 	if len(shard.cache) >= maxInternSize {
 		for k := range shard.cache {
 			delete(shard.cache, k)
@@ -171,8 +267,9 @@ func storeInterned(shard *internShard, key string) string {
 		}
 	}
 
-	shard.cache[key] = key
-	return key
+	entry := &internEntry{key: key}
+	shard.cache[key] = entry
+	return entry
 }
 
 // isValidDefaultKey is the canonical implementation for validating environment variable
@@ -216,8 +313,8 @@ func validateDefaultKeyScan(key string) (valid, hasNonASCII bool) {
 		if c >= 0x80 {
 			return false, true
 		}
-		if !((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') ||
-			(c >= '0' && c <= '9') || c == '_') {
+		if (c < 'a' || c > 'z') && (c < 'A' || c > 'Z') &&
+			(c < '0' || c > '9') && c != '_' {
 			valid = false
 		}
 	}
@@ -240,8 +337,11 @@ func IsValidJSONKey(key string) bool {
 	if len(key) == 0 {
 		return false
 	}
-	// SECURITY: Reject keys that look like array indices to prevent confusion
-	if key[0] >= '0' && key[0] <= '9' && len(key) <= 4 {
+	// SECURITY: Reject pure-digit keys of ANY length — they are ambiguous
+	// with array indices in dot-notation resolution (ResolvePath resolves
+	// numeric segments up to maxSafeIndex, far beyond four digits; the
+	// previous <=4 guard rejected "1234" while letting "12345" through).
+	if key[0] >= '0' && key[0] <= '9' {
 		allDigits := true
 		for i := 0; i < len(key); i++ {
 			if key[i] < '0' || key[i] > '9' {
@@ -275,14 +375,22 @@ func ClearInternCache() {
 	for i := range numShards {
 		shard := &internShards[i]
 		shard.mu.Lock()
-		shard.cache = make(map[string]string, maxInternSize)
+		shard.cache = make(map[string]*internEntry, maxInternSize)
 		shard.mu.Unlock()
+	}
+	// Drop front-cache entries too: without this, a cleared intern cache
+	// would keep answering hits from stale slot entries and repopulate the
+	// shard maps on the next miss from a potentially unwanted generation.
+	for i := range internFront {
+		internFront[i].Store(nil)
 	}
 }
 
-// EqualFoldASCII compares two strings case-insensitively for ASCII characters only.
+// EqualFoldASCII compares two strings case-insensitively for ASCII letters.
 // This is faster than strings.EqualFold for short ASCII strings because it avoids
-// the Unicode fallback path. Returns false if either string contains non-ASCII bytes.
+// the Unicode fallback path. Bytes outside A-Z/a-z — including all non-ASCII
+// bytes — are compared literally with no Unicode case folding:
+// EqualFoldASCII("ü", "ü") is true, but EqualFoldASCII("Ü", "ü") is false.
 func EqualFoldASCII(a, b string) bool {
 	if len(a) != len(b) {
 		return false
@@ -300,6 +408,79 @@ func EqualFoldASCII(a, b string) bool {
 		}
 	}
 	return true
+}
+
+// SplitQuotedCommaParts splits a comma-separated list, honoring double
+// quotes: a comma inside quotes does not split, the grouping quotes are
+// removed, and backslash escapes (\" and \\) are unfolded. It is the
+// parse-side counterpart of the quoting valueToString applies to
+// string-slice elements containing ',' or '"' — together they make such
+// elements survive a Marshal→Unmarshal round trip. A plain element splits
+// exactly like strings.Split(s, ","). It additionally reports, per element,
+// whether it was wrapped in grouping quotes; callers that trim elements
+// must trim only the unquoted ones: trimming quoted elements silently
+// strips the significant leading/trailing whitespace the quotes exist to
+// preserve. Both list consumers (setSliceValue for struct mapping, the
+// root package's parseCommaSeparated for GetSlice) follow this rule so the
+// two read paths agree on the same input.
+//
+// For quoted elements, whitespace OUTSIDE the quotes is separator gap, not
+// content: the gap between a comma and the opening quote (and between the
+// closing quote and the next comma) is dropped, so 'a, "b "' yields "b " —
+// not " b " — while the quoted trailing space survives.
+func SplitQuotedCommaParts(s string) (parts []string, quoted []bool) {
+	parts = make([]string, 0, strings.Count(s, ",")+1)
+	quoted = make([]bool, 0, cap(parts))
+	var elem []byte
+	elemQuoted := false
+	inQuotes := false
+	seenContent := false
+	// contentEnd bounds the element's real content: bytes appended inside
+	// quotes or non-space bytes outside them. Trailing outside-quote
+	// whitespace is provisional and trimmed at flush for quoted elements.
+	contentEnd := 0
+	flush := func() {
+		if elemQuoted {
+			elem = elem[:contentEnd]
+		}
+		parts = append(parts, string(elem))
+		quoted = append(quoted, elemQuoted)
+		elem = elem[:0]
+		elemQuoted = false
+		seenContent = false
+		contentEnd = 0
+	}
+	for i := 0; i < len(s); i++ {
+		c := s[i]
+		switch {
+		case c == '"':
+			inQuotes = !inQuotes
+			elemQuoted = true
+			seenContent = true
+		case c == '\\' && inQuotes && i+1 < len(s) && (s[i+1] == '"' || s[i+1] == '\\'):
+			elem = append(elem, s[i+1])
+			seenContent = true
+			contentEnd = len(elem)
+			i++
+		case c == ',' && !inQuotes:
+			flush()
+		default:
+			// Whitespace between a separator and the element's first
+			// content (the opening quote counts as content) is gap, not
+			// content: quoted elements must not inherit it, since their
+			// defining property is that their whitespace is significant.
+			if !inQuotes && !seenContent && (c == ' ' || c == '\t') {
+				continue
+			}
+			elem = append(elem, c)
+			seenContent = true
+			if inQuotes || (c != ' ' && c != '\t') {
+				contentEnd = len(elem)
+			}
+		}
+	}
+	flush()
+	return parts, quoted
 }
 
 // HasUpperPrefix checks whether s starts with the given uppercase prefix,
@@ -401,11 +582,11 @@ func ToUpperASCII(s string) string {
 }
 
 // DefaultMaskKey masks a key name for safe logging and error reporting.
-// Shows only the first 2 characters followed by "***" for keys longer than 3 characters.
-// This is the default masking function used by validators and path validators.
+// SECURITY (SEC-005): the previous two-character prefix ("DA***") leaked the
+// start of the key name, and the key itself is frequently sensitive (e.g.
+// DATABASE_PASSWORD). The mask is now a fixed token with no key content, so a
+// masked key reveals neither its spelling nor its length. This is the default
+// masking function used by validators, path validators, and error rendering.
 func DefaultMaskKey(key string) string {
-	if len(key) <= 3 {
-		return "***"
-	}
-	return key[:2] + "***"
+	return "[MASKED]"
 }

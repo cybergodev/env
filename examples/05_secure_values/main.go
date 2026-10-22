@@ -30,8 +30,13 @@ func demonstrateBasics() {
 	fmt.Printf("  Masked:  %s\n", sv.Masked()) // safe for logging
 	fmt.Printf("  Length:  %d bytes\n", sv.Length())
 
-	sv.Close()
-	fmt.Printf("  After Close: %q\n", sv.Reveal()) // empty — memory zeroed
+	// MarshalJSON/MarshalText mask the secret even under JSON encoding —
+	// safer than String(), which reflection-based serializers can bypass.
+	masked, _ := sv.MarshalJSON()
+	fmt.Printf("  JSON:    %s\n", masked)
+
+	_ = sv.Close()                                                              // best-effort cleanup
+	fmt.Printf("  After Close: %q (IsClosed=%v)\n", sv.Reveal(), sv.IsClosed()) // empty — memory zeroed
 }
 
 // demonstrateFromLoader shows reading a secret via the Loader.
@@ -44,7 +49,7 @@ func demonstrateFromLoader() {
 	if err != nil {
 		log.Fatalf("Failed to create loader: %v", err)
 	}
-	defer loader.Close()
+	defer func() { _ = loader.Close() }() // best-effort cleanup
 
 	// GetSecure returns a defensive copy; caller must Close/Release it.
 	if sv := loader.GetSecure("DB_PASSWORD"); sv != nil {
@@ -63,7 +68,7 @@ func demonstrateLifecycle() {
 	// Close zeros memory but does not return to the pool.
 	a := env.NewSecureValue("secret_a")
 	fmt.Printf("  a before close:  %s\n", a.Reveal())
-	a.Close()
+	_ = a.Close() // best-effort cleanup
 	fmt.Printf("  a after close:   %q\n", a.Reveal())
 
 	// Release zeros memory AND returns the object to the pool for reuse.
@@ -101,7 +106,7 @@ func demonstrateMemoryLock() {
 		fmt.Printf("  Lock failed (expected without privileges): %v\n", err)
 	} else {
 		fmt.Printf("  Locked: %v\n", sv.IsMemoryLocked())
-		sv.Close()
+		_ = sv.Close() // best-effort cleanup
 	}
 
 	// Restore defaults

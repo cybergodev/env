@@ -1,0 +1,67 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    name: Test (race, ${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        # Library targets Windows and Linux runtimes (CLAUDE.md).
+        os: [ubuntu-latest, windows-latest]
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Vet
+        run: go vet ./...
+
+      - name: Test with race detector
+        run: go test -race -count=1 ./...
+
+  lint:
+    name: golangci-lint
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+
+      - uses: golangci/golangci-lint-action@v7
+        with:
+          # Pin the linter version so CI is reproducible: `latest` drifts
+          # between runs and can introduce new findings (or silently drop
+          # rules) without any code change. Bump deliberately alongside the
+          # local golangci-lint.
+          version: v2.15.0
+
+  coverage:
+    name: Coverage gate (>= 90%)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+
+      - name: Measure library package coverage
+        run: |
+          go test -count=1 -covermode=atomic -coverprofile=coverage.out . ./internal
+          go tool cover -func=coverage.out | tail -1
+          go tool cover -func=coverage.out | tail -1 | awk \
+            '{sub(/%/, "", $3); if ($3 + 0 < 90) { print "coverage below 90%: " $3 "%"; exit 1 }}'

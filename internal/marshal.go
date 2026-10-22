@@ -1,4 +1,5 @@
-// Package internal provides internal struct marshaling utilities.
+// Provides internal struct marshaling utilities.
+
 package internal
 
 import (
@@ -16,16 +17,44 @@ import (
 // Struct fields can be tagged with `env:"KEY"` to specify the env variable name.
 // Nested structs are flattened with underscore-separated keys.
 func Struct(v interface{}, prefix string) (map[string]string, error) {
-	return marshalStruct(v, prefix)
+	return marshalStruct(v, prefix, 0)
 }
 
-func marshalStruct(v interface{}, prefix string) (map[string]string, error) {
+// maxStructNestingDepth bounds struct-reflection recursion on both the
+// marshal and unmarshal sides. Real config structs nest far below this (the
+// JSON/YAML flatten default depth is 16); the cap exists solely to turn a
+// cyclic value (marshal: a non-nil pointer field reaching back into the
+// value graph) or a self-referential type (unmarshal: StructInto allocates
+// nil pointer fields before recursing, so recursion never terminates on
+// types like `type Node struct{ Next *Node }`) from an unrecoverable
+// fatal out-of-memory crash into a *MarshalError.
+const maxStructNestingDepth = 100
+
+// errStructDepthExceeded is returned when struct-reflection recursion
+// exceeds maxStructNestingDepth. The prefix (the flattened key path
+// accumulated at that depth) becomes the MarshalError Field, so a genuinely
+// too-deep acyclic struct is debuggable, not just cyclic ones.
+func errStructDepthExceeded(prefix string) error {
+	field := prefix
+	if field == "" {
+		field = "value"
+	}
+	return &MarshalError{
+		Field:   field,
+		Message: fmt.Sprintf("maximum struct nesting depth (%d) exceeded; possible cyclic reference", maxStructNestingDepth),
+	}
+}
+
+func marshalStruct(v interface{}, prefix string, depth int) (map[string]string, error) {
+	if depth > maxStructNestingDepth {
+		return nil, errStructDepthExceeded(prefix)
+	}
 	if v == nil {
 		return nil, nil
 	}
 
 	val := reflect.ValueOf(v)
-	if val.Kind() == reflect.Ptr {
+	if val.Kind() == reflect.Pointer {
 		if val.IsNil() {
 			return nil, nil
 		}
@@ -67,9 +96,13 @@ func marshalStruct(v interface{}, prefix string) (map[string]string, error) {
 			key = buildPrefixedKey(prefix, key)
 		}
 
-		// Handle nested structs
-		if field.Kind() == reflect.Struct {
-			nested, err := marshalStruct(field.Interface(), key)
+		// Handle nested structs — except struct kinds implementing
+		// encoding.TextMarshaler (time.Time is the canonical case): those
+		// are scalar-like and fall through to valueToString's marshaler
+		// branch, which field recursion made unreachable (recursing walked
+		// their unexported internals and silently contributed nothing).
+		if field.Kind() == reflect.Struct && !implementsTextMarshaler(field) {
+			nested, err := marshalStruct(field.Interface(), key, depth+1)
 			if err != nil {
 				return nil, err
 			}
@@ -79,10 +112,11 @@ func marshalStruct(v interface{}, prefix string) (map[string]string, error) {
 			continue
 		}
 
-		// Handle pointers to structs
-		if field.Kind() == reflect.Ptr && !field.IsNil() {
-			if field.Elem().Kind() == reflect.Struct {
-				nested, err := marshalStruct(field.Elem().Interface(), key)
+		// Handle pointers to structs (same TextMarshaler exemption: a
+		// *time.Time passes the probe through its value-receiver methods)
+		if field.Kind() == reflect.Pointer && !field.IsNil() {
+			if field.Elem().Kind() == reflect.Struct && !implementsTextMarshaler(field) {
+				nested, err := marshalStruct(field.Elem().Interface(), key, depth+1)
 				if err != nil {
 					return nil, err
 				}
@@ -111,7 +145,17 @@ func marshalStruct(v interface{}, prefix string) (map[string]string, error) {
 // Struct fields can be tagged with `env:"KEY"` to specify the env variable name.
 // Optional `envDefault:"value"` sets a default if the key is not found.
 // Also supports inline format: `env:"KEY,envDefault:VALUE"`.
+//
+// Recursion is bounded by maxStructNestingDepth: a self-referential struct
+// type returns a *MarshalError instead of recursing (and allocating) forever.
 func StructInto(data map[string]string, val reflect.Value, prefix string) error {
+	return structInto(data, val, prefix, 0)
+}
+
+func structInto(data map[string]string, val reflect.Value, prefix string, depth int) error {
+	if depth > maxStructNestingDepth {
+		return errStructDepthExceeded(prefix)
+	}
 	typ := val.Type()
 
 	for i := 0; i < val.NumField(); i++ {
@@ -146,8 +190,12 @@ func StructInto(data map[string]string, val reflect.Value, prefix string) error 
 			key = ToUpperASCII(fieldType.Name)
 		}
 
-		// Handle nested structs
-		if field.Kind() == reflect.Struct {
+		// Handle nested structs — except struct kinds implementing
+		// encoding.TextUnmarshaler (time.Time): those are scalar-like and
+		// fall through to the leaf path below, whose setFieldValue
+		// TextUnmarshaler branch was unreachable for struct kinds (recursion
+		// walked unexported internals and silently matched nothing).
+		if field.Kind() == reflect.Struct && !implementsTextUnmarshaler(field) {
 			// Prefix nested fields with this field's key (tag or uppercased
 			// field name), accumulating the outer prefix — mirroring
 			// marshalStruct and the JSON/YAML flatteners so an untagged
@@ -158,29 +206,31 @@ func StructInto(data map[string]string, val reflect.Value, prefix string) error 
 			// flattened value, and tagged multi-level nesting looked up
 			// I_HOST where marshal emits M_I_HOST.
 			nestedPrefix := buildPrefixedKey(prefix, key)
-			if err := StructInto(data, field, nestedPrefix); err != nil {
+			if err := structInto(data, field, nestedPrefix, depth+1); err != nil {
 				return err
 			}
 			continue
 		}
 
-		// Handle pointers
-		if field.Kind() == reflect.Ptr {
-			if field.Type().Elem().Kind() == reflect.Struct {
+		// Handle pointers (same TextUnmarshaler exemption: a *time.Time
+		// matches through its pointer method set and is set as a leaf)
+		if field.Kind() == reflect.Pointer {
+			if field.Type().Elem().Kind() == reflect.Struct && !implementsTextUnmarshaler(field) {
 				// Create new struct if needed
 				if field.IsNil() {
 					field.Set(reflect.New(field.Type().Elem()))
 				}
 				// Same prefix accumulation as the struct branch above.
 				nestedPrefix := buildPrefixedKey(prefix, key)
-				if err := StructInto(data, field.Elem(), nestedPrefix); err != nil {
+				if err := structInto(data, field.Elem(), nestedPrefix, depth+1); err != nil {
 					return err
 				}
 				continue
 			}
 		}
 
-		// For non-struct fields, add prefix if parent passed one
+		// Leaf path: non-struct fields, and struct kinds diverted from the
+		// recursion branches above by the TextUnmarshaler probes.
 		if prefix != "" {
 			key = buildPrefixedKey(prefix, key)
 		}
@@ -208,6 +258,15 @@ func StructInto(data map[string]string, val reflect.Value, prefix string) error 
 func valueToString(v reflect.Value) (string, error) {
 	// Handle nil
 	if !v.IsValid() {
+		return "", nil
+	}
+
+	// A nil pointer cannot serve its marshaler methods: the interface probe
+	// succeeds (a nil *time.Time matches TextMarshaler through its
+	// value-receiver method set), but calling the method dereferences the
+	// nil pointer and panics. Render as empty — marshalStruct omits empty
+	// values, matching the documented nil-pointer omission.
+	if v.Kind() == reflect.Pointer && v.IsNil() {
 		return "", nil
 	}
 
@@ -247,11 +306,33 @@ func valueToString(v reflect.Value) (string, error) {
 	case reflect.Uint, reflect.Uint8, reflect.Uint16, reflect.Uint32, reflect.Uint64:
 		return strconv.FormatUint(v.Uint(), 10), nil
 	case reflect.Float32, reflect.Float64:
-		return strconv.FormatFloat(v.Float(), 'f', -1, 64), nil
+		// Format at the field's own precision: a float32 rendered at 64-bit
+		// precision carries double-precision noise (float32(0.1) would print
+		// as "0.10000000149011612").
+		bitSize := 64
+		if v.Kind() == reflect.Float32 {
+			bitSize = 32
+		}
+		return strconv.FormatFloat(v.Float(), 'f', -1, bitSize), nil
 	case reflect.Slice:
-		// Handle []byte
+		// Handle []byte — render as comma-separated decimals, the exact form
+		// setSliceValue's Uint8 branch parses back. The previous raw-string
+		// rendering ("hello" → "hello") made Struct→StructInto on the same
+		// []byte field fail with "invalid unsigned integer value".
 		if v.Type().Elem().Kind() == reflect.Uint8 {
-			return string(v.Bytes()), nil
+			raw := v.Bytes()
+			if len(raw) == 0 {
+				return "", nil
+			}
+			sb := GetBuilder()
+			defer PutBuilder(sb)
+			for i, b := range raw {
+				if i > 0 {
+					sb.WriteByte(',')
+				}
+				sb.WriteString(strconv.FormatUint(uint64(b), 10))
+			}
+			return sb.String(), nil
 		}
 		// Handle string slices - use builder for efficiency
 		if v.Type().Elem().Kind() == reflect.String {
@@ -263,10 +344,28 @@ func valueToString(v reflect.Value) (string, error) {
 			sb := GetBuilder()
 			defer PutBuilder(sb)
 			for i := 0; i < n; i++ {
+				elem := v.Index(i).String()
 				if i > 0 {
 					sb.WriteByte(',')
 				}
-				sb.WriteString(v.Index(i).String())
+				// Quote elements containing the list separator or a quote
+				// mark so SplitQuotedComma reassembles them as one element
+				// on the way back — unquoted, "a,b" would read back as two
+				// elements (silent data corruption). Leading/trailing
+				// whitespace also requires quoting: the unmarshal side trims
+				// unquoted elements, so "a " would silently round-trip to "a".
+				if strings.ContainsAny(elem, ",\"") || elem != strings.TrimSpace(elem) {
+					sb.WriteByte('"')
+					for j := 0; j < len(elem); j++ {
+						if c := elem[j]; c == '"' || c == '\\' {
+							sb.WriteByte('\\')
+						}
+						sb.WriteByte(elem[j])
+					}
+					sb.WriteByte('"')
+				} else {
+					sb.WriteString(elem)
+				}
 			}
 			return sb.String(), nil
 		}
@@ -274,7 +373,7 @@ func valueToString(v reflect.Value) (string, error) {
 			Field:   "slice",
 			Message: "unsupported slice type",
 		}
-	case reflect.Ptr:
+	case reflect.Pointer:
 		if v.IsNil() {
 			return "", nil
 		}
@@ -285,6 +384,38 @@ func valueToString(v reflect.Value) (string, error) {
 			Message: fmt.Sprintf("unsupported type: %s", v.Kind()),
 		}
 	}
+}
+
+// implementsTextMarshaler reports whether v's value implements
+// encoding.TextMarshaler. Struct-kind fields implementing it (time.Time is
+// the canonical case) are scalar-like: they take valueToString's marshaler
+// branch instead of field recursion, which walks their internals and
+// silently contributes nothing.
+func implementsTextMarshaler(v reflect.Value) bool {
+	if !v.CanInterface() {
+		return false
+	}
+	_, ok := v.Interface().(encoding.TextMarshaler)
+	return ok
+}
+
+// implementsTextUnmarshaler reports whether field can be populated from text
+// via encoding.TextUnmarshaler. For value fields the method lives on the
+// pointer receiver (time.Time), so the probe uses Addr; for pointer fields
+// it is already in the value's own method set.
+func implementsTextUnmarshaler(field reflect.Value) bool {
+	if field.Kind() == reflect.Pointer {
+		if !field.CanInterface() {
+			return false
+		}
+		_, ok := field.Interface().(encoding.TextUnmarshaler)
+		return ok
+	}
+	if !field.CanAddr() || !field.Addr().CanInterface() {
+		return false
+	}
+	_, ok := field.Addr().Interface().(encoding.TextUnmarshaler)
+	return ok
 }
 
 // convError converts a strconv/time conversion error into a MarshalError
@@ -310,7 +441,7 @@ func setFieldValue(field reflect.Value, value string) error {
 	}
 
 	// Handle pointer types
-	if field.Kind() == reflect.Ptr {
+	if field.Kind() == reflect.Pointer {
 		if field.IsNil() {
 			field.Set(reflect.New(field.Type().Elem()))
 		}
@@ -329,9 +460,12 @@ func setFieldValue(field reflect.Value, value string) error {
 	case reflect.String:
 		field.SetString(value)
 	case reflect.Bool:
-		b, err := strconv.ParseBool(value)
-		if err != nil {
-			return convError("boolean", err)
+		// Library-wide boolean grammar (yes/no/on/off/...), the same one
+		// GetBool accepts — the strict strconv grammar here previously made
+		// DEBUG=yes an error through ParseInto while GetBool parsed it fine.
+		b, ok := ParseBoolLoose(value)
+		if !ok {
+			return convError("boolean", strconv.ErrSyntax)
 		}
 		field.SetBool(b)
 	case reflect.Int, reflect.Int8, reflect.Int16, reflect.Int32, reflect.Int64:
@@ -360,7 +494,11 @@ func setFieldValue(field reflect.Value, value string) error {
 		}
 		field.SetUint(u)
 	case reflect.Float32, reflect.Float64:
-		f, err := strconv.ParseFloat(value, 64)
+		// Parse at the field's bit width, mirroring the integer rule above:
+		// SetFloat silently converts like a C cast, so a value that fits
+		// float64 but overflows float32 ("1e39") would become +Inf instead
+		// of failing.
+		f, err := strconv.ParseFloat(value, field.Type().Bits())
 		if err != nil {
 			return convError("float", err)
 		}
@@ -383,13 +521,18 @@ func setSliceValue(field reflect.Value, value string) error {
 		return nil
 	}
 
-	parts := strings.Split(value, ",")
+	parts, quoted := SplitQuotedCommaParts(value)
 	slice := reflect.MakeSlice(field.Type(), len(parts), len(parts))
 
 	elemKind := field.Type().Elem().Kind()
 
 	for i, part := range parts {
-		part = strings.TrimSpace(part)
+		// Trim only unquoted elements: grouping quotes exist to preserve
+		// significant leading/trailing whitespace, which a blanket trim
+		// silently stripped ("a , b" round-tripped as ["a","b"]).
+		if !quoted[i] {
+			part = strings.TrimSpace(part)
+		}
 		switch elemKind {
 		case reflect.String:
 			slice.Index(i).SetString(part)
@@ -411,13 +554,14 @@ func setSliceValue(field reflect.Value, value string) error {
 			}
 			slice.Index(i).SetUint(n)
 		case reflect.Bool:
-			b, err := strconv.ParseBool(part)
-			if err != nil {
-				return convError("boolean", err)
+			b, ok := ParseBoolLoose(part)
+			if !ok {
+				return convError("boolean", strconv.ErrSyntax)
 			}
 			slice.Index(i).SetBool(b)
 		case reflect.Float32, reflect.Float64:
-			f, err := strconv.ParseFloat(part, 64)
+			// Element bit width, same rationale as the scalar float branch.
+			f, err := strconv.ParseFloat(part, field.Type().Elem().Bits())
 			if err != nil {
 				return convError("float", err)
 			}

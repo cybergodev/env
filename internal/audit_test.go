@@ -3,6 +3,7 @@ package internal
 import (
 	"bytes"
 	"encoding/json"
+	"errors"
 	"log"
 	"os"
 	"strings"
@@ -12,57 +13,60 @@ import (
 )
 
 func TestNewAuditor(t *testing.T) {
-	// Test with nil handler
-	a := NewAuditor(nil, nil, nil, false)
-	if a == nil {
-		t.Error("NewAuditor() should not return nil")
-	}
-
-	// Test with enabled
-	a = NewAuditor(nil, nil, nil, true)
-	if !a.enabled.Load() {
-		t.Error("auditor should be enabled")
-	}
-}
-
-func TestAuditorLogDisabled(t *testing.T) {
-	a := NewAuditor(nil, nil, nil, false)
-
-	err := a.Log(ActionSet, "KEY", "test", true)
-	if err != nil {
-		t.Errorf("Log() when disabled should return nil, got %v", err)
-	}
-}
-
-func TestAuditorLogEnabled(t *testing.T) {
-	// Create channel handler to capture events
-	ch := make(chan Event, 1)
-	handler := NewChannelHandler(ch)
-	a := NewAuditor(handler, nil, nil, true)
-
-	err := a.Log(ActionSet, "KEY", "test", true)
-	if err != nil {
-		t.Errorf("Log() error = %v", err)
-		return
-	}
-
-	select {
-	case event := <-ch:
-		if event.Action != ActionSet {
-			t.Errorf("event action = %v, want %v", event.Action, ActionSet)
+	// NewAuditor unconditionally returns a non-nil auditor (every optional
+	// argument has a fallback), so the observable contracts are the enabled
+	// flag wiring, the per-argument defaults, and disabled Log being a no-op.
+	t.Run("enabled flag is wired", func(t *testing.T) {
+		if a := NewAuditor(nil, nil, nil, true); !a.enabled.Load() {
+			t.Error("NewAuditor(enabled=true) should be enabled")
 		}
-		if event.Key != "KEY" {
-			t.Errorf("event key = %v, want KEY", event.Key)
+		if a := NewAuditor(nil, nil, nil, false); a.enabled.Load() {
+			t.Error("NewAuditor(enabled=false) should be disabled")
 		}
-	case <-time.After(time.Second):
-		t.Error("timeout waiting for event")
-	}
+	})
+
+	t.Run("disabled Log is a no-op", func(t *testing.T) {
+		a := NewAuditor(nil, nil, nil, false)
+		if err := a.Log(ActionSet, "KEY", "test", true); err != nil {
+			t.Errorf("Log() when disabled should return nil, got %v", err)
+		}
+	})
+
+	// Pins the NewAuditor fallback (audit.go): an ENABLED auditor constructed
+	// with a nil handler gets NopHandler, so Log is a successful no-op rather
+	// than a nil-pointer panic.
+	t.Run("enabled auditor with nil handler falls back to Nop", func(t *testing.T) {
+		a := NewAuditor(nil, nil, nil, true)
+		if !a.IsEnabled() {
+			t.Fatal("auditor should be enabled")
+		}
+		if err := a.Log(ActionSet, "KEY", "test", true); err != nil {
+			t.Errorf("Log() with nil handler error = %v, want nil", err)
+		}
+		if err := a.Close(); err != nil {
+			t.Errorf("Close() error = %v, want nil", err)
+		}
+	})
+
+	// Partial-nil construction: a non-nil handler and isSensitive with a nil
+	// masker must install the identity masker default.
+	t.Run("partial nil arguments get their defaults", func(t *testing.T) {
+		captured := &eventCapturer{}
+		a := NewAuditor(captured, func(string) bool { return false }, nil, true)
+		if err := a.Log(ActionGet, "KEY", "read", true); err != nil {
+			t.Fatalf("Log() error = %v", err)
+		}
+		if len(captured.events) != 1 || captured.events[0].Key != "KEY" {
+			t.Errorf("captured %+v, want one event with key KEY", captured.events)
+		}
+	})
 }
 
-func TestAuditorLogWithMasking(t *testing.T) {
-	ch := make(chan Event, 1)
-	handler := NewChannelHandler(ch)
-
+// TestAuditorLogVariants exercises the Log* entry points through one
+// channel-capture table: each row constructs an auditor over a fresh channel
+// handler, logs one event, receives it and checks the variant-specific
+// fields.
+func TestAuditorLogVariants(t *testing.T) {
 	isSensitive := func(key string) bool {
 		return strings.Contains(strings.ToUpper(key), "PASSWORD")
 	}
@@ -73,60 +77,132 @@ func TestAuditorLogWithMasking(t *testing.T) {
 		return value
 	}
 
-	a := NewAuditor(handler, isSensitive, masker, true)
-
-	_ = a.Log(ActionSet, "PASSWORD", "test", true)
-
-	select {
-	case event := <-ch:
-		if !event.Masked {
-			t.Error("sensitive key should be marked as masked")
-		}
-	case <-time.After(time.Second):
-		t.Error("timeout waiting for event")
+	tests := []struct {
+		name       string
+		newAuditor func(handler Handler) *Auditor // nil: plain enabled auditor
+		log        func(a *Auditor) error
+		disabled   bool // auditor constructed disabled: no event may arrive
+		check      func(t *testing.T, event Event)
+	}{
+		{
+			name: "log",
+			log:  func(a *Auditor) error { return a.Log(ActionSet, "KEY", "test", true) },
+			check: func(t *testing.T, event Event) {
+				if event.Action != ActionSet {
+					t.Errorf("event action = %v, want %v", event.Action, ActionSet)
+				}
+				if event.Key != "KEY" {
+					t.Errorf("event key = %v, want KEY", event.Key)
+				}
+			},
+		},
+		{
+			// maskKey replaces a sensitive key wholesale (audit.go), and the
+			// Masked flag is computed from the ORIGINAL key before masking.
+			name:       "log masks sensitive key",
+			newAuditor: func(h Handler) *Auditor { return NewAuditor(h, isSensitive, masker, true) },
+			log:        func(a *Auditor) error { return a.Log(ActionSet, "PASSWORD", "test", true) },
+			check: func(t *testing.T, event Event) {
+				if !event.Masked {
+					t.Error("sensitive key should be marked as masked")
+				}
+				if event.Key != "[MASKED]" {
+					t.Errorf("event key = %q, want \"[MASKED]\"", event.Key)
+				}
+			},
+		},
+		{
+			name:       "log leaves non-sensitive key unmasked",
+			newAuditor: func(h Handler) *Auditor { return NewAuditor(h, isSensitive, masker, true) },
+			log:        func(a *Auditor) error { return a.Log(ActionSet, "USER", "test", true) },
+			check: func(t *testing.T, event Event) {
+				if event.Masked {
+					t.Error("non-sensitive key should not be marked as masked")
+				}
+				if event.Key != "USER" {
+					t.Errorf("event key = %q, want USER", event.Key)
+				}
+			},
+		},
+		{
+			name: "log with file",
+			log:  func(a *Auditor) error { return a.LogWithFile(ActionLoad, "", ".env", "loaded", true) },
+			check: func(t *testing.T, event Event) {
+				if event.File != ".env" {
+					t.Errorf("event file = %v, want .env", event.File)
+				}
+			},
+		},
+		{
+			name: "log with duration",
+			log: func(a *Auditor) error {
+				return a.LogWithDuration(ActionLoad, "", "test", true, 100*time.Millisecond)
+			},
+			check: func(t *testing.T, event Event) {
+				if want := (100 * time.Millisecond).Nanoseconds(); event.Duration != want {
+					t.Errorf("event duration = %v, want %v", event.Duration, want)
+				}
+			},
+		},
+		{
+			// LogError is the production error path: Success is forced false
+			// and the message lands in Reason.
+			name: "log error records failure",
+			log:  func(a *Auditor) error { return a.LogError(ActionSet, "KEY", "boom") },
+			check: func(t *testing.T, event Event) {
+				if event.Success {
+					t.Error("LogError event Success = true, want false")
+				}
+				if event.Reason != "boom" {
+					t.Errorf("event reason = %q, want boom", event.Reason)
+				}
+			},
+		},
+		{
+			// The Log* variants share acquireLogEvent's disabled early-return:
+			// a disabled auditor returns nil without touching the handler.
+			name:       "log with file disabled is a no-op",
+			newAuditor: func(h Handler) *Auditor { return NewAuditor(h, nil, nil, false) },
+			log:        func(a *Auditor) error { return a.LogWithFile(ActionLoad, "", ".env", "loaded", true) },
+			disabled:   true,
+		},
+		{
+			name:       "log with duration disabled is a no-op",
+			newAuditor: func(h Handler) *Auditor { return NewAuditor(h, nil, nil, false) },
+			log:        func(a *Auditor) error { return a.LogWithDuration(ActionLoad, "", "test", true, time.Second) },
+			disabled:   true,
+		},
 	}
-}
 
-func TestAuditorLogWithFile(t *testing.T) {
-	ch := make(chan Event, 1)
-	handler := NewChannelHandler(ch)
-	a := NewAuditor(handler, nil, nil, true)
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			ch := make(chan Event, 1)
+			handler := NewChannelHandler(ch)
+			a := NewAuditor(handler, nil, nil, true)
+			if tt.newAuditor != nil {
+				a = tt.newAuditor(handler)
+			}
 
-	err := a.LogWithFile(ActionLoad, "", ".env", "loaded", true)
-	if err != nil {
-		t.Errorf("LogWithFile() error = %v", err)
-		return
-	}
+			if err := tt.log(a); err != nil {
+				t.Fatalf("Log() error = %v", err)
+			}
 
-	select {
-	case event := <-ch:
-		if event.File != ".env" {
-			t.Errorf("event file = %v, want .env", event.File)
-		}
-	case <-time.After(time.Second):
-		t.Error("timeout waiting for event")
-	}
-}
+			if tt.disabled {
+				select {
+				case event := <-ch:
+					t.Errorf("disabled Log delivered event %+v, want none", event)
+				default:
+				}
+				return
+			}
 
-func TestAuditorLogWithDuration(t *testing.T) {
-	ch := make(chan Event, 1)
-	handler := NewChannelHandler(ch)
-	a := NewAuditor(handler, nil, nil, true)
-
-	duration := 100 * time.Millisecond
-	err := a.LogWithDuration(ActionLoad, "", "test", true, duration)
-	if err != nil {
-		t.Errorf("LogWithDuration() error = %v", err)
-		return
-	}
-
-	select {
-	case event := <-ch:
-		if event.Duration != duration.Nanoseconds() {
-			t.Errorf("event duration = %v, want %v", event.Duration, duration.Nanoseconds())
-		}
-	case <-time.After(time.Second):
-		t.Error("timeout waiting for event")
+			select {
+			case event := <-ch:
+				tt.check(t, event)
+			case <-time.After(time.Second):
+				t.Error("timeout waiting for event")
+			}
+		})
 	}
 }
 
@@ -145,29 +221,52 @@ func TestAuditorSetEnabled(t *testing.T) {
 }
 
 func TestJSONHandler(t *testing.T) {
-	var buf strings.Builder
-	handler := NewJSONHandler(&buf)
+	t.Run("writes valid JSON", func(t *testing.T) {
+		var buf strings.Builder
+		handler := NewJSONHandler(&buf)
 
-	event := Event{
-		Timestamp: time.Now(),
-		Action:    ActionSet,
-		Key:       "KEY",
-		Reason:    "test",
-		Success:   true,
-	}
+		event := Event{
+			Timestamp: time.Now(),
+			Action:    ActionSet,
+			Key:       "KEY",
+			Reason:    "test",
+			Success:   true,
+		}
 
-	err := handler.Log(event)
-	if err != nil {
-		t.Errorf("JSONHandler.Log() error = %v", err)
-		return
-	}
+		if err := handler.Log(event); err != nil {
+			t.Fatalf("JSONHandler.Log() error = %v", err)
+		}
 
-	// Verify output is valid JSON
-	output := buf.String()
-	var parsed Event
-	if err := json.Unmarshal([]byte(strings.TrimSpace(output)), &parsed); err != nil {
-		t.Errorf("output is not valid JSON: %v\noutput: %s", err, output)
-	}
+		// Verify output is valid JSON
+		output := buf.String()
+		var parsed Event
+		if err := json.Unmarshal([]byte(strings.TrimSpace(output)), &parsed); err != nil {
+			t.Errorf("output is not valid JSON: %v\noutput: %s", err, output)
+		}
+	})
+
+	// Pins the error branch a well-behaved buffer never reaches: a failing
+	// writer must surface the write error, not swallow it.
+	t.Run("write error is surfaced", func(t *testing.T) {
+		handler := NewJSONHandler(failingWriter{})
+		err := handler.Log(Event{Action: ActionSet, Key: "KEY"})
+		if err == nil {
+			t.Fatal("JSONHandler.Log() error = nil, want write error")
+		}
+		if !strings.Contains(err.Error(), "failed to write audit event") {
+			t.Errorf("JSONHandler.Log() error = %q, want write-failure message", err)
+		}
+	})
+}
+
+// failingWriter is a test-only io.Writer whose Write always fails, used to
+// drive JSONHandler.Log's write-error branch (audit.go).
+var errFailingWriter = errors.New("synthetic write failure")
+
+type failingWriter struct{}
+
+func (failingWriter) Write([]byte) (int, error) {
+	return 0, errFailingWriter
 }
 
 func TestLogHandler(t *testing.T) {
@@ -192,7 +291,7 @@ func TestLogHandler(t *testing.T) {
 		{
 			name:      "event with file appends file field",
 			event:     Event{Timestamp: time.Now(), Action: ActionLoad, Key: "KEY", File: ".env", Success: true},
-			wantParts: []string{"file=.env"},
+			wantParts: []string{`file=".env"`},
 		},
 		{
 			name:      "sub-millisecond duration formatted in microseconds",
@@ -230,36 +329,86 @@ func TestLogHandler(t *testing.T) {
 	}
 }
 
+// TestLogHandlerNilLogger pins the nil-logger fallback: NewLogHandler(nil)
+// installs the default stderr logger (audit.go), so logging one event
+// succeeds instead of panicking on a nil *log.Logger.
 func TestLogHandlerNilLogger(t *testing.T) {
 	handler := NewLogHandler(nil)
-	if handler == nil {
-		t.Error("NewLogHandler(nil) should not return nil")
+	if err := handler.Log(Event{Action: ActionGet}); err != nil {
+		t.Errorf("Log() with nil logger error = %v, want nil", err)
 	}
 }
 
-func TestChannelHandler(t *testing.T) {
-	ch := make(chan Event, 1)
-	handler := NewChannelHandler(ch)
+// TestLogHandlerFileInjection pins SEC-007 (CWE-117): the file field is
+// rendered quoted (%q), so a filename containing a newline cannot inject a
+// forged log record into the LogHandler stream.
+func TestLogHandlerFileInjection(t *testing.T) {
+	var buf bytes.Buffer
+	handler := NewLogHandler(log.New(&buf, "[TEST] ", 0))
 
-	event := Event{
-		Timestamp: time.Now(),
-		Action:    ActionSet,
-		Key:       "KEY",
+	malicious := "safe.env\n action=forged key=FAKE success=true"
+	if err := handler.Log(Event{Action: ActionLoad, File: malicious, Success: true}); err != nil {
+		t.Fatalf("LogHandler.Log() error = %v", err)
 	}
 
-	err := handler.Log(event)
-	if err != nil {
-		t.Errorf("ChannelHandler.Log() error = %v", err)
-		return
+	out := buf.String()
+	if strings.Contains(out, "\naction=forged") {
+		t.Errorf("log injection succeeded: %q", out)
+	}
+	if !strings.Contains(out, "file=") {
+		t.Errorf("file field missing from output: %q", out)
+	}
+	// The newline must be escaped by %q, so it never appears as a raw line
+	// break inside the log entry.
+	if strings.Count(out, "\n") > 1 {
+		t.Errorf("file field produced more than one line: %q", out)
+	}
+}
+
+// TestChannelHandlersDeliver checks the delivery contract shared by both
+// channel handlers: Log hands the event to the channel unchanged.
+func TestChannelHandlersDeliver(t *testing.T) {
+	tests := []struct {
+		name string
+		newH func() (Handler, <-chan Event)
+	}{
+		{"ChannelHandler", func() (Handler, <-chan Event) {
+			ch := make(chan Event, 1)
+			return NewChannelHandler(ch), ch
+		}},
+		{"CloseableChannelHandler", func() (Handler, <-chan Event) {
+			h := NewCloseableChannelHandler(10)
+			return h, h.Channel()
+		}},
 	}
 
-	select {
-	case received := <-ch:
-		if received.Action != ActionSet {
-			t.Errorf("received action = %v, want %v", received.Action, ActionSet)
-		}
-	case <-time.After(time.Second):
-		t.Error("timeout waiting for event")
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			handler, ch := tt.newH()
+			if ch == nil {
+				t.Fatal("channel should not be nil")
+			}
+			defer func() { _ = handler.Close() }() // best-effort cleanup
+
+			event := Event{
+				Timestamp: time.Now(),
+				Action:    ActionSet,
+				Key:       "KEY",
+			}
+
+			if err := handler.Log(event); err != nil {
+				t.Fatalf("Log() error = %v", err)
+			}
+
+			select {
+			case received := <-ch:
+				if received.Action != ActionSet {
+					t.Errorf("received action = %v, want %v", received.Action, ActionSet)
+				}
+			case <-time.After(time.Second):
+				t.Error("timeout waiting for event")
+			}
+		})
 	}
 }
 
@@ -279,10 +428,11 @@ func TestNopHandler(t *testing.T) {
 	}
 }
 
+// TestDefaultHandler pins that DefaultHandler returns a usable stderr
+// LogHandler (audit.go): logging one event to it succeeds.
 func TestDefaultHandler(t *testing.T) {
-	handler := DefaultHandler()
-	if handler == nil {
-		t.Error("DefaultHandler() should not return nil")
+	if err := DefaultHandler().Log(Event{Action: ActionGet, Key: "KEY"}); err != nil {
+		t.Errorf("DefaultHandler().Log() error = %v, want nil", err)
 	}
 }
 
@@ -290,61 +440,140 @@ func TestDefaultHandler(t *testing.T) {
 // Close Method Tests
 // ============================================================================
 
-func TestJSONHandler_Close(t *testing.T) {
-	t.Run("with closer", func(t *testing.T) {
-		tmpFile, err := os.CreateTemp("", "audit*.json")
-		if err != nil {
-			t.Fatalf("Failed to create temp file: %v", err)
-		}
-		defer os.Remove(tmpFile.Name())
+// TestHandlerClose checks the Close contract of every handler in one table.
+func TestHandlerClose(t *testing.T) {
+	tests := []struct {
+		name string
+		newH func(t *testing.T) Handler
+	}{
+		{"json handler with closer", func(t *testing.T) Handler {
+			tmpFile, err := os.CreateTemp("", "audit*.json")
+			if err != nil {
+				t.Fatalf("Failed to create temp file: %v", err)
+			}
+			t.Cleanup(func() { _ = os.Remove(tmpFile.Name()) }) // best-effort cleanup
+			return NewJSONHandler(tmpFile)
+		}},
+		// Should not error when the underlying writer has no Close.
+		{"json handler without closer", func(t *testing.T) Handler {
+			return NewJSONHandler(&strings.Builder{})
+		}},
+		{"log handler", func(t *testing.T) Handler {
+			return NewLogHandler(nil)
+		}},
+		// DefaultHandler returns a stderr LogHandler, so its Close follows the
+		// same contract (Log behavior is pinned by TestDefaultHandler).
+		{"default handler", func(t *testing.T) Handler {
+			return DefaultHandler()
+		}},
+		{"channel handler", func(t *testing.T) Handler {
+			return NewChannelHandler(make(chan Event, 1))
+		}},
+	}
 
-		handler := NewJSONHandler(tmpFile)
-		if err := handler.Close(); err != nil {
-			t.Errorf("Close() error = %v", err)
-		}
-	})
-
-	t.Run("without closer", func(t *testing.T) {
-		var buf strings.Builder
-		handler := NewJSONHandler(&buf)
-		// Should not error when underlying writer has no Close
-		if err := handler.Close(); err != nil {
-			t.Errorf("Close() error = %v", err)
-		}
-	})
-}
-
-func TestLogHandler_Close(t *testing.T) {
-	handler := NewLogHandler(nil)
-	if err := handler.Close(); err != nil {
-		t.Errorf("Close() error = %v", err)
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			handler := tt.newH(t)
+			if err := handler.Close(); err != nil {
+				t.Errorf("Close() error = %v", err)
+			}
+		})
 	}
 }
 
-func TestChannelHandler_Close(t *testing.T) {
+// TestAuditorLogAfterCloseIsNoop pins the documented Close semantics
+// (audit.go): after Close, Log* calls are no-ops that return nil — no write
+// to a handler whose resources may already be released, and no event.
+func TestAuditorLogAfterCloseIsNoop(t *testing.T) {
 	ch := make(chan Event, 1)
-	handler := NewChannelHandler(ch)
+	a := NewAuditor(NewChannelHandler(ch), nil, nil, true)
 
-	if err := handler.Close(); err != nil {
-		t.Errorf("Close() error = %v", err)
+	if err := a.Close(); err != nil {
+		t.Fatalf("Close() error = %v", err)
+	}
+
+	if err := a.Log(ActionSet, "KEY", "test", true); err != nil {
+		t.Errorf("Log() after Close() error = %v, want nil (documented no-op)", err)
+	}
+	select {
+	case event := <-ch:
+		t.Errorf("Log() after Close() delivered event %+v, want none", event)
+	default:
+		// No event — expected.
 	}
 }
 
-func TestAuditor_Close(t *testing.T) {
-	t.Run("with handler", func(t *testing.T) {
-		ch := make(chan Event, 10)
-		handler := NewChannelHandler(ch)
-		a := NewAuditor(handler, nil, nil, true)
+// countingHandler counts the events that actually reach it.
+type countingHandler struct {
+	events int
+}
 
-		if err := a.Close(); err != nil {
-			t.Errorf("Close() error = %v", err)
+func (h *countingHandler) Log(event Event) error {
+	h.events++
+	return nil
+}
+
+func (h *countingHandler) Close() error { return nil }
+
+// TestAuditor_SetEnabledAfterCloseIsNoop pins the GEN-001 fix: a closed
+// auditor cannot be resurrected by SetEnabled(true) — its handler's
+// resources may already be released, and resuming writes was a
+// use-after-close hazard.
+func TestAuditor_SetEnabledAfterCloseIsNoop(t *testing.T) {
+	handler := &countingHandler{}
+	a := NewAuditor(handler, nil, nil, true)
+
+	if err := a.Close(); err != nil {
+		t.Fatalf("Close() error = %v", err)
+	}
+
+	a.SetEnabled(true)
+	if a.IsEnabled() {
+		t.Fatal("SetEnabled(true) re-enabled a closed auditor")
+	}
+
+	// Log after close stays a no-op success; no event reaches the handler.
+	if err := a.Log(ActionLoad, "KEY", "reason", true); err != nil {
+		t.Fatalf("Log() after Close = %v, want nil (no-op)", err)
+	}
+	if handler.events != 0 {
+		t.Errorf("handler received %d events after Close, want 0", handler.events)
+	}
+}
+
+// TestAuditor_FailClosedLatch verifies the sticky-failure mechanics directly:
+// with fail-closed armed, the first failed Log latches an error that
+// TakeFailure reports exactly once; disarmed, failures are only counted.
+func TestAuditor_FailClosedLatch(t *testing.T) {
+	t.Run("armed latches first failure once", func(t *testing.T) {
+		a := NewAuditor(&panicTestHandler{}, nil, nil, true)
+		a.SetFailClosed(true)
+
+		if err := a.Log(ActionLoad, "KEY", "reason", true); err == nil {
+			t.Fatal("Log() = nil, want the recovered panic error")
+		}
+		if err := a.TakeFailure(); err == nil {
+			t.Fatal("TakeFailure() = nil, want the latched failure")
+		}
+		if err := a.TakeFailure(); err != nil {
+			t.Fatalf("second TakeFailure() = %v, want nil (cleared)", err)
+		}
+		if a.Failures() != 1 {
+			t.Errorf("Failures() = %d, want 1", a.Failures())
 		}
 	})
 
-	t.Run("without handler", func(t *testing.T) {
-		a := NewAuditor(nil, nil, nil, true)
-		if err := a.Close(); err != nil {
-			t.Errorf("Close() error = %v", err)
+	t.Run("disarmed counts but does not latch", func(t *testing.T) {
+		a := NewAuditor(&panicTestHandler{}, nil, nil, true)
+
+		if err := a.Log(ActionLoad, "KEY", "reason", true); err == nil {
+			t.Fatal("Log() = nil, want the recovered panic error")
+		}
+		if err := a.TakeFailure(); err != nil {
+			t.Fatalf("TakeFailure() = %v, want nil (never armed)", err)
+		}
+		if a.Failures() != 1 {
+			t.Errorf("Failures() = %d, want 1", a.Failures())
 		}
 	})
 }
@@ -415,34 +644,35 @@ func TestAuditor_CloseHandlerPanicRecovery(t *testing.T) {
 // CloseableChannelHandler Tests
 // ============================================================================
 
-func TestCloseableChannelHandler_Basic(t *testing.T) {
-	handler := NewCloseableChannelHandler(10)
-	defer handler.Close()
+// TestCloseableChannelHandler_BufferFullDrops pins the buffered drop path
+// (audit.go): when the buffer is full and nothing drains it, the next Log
+// drops the event and reports it ("audit channel full, event dropped")
+// instead of blocking.
+func TestCloseableChannelHandler_BufferFullDrops(t *testing.T) {
+	handler := NewCloseableChannelHandler(1)
+	defer func() { _ = handler.Close() }() // best-effort cleanup
 
-	ch := handler.Channel()
-	if ch == nil {
-		t.Error("Channel() should not return nil")
+	if err := handler.Log(Event{Action: ActionSet, Key: "FIRST"}); err != nil {
+		t.Fatalf("first Log() error = %v, want nil (buffer has room)", err)
 	}
 
-	event := Event{
-		Timestamp: time.Now(),
-		Action:    ActionSet,
-		Key:       "KEY",
+	err := handler.Log(Event{Action: ActionSet, Key: "SECOND"})
+	if err == nil {
+		t.Fatal("second Log() error = nil, want buffer-full drop error")
+	}
+	if !strings.Contains(err.Error(), "audit channel full, event dropped") {
+		t.Errorf("second Log() error = %q, want drop message", err)
 	}
 
-	err := handler.Log(event)
-	if err != nil {
-		t.Errorf("Log() error = %v", err)
-		return
+	// The dropped event never reached the channel; the first one did.
+	if ev := <-handler.Channel(); ev.Key != "FIRST" {
+		t.Errorf("received key = %q, want FIRST (SECOND must be dropped)", ev.Key)
 	}
 
-	select {
-	case received := <-ch:
-		if received.Action != ActionSet {
-			t.Errorf("received action = %v, want %v", received.Action, ActionSet)
-		}
-	case <-time.After(time.Second):
-		t.Error("timeout waiting for event")
+	// DroppedEvents pins the GEN-001 drop counter: one discard, observable
+	// without the best-effort caller having kept the Log error.
+	if got := handler.DroppedEvents(); got != 1 {
+		t.Errorf("DroppedEvents() = %d, want 1", got)
 	}
 }
 
@@ -513,8 +743,43 @@ func TestCloseableChannelHandler_LogAfterClose(t *testing.T) {
 	}
 }
 
-func TestCloseableChannelHandler_IdempotentClose(t *testing.T) {
+// TestCloseableChannelHandler_CloseDuringUnbufferedSend pins the unbuffered
+// send's done-branch: a Log blocked because no receiver is ready must return
+// "handler is closed" (counting the drop) when Close interrupts it, instead
+// of deadlocking or racing a send on a closed channel.
+func TestCloseableChannelHandler_CloseDuringUnbufferedSend(t *testing.T) {
+	handler := NewCloseableChannelHandler(0) // unbuffered
+
+	errc := make(chan error, 1)
+	go func() { errc <- handler.Log(Event{Action: ActionSet, Key: "BLOCKED"}) }()
+
+	// Give the sender time to block in the unbuffered send.
+	time.Sleep(50 * time.Millisecond)
+	if err := handler.Close(); err != nil {
+		t.Fatalf("Close() error = %v", err)
+	}
+
+	select {
+	case err := <-errc:
+		if err == nil {
+			t.Error("blocked Log() error = nil, want handler-closed error")
+		}
+	case <-time.After(time.Second):
+		t.Fatal("blocked Log() did not return after Close()")
+	}
+	if got := handler.DroppedEvents(); got != 1 {
+		t.Errorf("DroppedEvents() = %d, want 1 (interrupted send counted)", got)
+	}
+}
+
+// TestCloseableChannelHandler_CloseLifecycle covers the Close contract in one
+// place: repeated Close is idempotent, and IsClosed reports both states.
+func TestCloseableChannelHandler_CloseLifecycle(t *testing.T) {
 	handler := NewCloseableChannelHandler(10)
+
+	if handler.IsClosed() {
+		t.Error("IsClosed() = true before Close(), want false")
+	}
 
 	// Close multiple times should not error
 	for i := 0; i < 3; i++ {
@@ -531,7 +796,7 @@ func TestCloseableChannelHandler_IdempotentClose(t *testing.T) {
 func TestCloseableChannelHandler_NegativeBufferSize(t *testing.T) {
 	// Negative buffer size should be treated as 0
 	handler := NewCloseableChannelHandler(-1)
-	defer handler.Close()
+	defer func() { _ = handler.Close() }() // best-effort cleanup
 
 	// Should still work (unbuffered)
 	ch := handler.Channel()
@@ -549,7 +814,7 @@ func TestCloseableChannelHandler_NegativeBufferSize(t *testing.T) {
 
 func TestCloseableChannelHandler_Concurrent(t *testing.T) {
 	handler := NewCloseableChannelHandler(100)
-	defer handler.Close()
+	defer func() { _ = handler.Close() }() // best-effort cleanup
 
 	ch := handler.Channel()
 	received := make(chan int, 100)
@@ -598,7 +863,12 @@ func TestAuditEventPool_Boundary(t *testing.T) {
 	})
 
 	t.Run("unexpected pool type falls back to a fresh event", func(t *testing.T) {
-		auditEventPool.Put(new(int)) // poison the pool with a foreign type
+		// sync.Pool may serve any previously pooled victim, so poison it
+		// with several foreign objects to make the type-check fallback
+		// observable regardless of which one Get returns.
+		for i := 0; i < 4; i++ {
+			auditEventPool.Put(new(int))
+		}
 		ev := getAuditEvent()
 		if ev == nil {
 			t.Fatal("getAuditEvent() = nil, want a fresh fallback Event")
@@ -607,19 +877,55 @@ func TestAuditEventPool_Boundary(t *testing.T) {
 	})
 }
 
-// TestCloseableChannelHandler_IsClosedStates covers both states of the
-// closed flag: false while open, true after Close.
-func TestCloseableChannelHandler_IsClosedStates(t *testing.T) {
-	handler := NewCloseableChannelHandler(1)
-	defer handler.Close()
+// TestChannelHandlerNilChannel pins the nil-channel guard: Log must return
+// an error immediately instead of blocking forever on a nil channel send
+// (a send on a nil channel never completes).
+func TestChannelHandlerNilChannel(t *testing.T) {
+	h := NewChannelHandler(nil)
+	if err := h.Log(Event{Action: ActionGet}); err == nil {
+		t.Error("Log(nil channel) error = nil, want error")
+	}
+	if err := h.Close(); err != nil {
+		t.Errorf("Close(nil channel handler) error = %v, want nil", err)
+	}
+}
 
-	if handler.IsClosed() {
-		t.Error("IsClosed() = true before Close(), want false")
+// eventCapturer collects events for assertions.
+type eventCapturer struct {
+	events []Event
+}
+
+func (c *eventCapturer) Log(event Event) error {
+	c.events = append(c.events, event)
+	return nil
+}
+
+func (c *eventCapturer) Close() error { return nil }
+
+// TestAuditor_PanickingCallbacksFailSafe pins the panic guards on the
+// user-supplied isSensitive/masker callbacks (safeIsSensitive /
+// safeMaskSensitive, mirroring safeHandlerLog): a panicking callback must
+// fail SAFE — the key is treated as sensitive and hidden entirely — instead
+// of crashing the caller of Log.
+func TestAuditor_PanickingCallbacksFailSafe(t *testing.T) {
+	cap := &eventCapturer{}
+	a := NewAuditor(cap,
+		func(string) bool { panic("isSensitive boom") },
+		func(key, value string) string { panic("masker boom") },
+		true,
+	)
+
+	if err := a.Log(ActionGet, "SECRET_KEY", "read", true); err != nil {
+		t.Fatalf("Log() error = %v", err)
 	}
-	if err := handler.Close(); err != nil {
-		t.Fatalf("Close() error = %v", err)
+	if len(cap.events) != 1 {
+		t.Fatalf("captured %d events, want 1", len(cap.events))
 	}
-	if !handler.IsClosed() {
-		t.Error("IsClosed() = false after Close(), want true")
+	ev := cap.events[0]
+	if !ev.Masked {
+		t.Error("Masked = false, want true (panicking isSensitive fails safe)")
+	}
+	if ev.Key != "[MASKED]" {
+		t.Errorf("Key = %q, want [MASKED] (panicking masker fails safe)", ev.Key)
 	}
 }

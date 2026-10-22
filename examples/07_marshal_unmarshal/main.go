@@ -3,6 +3,7 @@
 package main
 
 import (
+	"errors"
 	"fmt"
 	"log"
 	"sort"
@@ -19,6 +20,8 @@ func main() {
 	demonstrateFormats()
 
 	demonstrateRoundTrip()
+
+	demonstrateConfiguredParsing()
 }
 
 // demonstrateUnmarshal parses formatted strings into maps and structs.
@@ -43,6 +46,13 @@ func demonstrateUnmarshal() {
 		log.Fatal(err)
 	}
 	fmt.Printf("  JSON → struct: Host=%s Port=%d\n", srv.Host, srv.Port)
+
+	// FormatAuto detects the format from the data itself (nested keys flatten).
+	autoMap, err := env.UnmarshalMap(`{"auto_detect": "works"}`, env.FormatAuto)
+	if err != nil {
+		log.Fatal(err)
+	}
+	fmt.Printf("  auto-detected: %v\n", autoMap)
 }
 
 // demonstrateMarshal converts maps and structs to .env strings.
@@ -120,4 +130,49 @@ func demonstrateRoundTrip() {
 	}
 	sort.Strings(keys)
 	fmt.Printf("  Map keys:  %v\n", keys)
+}
+
+// demonstrateConfiguredParsing applies a Config to one-shot parsing:
+// the DuplicateKeyPolicy decides how duplicate keys in one document resolve,
+// via the WithConfig variants of UnmarshalMap/UnmarshalStruct.
+func demonstrateConfiguredParsing() {
+	fmt.Println("\n=== Configured Parsing (DuplicateKeyPolicy) ===")
+
+	const dupData = "APP_NAME=first\nAPP_NAME=second\n"
+
+	// Default policy (DuplicateKeyInherit): .env follows OverwriteExisting,
+	// which is false in DefaultConfig — the first occurrence wins.
+	first, err := env.UnmarshalMap(dupData)
+	if err != nil {
+		log.Fatal(err)
+	}
+	fmt.Printf("  inherit:    APP_NAME=%s\n", first["APP_NAME"])
+
+	// DuplicateKeyLastWins: last occurrence wins regardless.
+	cfg := env.DefaultConfig()
+	cfg.ParsingConfig.DuplicateKeyPolicy = env.DuplicateKeyLastWins
+	last, err := env.UnmarshalMapWithConfig(cfg, dupData)
+	if err != nil {
+		log.Fatal(err)
+	}
+	fmt.Printf("  last-wins:  APP_NAME=%s\n", last["APP_NAME"])
+
+	// DuplicateKeyError: any duplicate is rejected (matches ErrDuplicateKey).
+	cfg.ParsingConfig.DuplicateKeyPolicy = env.DuplicateKeyError
+	_, err = env.UnmarshalMapWithConfig(cfg, dupData)
+	fmt.Printf("  error:      rejected=%v (errors.Is ErrDuplicateKey)\n",
+		errors.Is(err, env.ErrDuplicateKey))
+
+	// UnmarshalStructWithConfig: the same config-driven rules for structs.
+	type Server struct {
+		Host string `env:"SERVER_HOST"`
+		Port int    `env:"SERVER_PORT"`
+	}
+	var srv Server
+	err = env.UnmarshalStructWithConfig(env.DefaultConfig(),
+		"server:\n  host: 0.0.0.0\n  port: 8443\n", &srv, env.FormatYAML)
+	if err != nil {
+		log.Fatal(err)
+	}
+	fmt.Printf("  YAML → struct: Host=%s Port=%d\n", srv.Host, srv.Port)
 }

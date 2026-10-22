@@ -46,7 +46,10 @@ func TestInternKeyBytes_ConcurrentWithClear(t *testing.T) {
 			go func() {
 				defer wg.Done()
 				for j := 0; j < iterations; j++ {
-					InternKeyBytes([]byte("TEST_KEY"))
+					if got := InternKeyBytes([]byte("TEST_KEY")); got != "TEST_KEY" {
+						t.Errorf("InternKeyBytes concurrent with clear = %q, want %q", got, "TEST_KEY")
+						return
+					}
 				}
 			}()
 		}
@@ -66,6 +69,11 @@ func TestInternKeyBytes_ConcurrentWithClear(t *testing.T) {
 		}
 
 		wg.Wait()
+
+		// After the intern/clear storm the cache must still intern correctly.
+		if got := InternKeyBytes([]byte("TEST_KEY")); got != "TEST_KEY" {
+			t.Errorf("InternKeyBytes after clear storm = %q, want %q", got, "TEST_KEY")
+		}
 	}
 }
 
@@ -116,10 +124,12 @@ func TestDetectCycle_Concurrent(t *testing.T) {
 	iterations := 100
 	concurrency := 5
 
+	// Cyclic map (A→B→A): the concurrent loop keeps its race-detector value,
+	// while the assertions exercise the true path — the previous acyclic map
+	// never returned a cycle at all.
 	vars := map[string]string{
-		"VAR1": "$VAR2",
-		"VAR2": "$VAR3",
-		"VAR3": "value",
+		"A": "$B",
+		"B": "$A",
 	}
 
 	for i := 0; i < concurrency; i++ {
@@ -127,7 +137,15 @@ func TestDetectCycle_Concurrent(t *testing.T) {
 		go func() {
 			defer wg.Done()
 			for j := 0; j < iterations; j++ {
-				DetectCycle(vars)
+				cycle, found := DetectCycle(vars, nil)
+				if !found {
+					t.Errorf("DetectCycle(cyclic map) found = false, want true")
+					return
+				}
+				if cycle == "" {
+					t.Errorf("DetectCycle(cyclic map) cycle = %q, want non-empty key", cycle)
+					return
+				}
 			}
 		}()
 	}
@@ -156,9 +174,20 @@ func TestAuditor_ConcurrentAccess(t *testing.T) {
 		go func() {
 			defer wg.Done()
 			for j := 0; j < iterations; j++ {
-				_ = auditor.Log(ActionSet, "KEY", "test", true) // error irrelevant under concurrent stress
-				_ = auditor.LogError(ActionGet, "KEY", "error") // error irrelevant under concurrent stress
-				_ = auditor.IsEnabled()
+				// Nothing disables the auditor or fails the NopHandler in this
+				// test, so all three results are deterministic.
+				if err := auditor.Log(ActionSet, "KEY", "test", true); err != nil {
+					t.Errorf("Log() error = %v, want nil", err)
+					return
+				}
+				if err := auditor.LogError(ActionGet, "KEY", "error"); err != nil {
+					t.Errorf("LogError() error = %v, want nil", err)
+					return
+				}
+				if !auditor.IsEnabled() {
+					t.Errorf("IsEnabled() = false, want true (never disabled in this test)")
+					return
+				}
 			}
 		}()
 	}
@@ -286,9 +315,6 @@ func TestLineParser_ConcurrentAccess(t *testing.T) {
 	parser := NewLineParser(LineParserConfig{
 		AllowExportPrefix: true,
 		AllowYamlSyntax:   true,
-		OverwriteExisting: true,
-		MaxVariables:      1000,
-		ExpandVariables:   false,
 	}, validator, auditor, expander)
 
 	var wg sync.WaitGroup
@@ -303,33 +329,6 @@ func TestLineParser_ConcurrentAccess(t *testing.T) {
 				_, _, _ = parser.ParseLineBytes([]byte("KEY=value"))
 			}
 		}()
-	}
-
-	wg.Wait()
-}
-
-// ============================================================================
-// Stress Tests
-// ============================================================================
-
-func TestStress_InternKeyBytes(t *testing.T) {
-	if testing.Short() {
-		t.Skip("skipping stress test in short mode")
-	}
-
-	var wg sync.WaitGroup
-	iterations := 10000
-	concurrency := 50
-
-	for i := 0; i < concurrency; i++ {
-		wg.Add(1)
-		go func(id int) {
-			defer wg.Done()
-			for j := 0; j < iterations; j++ {
-				key := "STRESS_KEY_" + string(rune('A'+j%26))
-				InternKeyBytes([]byte(key))
-			}
-		}(i)
 	}
 
 	wg.Wait()

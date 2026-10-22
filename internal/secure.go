@@ -1,4 +1,5 @@
-// Package internal provides secure io.Reader implementations with security limits.
+// Provides secure io.Reader implementations with security limits.
+
 package internal
 
 import (
@@ -29,6 +30,11 @@ type SecureReader struct {
 // NewSecureReader creates a new SecureReader with the specified limits.
 // The returned reader must be returned to the pool via ReleaseSecureReader
 // when done to avoid per-call allocation overhead.
+//
+// Zero-value semantics are deliberately asymmetric and fail-closed: maxSize
+// must be > 0 (a zero maxSize fails every Read with ErrFileTooLarge), while
+// maxLineLen == 0 disables the per-line limit. Callers derive both from the
+// validated root Config, where limits are mandatory-positive.
 func NewSecureReader(r io.Reader, maxSize int64, maxLineLen int) *SecureReader {
 	if maxSize > HardMaxFileSize {
 		maxSize = HardMaxFileSize
@@ -47,6 +53,14 @@ func NewSecureReader(r io.Reader, maxSize int64, maxLineLen int) *SecureReader {
 	sr.lineRead = 0
 	sr.err = nil
 	return sr
+}
+
+// BytesDelivered returns the total number of bytes the wrapped reader has
+// delivered through Read calls so far. Parse callers use it to clear only
+// the region of a pooled buffer that actually held file content (see
+// putScannerBuffer in the root package) instead of the whole buffer.
+func (r *SecureReader) BytesDelivered() int64 {
+	return r.totalRead
 }
 
 // ReleaseSecureReader returns a SecureReader to the pool.

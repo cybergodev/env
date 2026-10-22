@@ -71,6 +71,9 @@ type EnvParser interface {
 }
 
 // EnvStorage defines the interface for storing and retrieving environment variables.
+// The library's internal storage (the sharded secure map) satisfies it as a
+// compile-time contract; no library API currently accepts an EnvStorage, so
+// implement it only when substituting your own storage type.
 type EnvStorage interface {
 	// Get retrieves a value by key. Returns the value and whether it exists.
 	Get(key string) (string, bool)

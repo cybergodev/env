@@ -18,7 +18,7 @@ func main() {
 	if err != nil {
 		log.Fatalf("Failed to create loader: %v", err)
 	}
-	defer loader.Close()
+	defer func() { _ = loader.Close() }() // best-effort cleanup
 
 	// Concurrent reads — many goroutines reading different keys simultaneously.
 	demonstrateConcurrentReads(loader, 10)

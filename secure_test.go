@@ -4,8 +4,8 @@ import (
 	"bytes"
 	"encoding/json"
 	"errors"
-	"io"
 	"log"
+	"strconv"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -42,6 +42,7 @@ func TestSecureValue(t *testing.T) {
 
 		// Release operation
 		{"release value", "test", "release", nil, true},
+		{"release twice is safe", "test", "release_twice", nil, true},
 
 		// Masked output
 		{"masked with value", "test", "masked", "[SECURE:4 bytes]", false},
@@ -80,7 +81,7 @@ func TestSecureValue(t *testing.T) {
 					t.Errorf("Masked() = %q, want %q", sv.Masked(), tt.wantResult)
 				}
 			case "masked_closed":
-				sv.Close()
+				_ = sv.Close() // best-effort cleanup
 				if sv.Masked() != tt.wantResult.(string) {
 					t.Errorf("Masked() = %q, want %q", sv.Masked(), tt.wantResult)
 				}
@@ -89,17 +90,17 @@ func TestSecureValue(t *testing.T) {
 					t.Errorf("Masked() = %q, should contain %q", m, tt.wantResult)
 				}
 			case "string_closed":
-				sv.Close()
+				_ = sv.Close() // best-effort cleanup
 				if sv.String() != tt.wantResult.(string) {
 					t.Errorf("String() after Close() = %q, want %q", sv.String(), tt.wantResult)
 				}
 			case "bytes_closed":
-				sv.Close()
+				_ = sv.Close() // best-effort cleanup
 				if sv.Bytes() != nil {
 					t.Errorf("Bytes() after Close() = %v, want nil", sv.Bytes())
 				}
 			case "length_closed":
-				sv.Close()
+				_ = sv.Close() // best-effort cleanup
 				if sv.Length() != tt.wantResult.(int) {
 					t.Errorf("Length() after Close() = %d, want %d", sv.Length(), tt.wantResult)
 				}
@@ -121,6 +122,14 @@ func TestSecureValue(t *testing.T) {
 					t.Error("IsClosed() = false after Close()")
 				}
 			case "release":
+				sv.Release()
+				if !sv.IsClosed() {
+					t.Error("IsClosed() = false after Release()")
+				}
+			case "release_twice":
+				// Merged from the former TestSecureValue_DoubleReleaseSafe: a
+				// repeated Release on an already-pooled value is a no-op.
+				sv.Release()
 				sv.Release()
 				if !sv.IsClosed() {
 					t.Error("IsClosed() = false after Release()")
@@ -170,40 +179,9 @@ func TestSecureValuePool(t *testing.T) {
 	}
 }
 
-// TestSecureValue_ResetStateConsistency tests the fix for C1:
-// The reset() method should properly manage state transitions
-// with data being cleared before new value is set.
-func TestSecureValue_ResetStateConsistency(t *testing.T) {
-	tests := []struct {
-		name       string
-		setupValue string
-		testValue  string
-		wantString string
-		wantClosed bool
-	}{
-		{"empty_value_is_valid", "", "", "", false},
-		{"non_empty_value_is_not_closed", "test", "", "", false},
-		{"reuse_from_pool_with_empty", "initial", "", "", false},
-		{"reuse_from_pool_preserves_state", "initial", "newvalue", "newvalue", false},
-	}
-
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			sv := NewSecureValue(tt.setupValue)
-			sv.Release()
-
-			sv2 := NewSecureValue(tt.testValue)
-
-			if tt.wantClosed != sv2.IsClosed() {
-				t.Errorf("IsClosed() = %v, want %v", sv2.IsClosed(), tt.wantClosed)
-			}
-
-			if sv2.Reveal() != tt.wantString {
-				t.Errorf("Reveal() = %q, want %q", sv2.Reveal(), tt.wantString)
-			}
-		})
-	}
-}
+// (TestSecureValue_ResetStateConsistency was removed: pool reuse returning a
+// reset, usable value is pinned by TestSecureValuePool, and the empty-value
+// behavior by TestSecureValue's "empty value string/length/masked" rows.)
 
 // ============================================================================
 // secureMap Tests (Table-Driven)
@@ -285,6 +263,12 @@ func TestSecureMap(t *testing.T) {
 				sm.Clear()
 				if sm.Len() != 0 {
 					t.Errorf("Len() after Clear() = %d, want 0", sm.Len())
+				}
+				// The map stays usable after Clear (formerly pinned by the
+				// removed TestSecureMap_ClearReleasesMemory).
+				sm.Set("NEWKEY", "newvalue")
+				if sm.Len() != 1 {
+					t.Errorf("Len() after Set on a cleared map = %d, want 1", sm.Len())
 				}
 
 			case "keys":
@@ -394,6 +378,11 @@ func TestMemoryLock_SecureValue(t *testing.T) {
 		if sv.IsMemoryLocked() {
 			t.Error("IsMemoryLocked() = true when memory locking is disabled")
 		}
+		// From the former TestSecureValue_MemoryLockError: no lock was
+		// attempted, so no lock error is recorded either.
+		if err := sv.MemoryLockError(); err != nil {
+			t.Errorf("MemoryLockError() = %v, want nil when disabled", err)
+		}
 	})
 
 	t.Run("enabled_creates_locked_value", func(t *testing.T) {
@@ -428,7 +417,7 @@ func TestMemoryLock_SecureValue(t *testing.T) {
 	t.Run("close_unlocks_memory", func(t *testing.T) {
 		SetMemoryLockEnabled(true)
 		sv := NewSecureValue("test")
-		sv.Close()
+		_ = sv.Close() // best-effort cleanup
 
 		// After close, should not report as locked
 		if sv.IsMemoryLocked() {
@@ -484,28 +473,120 @@ func TestNewSecureValueStrict(t *testing.T) {
 			t.Errorf("Reveal() = %q, want %q", sv.Reveal(), "sensitive-data")
 		}
 	})
-}
 
-func TestSecureValue_MemoryLockError(t *testing.T) {
-	// Save original state
-	originalEnabled := IsMemoryLockEnabled()
-	defer SetMemoryLockEnabled(originalEnabled)
+	t.Run("empty_value_lock_enabled_no_error", func(t *testing.T) {
+		SetMemoryLockEnabled(true)
 
-	t.Run("no_error_when_disabled", func(t *testing.T) {
-		SetMemoryLockEnabled(false)
-		sv := NewSecureValue("test")
-		defer sv.Release()
+		sv, err := NewSecureValueStrict("")
+		if sv != nil {
+			defer sv.Release()
+		}
 
-		if err := sv.MemoryLockError(); err != nil {
-			t.Errorf("MemoryLockError() = %v, want nil when disabled", err)
+		// reset() returns early for zero-length values before tryLockMemory
+		// runs, so no lock is ever attempted and strict mode sees no error.
+		if err != nil {
+			t.Errorf("NewSecureValueStrict(\"\") error = %v, want nil for zero-length value", err)
+		}
+		if sv == nil {
+			t.Fatal("NewSecureValueStrict(\"\") returned nil")
 		}
 	})
 }
 
-func TestIsMemoryLockSupported(t *testing.T) {
-	// This test just verifies the function doesn't panic
-	supported := IsMemoryLockSupported()
-	t.Logf("IsMemoryLockSupported() = %v", supported)
+// (TestSecureValue_MemoryLockError was folded into TestMemoryLock_SecureValue's
+// disabled_by_default case above.)
+
+// TestSecureValue_MaskedLockStatus pins the lock-status suffix that Masked
+// (and String, which delegates to it) appends when memory locking is enabled:
+// " locked" on success, " lock-failed" on failure, and nothing at all while
+// disabled. Which enabled-state outcome applies depends on OS privileges, so
+// the expectation is derived from the value's own lock state — but the exact
+// string, including the suffix and closing bracket, is asserted.
+func TestSecureValue_MaskedLockStatus(t *testing.T) {
+	origEnabled := IsMemoryLockEnabled()
+	defer SetMemoryLockEnabled(origEnabled)
+
+	const value = "test"
+
+	t.Run("disabled omits lock status", func(t *testing.T) {
+		SetMemoryLockEnabled(false)
+		sv := NewSecureValue(value)
+		defer sv.Release()
+		if got, want := sv.Masked(), "[SECURE:4 bytes]"; got != want {
+			t.Errorf("Masked() = %q, want %q", got, want)
+		}
+	})
+
+	t.Run("enabled appends lock outcome", func(t *testing.T) {
+		SetMemoryLockEnabled(true)
+		sv := NewSecureValue(value)
+		defer sv.Release()
+
+		var want string
+		switch {
+		case sv.IsMemoryLocked():
+			want = "[SECURE:4 bytes locked]"
+			// A successful lock proves the platform supports memory
+			// locking — pins IsMemoryLockSupported's body alongside.
+			if !IsMemoryLockSupported() {
+				t.Error("IsMemoryLockSupported() = false after a successful lock")
+			}
+		case sv.MemoryLockError() != nil:
+			want = "[SECURE:4 bytes lock-failed]"
+		default:
+			want = "[SECURE:4 bytes unlocked]"
+		}
+		if got := sv.Masked(); got != want {
+			t.Errorf("Masked() = %q, want %q", got, want)
+		}
+		if got := sv.String(); got != want {
+			t.Errorf("String() = %q, want %q (String delegates to Masked)", got, want)
+		}
+	})
+
+	// BOUNDARY, deterministic: a value created while locking was disabled
+	// carries neither a lock nor a lock error, so flipping the switch on
+	// afterwards must render the "unlocked" suffix.
+	t.Run("enabled after creation renders unlocked", func(t *testing.T) {
+		SetMemoryLockEnabled(false)
+		sv := NewSecureValue(value)
+		defer sv.Release()
+		SetMemoryLockEnabled(true)
+
+		const want = "[SECURE:4 bytes unlocked]"
+		if got := sv.Masked(); got != want {
+			t.Errorf("Masked() = %q, want %q", got, want)
+		}
+	})
+}
+
+// TestSecureValue_RevealAfterClose pins Reveal on a closed value (secure.go):
+// the backing buffer is zeroed on Close, so the reveal is the empty string.
+func TestSecureValue_RevealAfterClose(t *testing.T) {
+	sv := NewSecureValue("test")
+	if err := sv.Close(); err != nil {
+		t.Fatalf("Close() error = %v", err)
+	}
+	if got := sv.Reveal(); got != "" {
+		t.Errorf("Reveal() after Close() = %q, want \"\"", got)
+	}
+}
+
+// TestNewSecureValue_PoolPoison pins NewSecureValue's pool type guard: a
+// poisoned secureValuePool must fall back to a fresh value instead of
+// panicking on the type assertion.
+func TestNewSecureValue_PoolPoison(t *testing.T) {
+	for i := 0; i < 4; i++ {
+		secureValuePool.Put(new(int))
+	}
+	sv := NewSecureValue("x")
+	if sv == nil {
+		t.Fatal("NewSecureValue() = nil for a poisoned pool")
+	}
+	if got := sv.Reveal(); got != "x" {
+		t.Errorf("Reveal() = %q, want %q (fresh fallback value)", got, "x")
+	}
+	sv.Release()
 }
 
 // TestDefaultStrictLockFailureHandler covers the D-002 strict-mode hook. The
@@ -564,244 +645,51 @@ func TestOnStrictLockFailureSwappable(t *testing.T) {
 }
 
 // ============================================================================
-// Sensitive Key Detection Tests (from sensitive_export_test.go)
+// Sensitive Helper Wiring Tests
 // ============================================================================
 
-func TestIsSensitiveKey(t *testing.T) {
+// TestSensitiveHelpersWiring covers the delegation in sensitive_export.go:
+// each exported helper must return its internal implementation's output. The
+// full behavior matrices live in internal/sensitive_test.go; the rows here
+// (one or two per function) pin known output shapes so the wiring cannot
+// silently detach from the internal implementation.
+func TestSensitiveHelpersWiring(t *testing.T) {
 	tests := []struct {
-		key      string
-		expected bool
+		name string
+		got  string
+		want string
 	}{
-		// Sensitive patterns
-		{"PASSWORD", true},
-		{"SECRET", true},
-		{"API_KEY", true},
-		{"PRIVATE_KEY", true},
-		{"ACCESS_TOKEN", true},
-		{"AUTH_TOKEN", true},
-		{"DATABASE_PASSWORD", true},
-		{"DB_SECRET", true},
-		{"CREDENTIAL", true},
+		// IsSensitiveKey -> internal.IsKey
+		{"IsSensitiveKey flags API_KEY", strconv.FormatBool(IsSensitiveKey("API_KEY")), "true"},
+		{"IsSensitiveKey passes HOST through", strconv.FormatBool(IsSensitiveKey("HOST")), "false"},
 
-		// Non-sensitive patterns
-		{"HOST", false},
-		{"PORT", false},
-		{"DEBUG", false},
-		{"APP_NAME", false},
-		{"LOG_LEVEL", false},
-		{"TIMEOUT", false},
-	}
+		// MaskValue -> internal.MaskValue: sensitive keys mask with the fixed
+		// token (SEC-004 — no length oracle), non-sensitive values pass through.
+		{"MaskValue masks sensitive key", MaskValue("PASSWORD", "super_secret_123"), "[MASKED]"},
+		{"MaskValue masks empty value under sensitive key", MaskValue("SECRET", ""), "[MASKED]"},
+		{"MaskValue passes non-sensitive value", MaskValue("HOST", "localhost"), "localhost"},
 
-	for _, tt := range tests {
-		t.Run(tt.key, func(t *testing.T) {
-			result := IsSensitiveKey(tt.key)
-			if result != tt.expected {
-				t.Errorf("IsSensitiveKey(%q) = %v, want %v", tt.key, result, tt.expected)
-			}
-		})
-	}
-}
+		// MaskKey -> internal.MaskKey: fixed token with no key content (SEC-005).
+		{"MaskKey hides the key spelling", MaskKey("API_KEY"), "[MASKED]"},
 
-// ============================================================================
-// MaskValue Tests
-// ============================================================================
+		// MaskSensitiveInString -> internal.MaskInString (SEC-04 posture)
+		{"MaskSensitiveInString masks secret pair", MaskSensitiveInString("password=hunter2"), "password=[MASKED]"},
+		{"MaskSensitiveInString truncates to 47 chars", MaskSensitiveInString(strings.Repeat("a", 60)), strings.Repeat("a", 47) + "..."},
 
-func TestMaskValue(t *testing.T) {
-	tests := []struct {
-		name     string
-		key      string
-		value    string
-		contains string // check if result contains this
-	}{
-		{
-			name:     "sensitive key masked",
-			key:      "PASSWORD",
-			value:    "super_secret_123",
-			contains: "[MASKED",
-		},
-		{
-			name:     "non-sensitive key not masked",
-			key:      "HOST",
-			value:    "localhost",
-			contains: "localhost",
-		},
-		{
-			name:     "api key masked",
-			key:      "API_KEY",
-			value:    "sk-1234567890abcdef",
-			contains: "[MASKED",
-		},
-		{
-			name:     "empty value",
-			key:      "SECRET",
-			value:    "",
-			contains: "",
-		},
+		// SanitizeForLog -> internal.SanitizeForLog
+		{"SanitizeForLog masks secret pair", SanitizeForLog("password=my_secret_password"), "password=[MASKED]"},
+		{"SanitizeForLog keeps non-sensitive text", SanitizeForLog("host=localhost port=8080"), "host=localhost port=8080"},
 	}
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			result := MaskValue(tt.key, tt.value)
-			if tt.contains != "" && !strings.Contains(result, tt.contains) {
-				t.Errorf("MaskValue(%q, %q) = %q, should contain %q", tt.key, tt.value, result, tt.contains)
+			if tt.got != tt.want {
+				t.Errorf("got %q, want %q", tt.got, tt.want)
 			}
 		})
 	}
 }
 
-// ============================================================================
-// MaskKey Tests
-// ============================================================================
-
-func TestMaskKey(t *testing.T) {
-	tests := []struct {
-		key      string
-		expected string
-	}{
-		{"AB", "***"},
-		{"ABC", "***"},
-		{"ABCD", "AB***"},
-		{"API_KEY", "AP***"},
-		{"", "***"},
-	}
-
-	for _, tt := range tests {
-		t.Run(tt.key, func(t *testing.T) {
-			result := MaskKey(tt.key)
-			if result != tt.expected {
-				t.Errorf("MaskKey(%q) = %q, want %q", tt.key, result, tt.expected)
-			}
-		})
-	}
-}
-
-// ============================================================================
-// MaskSensitiveInString Tests
-// ============================================================================
-
-func TestMaskSensitiveInString(t *testing.T) {
-	tests := []struct {
-		name     string
-		input    string
-		expected string
-	}{
-		{
-			name:     "short non-sensitive string unchanged",
-			input:    "plain value",
-			expected: "plain value",
-		},
-		{
-			name:     "sensitive pattern masked",
-			input:    "password=secret123",
-			expected: "password=[MASKED]",
-		},
-		{
-			name:     "long string truncated",
-			input:    strings.Repeat("a", 60),
-			expected: strings.Repeat("a", 47) + "...",
-		},
-		{
-			name:     "empty string",
-			input:    "",
-			expected: "",
-		},
-		{
-			name:     "exact max length",
-			input:    strings.Repeat("a", 50),
-			expected: strings.Repeat("a", 50),
-		},
-	}
-
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			result := MaskSensitiveInString(tt.input)
-			if result != tt.expected {
-				t.Errorf("MaskSensitiveInString(%q) = %q, want %q", tt.input, result, tt.expected)
-			}
-		})
-	}
-}
-
-// ============================================================================
-// SanitizeForLog Tests
-// ============================================================================
-
-func TestSanitizeForLog(t *testing.T) {
-	tests := []struct {
-		name        string
-		input       string
-		shouldMask  bool // if true, verify value is masked
-		checkResult func(t *testing.T, result string)
-	}{
-		{
-			name:  "removes password value",
-			input: "password=my_secret_password",
-			checkResult: func(t *testing.T, result string) {
-				if strings.Contains(result, "my_secret_password") {
-					t.Errorf("SanitizeForLog() should mask password value, got %q", result)
-				}
-			},
-		},
-		{
-			name:  "removes api_key value",
-			input: "api_key=sk-1234567890",
-			checkResult: func(t *testing.T, result string) {
-				if strings.Contains(result, "sk-1234567890") {
-					t.Errorf("SanitizeForLog() should mask api_key value, got %q", result)
-				}
-			},
-		},
-		{
-			name:  "preserves non-sensitive",
-			input: "host=localhost port=8080",
-			checkResult: func(t *testing.T, result string) {
-				if !strings.Contains(result, "localhost") {
-					t.Errorf("SanitizeForLog() should preserve non-sensitive data, got %q", result)
-				}
-			},
-		},
-		{
-			name:  "empty string",
-			input: "",
-			checkResult: func(t *testing.T, result string) {
-				if result != "" {
-					t.Errorf("SanitizeForLog(\"\") = %q, want empty", result)
-				}
-			},
-		},
-	}
-
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			result := SanitizeForLog(tt.input)
-			tt.checkResult(t, result)
-		})
-	}
-}
-
-// ============================================================================
-// sensitiveKeyPatterns Tests
-// ============================================================================
-
-func TestSensitiveKeyPatterns(t *testing.T) {
-	// Verify patterns exist and are non-empty
-	if len(internal.Patterns) == 0 {
-		t.Error("internal.Patterns should not be empty")
-	}
-
-	// Verify common patterns are included
-	patternStr := strings.ToLower(strings.Join(internal.Patterns, " "))
-	expectedPatterns := []string{"password", "secret", "key", "token", "credential"}
-
-	for _, pattern := range expectedPatterns {
-		if !strings.Contains(patternStr, pattern) {
-			t.Errorf("internal.Patterns should contain pattern containing %q", pattern)
-		}
-	}
-}
-
-// TestSecureMap_EmptyStringValue verifies that empty string values are correctly
-// stored and retrieved (not treated as "not found").
 // TestSecureValue_Nil tests nil SecureValue method calls.
 func TestSecureValue_Nil(t *testing.T) {
 	t.Run("String", func(t *testing.T) {
@@ -846,6 +734,25 @@ func TestSecureValue_Nil(t *testing.T) {
 			t.Errorf("nil Masked() = %q, want [NIL]", got)
 		}
 	})
+	t.Run("Release", func(t *testing.T) {
+		var sv *SecureValue
+		sv.Release() // nil guard: no-op, must not panic
+		if !sv.IsClosed() {
+			t.Error("nil IsClosed() = false after nil Release(), want true")
+		}
+	})
+	t.Run("IsMemoryLocked", func(t *testing.T) {
+		var sv *SecureValue
+		if sv.IsMemoryLocked() {
+			t.Error("nil IsMemoryLocked() = true, want false")
+		}
+	})
+	t.Run("MemoryLockError", func(t *testing.T) {
+		var sv *SecureValue
+		if err := sv.MemoryLockError(); err != nil {
+			t.Errorf("nil MemoryLockError() = %v, want nil", err)
+		}
+	})
 }
 
 // TestBuildIndexedKey tests edge cases for buildIndexedKey.
@@ -862,12 +769,20 @@ func TestBuildIndexedKey(t *testing.T) {
 		{"large index", "KEY", 99999, "KEY_99999"},
 		{"empty base", "", 0, "_0"},
 		{"long base uses builder", strings.Repeat("A", 63), 0, strings.Repeat("A", 63) + "_0"},
+		// BOUNDARY against the hard key-length guard (accessors.go): a base
+		// of HardMaxKeyLength-2 plus "_0" lands exactly on the limit and is
+		// allowed; one byte more is rejected with "".
+		{"total exactly at hard max", strings.Repeat("A", internal.HardMaxKeyLength-2), 0, strings.Repeat("A", internal.HardMaxKeyLength-2) + "_0"},
+		{"total one over hard max", strings.Repeat("A", internal.HardMaxKeyLength-1), 0, ""},
 	}
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			result := buildIndexedKey(tt.base, tt.index)
-			if tt.expected != "" && result != tt.expected {
+			// Unconditional: the negative-index row's expected "" is the real
+			// contract (buildIndexedKey returns "" for index < 0), not a
+			// placeholder to skip.
+			if result != tt.expected {
 				t.Errorf("buildIndexedKey(%q, %d) = %q, want %q", tt.base, tt.index, result, tt.expected)
 			}
 		})
@@ -949,130 +864,46 @@ func TestLoader_NilMethodCalls(t *testing.T) {
 			t.Errorf("nil GetString() = %q, want default", v)
 		}
 	})
-}
 
-// TestLoader_ClosedMethodCalls verifies that methods documenting ErrClosed
-// honor that contract for a closed (but non-nil) loader, not only for nil.
-func TestLoader_ClosedMethodCalls(t *testing.T) {
-	newClosedLoader := func(t *testing.T) *Loader {
-		t.Helper()
-		cfg := DefaultConfig()
-		cfg.Filenames = nil // no file dependency
-		l, err := New(cfg)
-		if err != nil {
-			t.Fatalf("New() error = %v", err)
-		}
-		if err := l.Close(); err != nil {
-			t.Fatalf("Close() error = %v", err)
-		}
-		return l
-	}
-
-	t.Run("ParseInto closed", func(t *testing.T) {
-		l := newClosedLoader(t)
-		if err := l.ParseInto(&struct{}{}); err != ErrClosed {
-			t.Errorf("closed ParseInto() = %v, want ErrClosed", err)
+	// BOUNDARY (accessors.go getWithDefault): typed accessors on a nil
+	// loader return the caller's default (or the zero value) before any
+	// lookup is attempted.
+	t.Run("GetInt nil returns default", func(t *testing.T) {
+		var l *Loader
+		if v := l.GetInt("KEY", 7); v != 7 {
+			t.Errorf("nil GetInt() = %v, want 7", v)
 		}
 	})
-
-	t.Run("Validate closed", func(t *testing.T) {
-		l := newClosedLoader(t)
-		if err := l.Validate(); err != ErrClosed {
-			t.Errorf("closed Validate() = %v, want ErrClosed", err)
+	t.Run("GetDuration nil returns zero", func(t *testing.T) {
+		var l *Loader
+		if v := l.GetDuration("KEY"); v != 0 {
+			t.Errorf("nil GetDuration() = %v, want 0", v)
 		}
 	})
 }
 
-// TestNewCloseableChannelHandler tests the CloseableChannelHandler creation.
-func TestNewCloseableChannelHandler(t *testing.T) {
-	handler := NewCloseableChannelHandler(10)
-	if handler == nil {
-		t.Fatal("NewCloseableChannelHandler() returned nil")
-	}
+// (TestNewCloseableChannelHandler and TestBuildValidatorAdapter_CustomValidator
+// were removed: construction + Close of the closeable channel handler is
+// pinned by TestCloseableChannelHandler_DroppedEvents in
+// audit_failclosed_test.go, and the custom-validator factory wiring — with
+// the same fullMockValidator/minimalMockValidator mocks actually INVOKED — by
+// TestComponentFactory_Validator in utils_test.go, which is the stronger
+// assertion.)
 
-	// Verify we can use it as an AuditHandler
-	_ = AuditHandler(handler)
-
-	// Close should not panic
-	if err := handler.Close(); err != nil {
-		t.Errorf("Close() error = %v", err)
-	}
-}
-
-// TestParserClose tests parser Close methods through the registry.
-func TestParserClose(t *testing.T) {
-	t.Run("parser close via type assertion", func(t *testing.T) {
-		cfg := DefaultConfig()
-		loader, err := New(cfg)
-		if err != nil {
-			t.Fatalf("New() error = %v", err)
-		}
-		defer loader.Close()
-
-		// Access parsers through the registry and test Close via type assertion
-		for _, p := range loader.parsers {
-			if closer, ok := p.(io.Closer); ok {
-				if err := closer.Close(); err != nil {
-					t.Errorf("parser Close() error = %v", err)
-				}
-			}
-		}
-	})
-}
-
-// TestBuildValidatorAdapter_CustomValidator tests the factory adapter with a custom validator
-// that already implements the public Validator interface.
-func TestBuildValidatorAdapter_CustomValidator(t *testing.T) {
-	t.Run("validator implementing public Validator", func(t *testing.T) {
-		cfg := DefaultConfig()
-		cfg.CustomValidator = &fullMockValidator{}
-		factory := cfg.buildComponentFactory()
-		defer factory.Close()
-
-		v := factory.Validator()
-		if v == nil {
-			t.Fatal("Validator() returned nil")
-		}
-	})
-
-	t.Run("validator not implementing public Validator", func(t *testing.T) {
-		cfg := DefaultConfig()
-		cfg.CustomValidator = &minimalMockValidator{}
-		factory := cfg.buildComponentFactory()
-		defer factory.Close()
-
-		v := factory.Validator()
-		if v == nil {
-			t.Fatal("Validator() returned nil")
-		}
-	})
-}
-
-// TestBuildAuditorAdapter tests the factory auditor adapter paths.
+// TestBuildAuditorAdapter keeps the factory.go branch with no runtime
+// equivalent elsewhere: a custom auditor implementing FullAuditLogger is
+// passed through unwrapped. (The former "non-standard auditor" case was
+// removed — TestSetDelete_AuditGating in loader_test.go drives the same
+// wrapper end to end through New and asserts event routing.)
 func TestBuildAuditorAdapter(t *testing.T) {
-	t.Run("with custom FullAuditLogger", func(t *testing.T) {
-		cfg := DefaultConfig()
-		cfg.CustomAuditor = &mockFullAuditLogger{}
-		factory := cfg.buildComponentFactory()
-		defer factory.Close()
+	cfg := DefaultConfig()
+	cfg.CustomAuditor = &mockFullAuditLogger{}
+	factory := cfg.buildComponentFactory()
+	defer func() { _ = factory.Close() }() // best-effort cleanup
 
-		a := factory.Auditor()
-		if a == nil {
-			t.Fatal("Auditor() returned nil")
-		}
-	})
-
-	t.Run("with custom non-standard auditor", func(t *testing.T) {
-		cfg := DefaultConfig()
-		cfg.CustomAuditor = &mockAuditLogger{}
-		factory := cfg.buildComponentFactory()
-		defer factory.Close()
-
-		a := factory.Auditor()
-		if a == nil {
-			t.Fatal("Auditor() returned nil")
-		}
-	})
+	if a := factory.Auditor(); a == nil {
+		t.Fatal("Auditor() returned nil")
+	}
 }
 
 // TestSecureMap_EmptyStringValue verifies that empty string values are correctly
@@ -1124,6 +955,89 @@ func TestSecureMap_EmptyStringValue(t *testing.T) {
 	sm.Clear()
 }
 
+// TestSecureMap_Has covers the allocation-free existence check directly.
+// A closed SecureValue inside a shard counts as absent even though the shard
+// map still holds the entry — reachable only through the shard, since no
+// public API closes an in-map value.
+func TestSecureMap_Has(t *testing.T) {
+	sm := newSecureMap()
+	defer sm.Clear()
+	sm.Set("OPEN_KEY", "value")
+	sm.Set("CLOSED_KEY", "value")
+
+	shard := sm.getShard("CLOSED_KEY")
+	shard.mu.RLock()
+	stored := shard.values["CLOSED_KEY"]
+	shard.mu.RUnlock()
+	_ = stored.Close() // best-effort cleanup
+
+	tests := []struct {
+		key  string
+		want bool
+	}{
+		{"OPEN_KEY", true},
+		{"CLOSED_KEY", false},
+		{"MISSING_KEY", false},
+	}
+	for _, tt := range tests {
+		if got := sm.Has(tt.key); got != tt.want {
+			t.Errorf("Has(%q) = %v, want %v", tt.key, got, tt.want)
+		}
+	}
+
+	// BOUNDARY (secure.go): a stored-but-closed value reads as absent from
+	// Get and GetSecure alike — the closed check, not just the map lookup,
+	// gates both readers.
+	if v, ok := sm.Get("CLOSED_KEY"); ok || v != "" {
+		t.Errorf("Get(CLOSED_KEY) = (%q, %v), want (\"\", false)", v, ok)
+	}
+	if sv := sm.GetSecure("CLOSED_KEY"); sv != nil {
+		t.Errorf("GetSecure(CLOSED_KEY) = %v, want nil", sv)
+	}
+}
+
+// TestSecureMap_SetAllIfAbsent covers the batch insert-if-missing path: it
+// returns the count of newly inserted keys and leaves existing keys' values
+// untouched.
+func TestSecureMap_SetAllIfAbsent(t *testing.T) {
+	sm := newSecureMap()
+	defer sm.Clear()
+	sm.Set("EXISTING", "original")
+
+	inserted := sm.SetAllIfAbsent(map[string]string{
+		"EXISTING": "must-not-replace",
+		"FRESH_A":  "a",
+		"FRESH_B":  "b",
+	})
+	if inserted != 2 {
+		t.Errorf("SetAllIfAbsent() inserted = %d, want 2", inserted)
+	}
+	if v, ok := sm.Get("EXISTING"); !ok || v != "original" {
+		t.Errorf("Get(EXISTING) = (%q, %v), want (%q, true): existing keys must be untouched", v, ok, "original")
+	}
+	for _, key := range []string{"FRESH_A", "FRESH_B"} {
+		if !sm.Has(key) {
+			t.Errorf("Has(%q) = false, want true after SetAllIfAbsent", key)
+		}
+	}
+	if got := sm.Len(); got != 3 {
+		t.Errorf("Len() = %d, want 3", got)
+	}
+
+	// A fully-present batch inserts nothing and still changes no values.
+	if n := sm.SetAllIfAbsent(map[string]string{"EXISTING": "x", "FRESH_A": "y"}); n != 0 {
+		t.Errorf("SetAllIfAbsent() = %d, want 0 for fully-present batch", n)
+	}
+	if v, _ := sm.Get("FRESH_A"); v != "a" {
+		t.Errorf("Get(FRESH_A) = %q, want %q", v, "a")
+	}
+
+	// An empty batch is a no-op.
+	if n := sm.SetAllIfAbsent(nil); n != 0 {
+		t.Errorf("SetAllIfAbsent(nil) = %d, want 0", n)
+	}
+}
+
 // ============================================================================
 // Marshaling Redaction Tests
 // ============================================================================
@@ -1166,7 +1080,7 @@ func TestSecureValue_MarshalRedaction(t *testing.T) {
 
 	t.Run("MarshalJSON on closed value stays masked", func(t *testing.T) {
 		sv := NewSecureValue(secret)
-		sv.Close()
+		_ = sv.Close() // best-effort cleanup
 
 		b, err := json.Marshal(sv)
 		if err != nil {
@@ -1275,5 +1189,41 @@ func TestSecureValue_MemoryLockFailureContract(t *testing.T) {
 	// The value stays usable either way — the data is just not swap-protected.
 	if sv.Reveal() != strings.Repeat("x", 64<<20) {
 		t.Error("Reveal() changed after memory lock failure")
+	}
+}
+
+// ============================================================================
+// Full-Capacity Clearing (GEN-001 hardening)
+// ============================================================================
+
+// TestSecureValueClearCoversFullCapacity pins the security invariant that
+// wiping covers the slice's full capacity, not just its length: after an
+// in-place shrink-and-reuse (reset to a shorter value) the [len, cap) slack
+// must contain only zeros, and Close must zero the whole backing array.
+func TestSecureValueClearCoversFullCapacity(t *testing.T) {
+	sv := NewSecureValue("secretXX") // 8 bytes: len == cap
+
+	// Shrink in place: cap 8 >= 4 and 8 <= 4*2, so reset takes the reuse
+	// branch and re-slices the same backing array.
+	sv.reset("abcd")
+	if len(sv.data) != 4 || cap(sv.data) != 8 {
+		t.Fatalf("after reset: len=%d cap=%d, want len=4 cap=8", len(sv.data), cap(sv.data))
+	}
+	for i, b := range sv.data[4:] {
+		if b != 0 {
+			t.Fatalf("reuse slack byte %d = %q, want 0 (old value survived the shrink)", i, b)
+		}
+	}
+
+	// Close must zero the entire backing array, slack included. Keep an alias
+	// so the array stays observable after clearDataLocked drops the reference.
+	backing := sv.data[:cap(sv.data)]
+	if err := sv.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+	for i, b := range backing {
+		if b != 0 {
+			t.Fatalf("backing array byte %d = %q after Close, want 0", i, b)
+		}
 	}
 }

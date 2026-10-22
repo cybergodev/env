@@ -195,7 +195,7 @@ func Set(key, value string) error {
 // GetSlice retrieves a slice of values from the default loader.
 // Requires Load() or LoadWithConfig() to have been called first.
 // Returns nil if the key is not found and no default is provided.
-// Returns nil if no loader is initialized.
+// Returns the provided default (or nil if none) if no loader is initialized.
 //
 // Indexed keys are searched in format: KEY_0, KEY_1, KEY_2, etc.
 // Also supports comma-separated values as fallback for .env files.
@@ -294,7 +294,9 @@ func GetSecure(key string) *SecureValue {
 	}, nil)
 }
 
-// Validate validates the default loader against required and allowed keys.
+// Validate validates the default loader against required keys: it checks
+// that all RequiredKeys are present. AllowedKeys and ForbiddenKeys are
+// enforced at parse/Set time, not by this function.
 // Requires Load() or LoadWithConfig() to have been called first.
 // Returns ErrNotInitialized if no loader is initialized, or validation errors.
 //
@@ -327,8 +329,9 @@ func Validate() error {
 //
 // Files are loaded sequentially. Whether a later file can override values from
 // an earlier one depends on OverwriteExisting: this function keeps the
-// DefaultConfig value (false), so the first file to set a key wins; set
-// cfg.OverwriteExisting = true via LoadWithConfig for last-file-wins.
+// DefaultConfig value (false), so the first file to set a key wins; use
+// Overload (or cfg.OverwriteExisting = true via LoadWithConfig) for
+// last-file-wins.
 //
 // Supported file formats:
 //   - .env files (dotenv format)
@@ -341,6 +344,10 @@ func Validate() error {
 //	env.Load("config.json")
 //	host := env.GetString("database.host") // "localhost"
 //	port := env.GetInt("database.port")    // 5432
+//
+// Preset shortcut: Load(filenames...) is equivalent to LoadWithConfig with
+// DefaultConfig() and Filenames set to the given files (OverwriteExisting
+// stays false); Overload is the same preset with OverwriteExisting = true.
 //
 // Returns ErrAlreadyInitialized if the default loader has already been initialized.
 //
@@ -363,19 +370,49 @@ func Load(filenames ...string) error {
 		cfg.Filenames = filenames
 	}
 	cfg.AutoApply = true
+	return initDefaultLoader(cfg)
+}
 
-	loader, err := New(cfg)
-	if err != nil {
-		return err
+// Overload initializes the default loader like Load, but with
+// OverwriteExisting enabled: when several files define the same key, the
+// LATER file wins, and loaded values replace variables that already exist in
+// the process environment (the godotenv Overload convention).
+//
+// SECURITY: Load never touches existing process environment variables —
+// deployment-injected variables (container secrets, CI variables) always win
+// over file values. Overload removes that protection: a file value replaces
+// an existing process variable of the same name. When in doubt, prefer Load
+// and order the files by priority (highest first).
+//
+// This function:
+//  1. Sets the package-level default loader (used by GetString, GetInt, etc.)
+//  2. Auto-applies all loaded variables to os.Environ
+//
+// Within a single file the format's duplicate-key semantics are unchanged
+// (see DuplicateKeyPolicy).
+//
+// Preset shortcut: Overload(filenames...) is equivalent to LoadWithConfig
+// with DefaultConfig(), Filenames set to the given files, and
+// OverwriteExisting = true.
+//
+// Returns ErrAlreadyInitialized if the default loader has already been
+// initialized — Load, Overload and LoadWithConfig share one default loader.
+//
+// Example:
+//
+//	// config.yaml values override config.json values for shared keys
+//	if err := env.Overload("config.json", "config.yaml"); err != nil {
+//	    log.Fatal(err)
+//	}
+//	key := env.GetString("deepseek.key", "")
+func Overload(filenames ...string) error {
+	cfg := DefaultConfig()
+	if len(filenames) > 0 {
+		cfg.Filenames = filenames
 	}
-
-	// Set as default loader for package-level functions
-	if err := setDefaultLoader(loader); err != nil {
-		_ = loader.Close() // best-effort cleanup; error not actionable
-		return err
-	}
-
-	return nil
+	cfg.AutoApply = true
+	cfg.OverwriteExisting = true
+	return initDefaultLoader(cfg)
 }
 
 // LoadWithConfig initializes the default loader with a custom configuration.
@@ -387,6 +424,10 @@ func Load(filenames ...string) error {
 //  2. Forces AutoApply=true regardless of cfg.AutoApply value
 //
 // For isolated instances without setting the default, use New().
+//
+// Load and Overload are preset shortcuts over the same mechanism: they build
+// a DefaultConfig()-based Config (differing only in OverwriteExisting) and
+// initialize the same shared default loader.
 //
 // Returns ErrAlreadyInitialized if the default loader has already been initialized.
 //
@@ -402,6 +443,13 @@ func LoadWithConfig(cfg Config) error {
 	// Force AutoApply: convenience functions (GetString, etc.) require
 	// variables applied to os.Environ. Use New() for manual control.
 	cfg.AutoApply = true
+	return initDefaultLoader(cfg)
+}
+
+// initDefaultLoader creates a loader from cfg and installs it as the
+// package-level default loader for the convenience functions. Shared by Load,
+// Overload and LoadWithConfig, which differ only in the Config they build.
+func initDefaultLoader(cfg Config) error {
 	loader, err := New(cfg)
 	if err != nil {
 		return err
@@ -409,6 +457,13 @@ func LoadWithConfig(cfg Config) error {
 
 	// Set as default loader for package-level functions
 	if err := setDefaultLoader(loader); err != nil {
+		// NOTE: New(cfg) may already have applied variables to os.Environ
+		// (Load/LoadWithConfig force AutoApply=true). Close clears only the
+		// in-memory copies — the process-environment variables set during
+		// construction are NOT unset — so a failed init (e.g.
+		// ErrAlreadyInitialized from a concurrent Load) leaves them behind.
+		// Treat a failed Load as "the default loader is unchanged", not "the
+		// process environment is unchanged".
 		_ = loader.Close() // best-effort cleanup; error not actionable
 		return err
 	}

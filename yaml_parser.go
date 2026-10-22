@@ -10,6 +10,7 @@ import (
 type yamlParser struct {
 	structuredParserConfig
 	flatten internal.YAMLFlattenConfig
+	dup     internal.DuplicateKeyPolicy
 }
 
 // Compile-time check that yamlParser implements EnvParser.
@@ -17,34 +18,31 @@ var _ EnvParser = (*yamlParser)(nil)
 
 // newYAMLParserWithFactory creates a new yamlParser with a ComponentFactory.
 func newYAMLParserWithFactory(cfg Config, factory *ComponentFactory) (*yamlParser, error) {
-	maxDepth := cfg.YAMLMaxDepth
-	if maxDepth <= 0 {
-		maxDepth = defaultStructuredMaxDepth
-	}
-
 	flattenCfg := internal.YAMLFlattenConfig{
 		KeyDelimiter:     "_",
 		ArrayIndexFormat: "underscore",
 		NullAsEmpty:      cfg.YAMLNullAsEmpty,
 		NumberAsString:   cfg.YAMLNumberAsString,
 		BoolAsString:     cfg.YAMLBoolAsString,
-		MaxDepth:         maxDepth,
+		MaxDepth:         normalizeStructuredDepth(cfg.YAMLMaxDepth),
+		DuplicateKey:     cfg.DuplicateKeyPolicy,
 	}
 
 	return &yamlParser{
-		structuredParserConfig: structuredParserConfig{
-			config:    cfg,
-			validator: factory.Validator(),
-			auditor:   factory.Auditor(),
-		},
-		flatten: flattenCfg,
+		structuredParserConfig: newStructuredParserConfig(cfg, factory),
+		flatten:                flattenCfg,
+		dup:                    cfg.DuplicateKeyPolicy,
 	}, nil
 }
 
 // Parse reads and parses YAML content from an io.Reader.
+// Duplicate mapping keys resolve per the configured DuplicateKeyPolicy
+// (default: last occurrence wins, deliberately lenient; see
+// internal.ParseYAMLWithPolicy). Flat-key collisions from different source
+// paths always error (see internal.FlattenYAML).
 func (p *yamlParser) Parse(r io.Reader, filename string) (map[string]string, error) {
 	return p.structuredParseResult(r, filename, "YAML", func(data []byte) (map[string]string, error) {
-		value, err := internal.ParseYAML(data, p.flatten.MaxDepth)
+		value, err := internal.ParseYAMLWithPolicy(data, p.flatten.MaxDepth, p.dup)
 		if err != nil {
 			return nil, err
 		}

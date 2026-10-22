@@ -1,4 +1,5 @@
-// Package internal provides shared resource pools for the env package.
+// Provides shared resource pools for the env package.
+
 package internal
 
 import (
@@ -32,29 +33,31 @@ func GetBuilder() *strings.Builder {
 }
 
 // PutBuilder returns a strings.Builder to the shared pool.
-// Builders with capacity exceeding MaxPooledBuilderSize are discarded
-// to prevent memory bloat.
-// The builder is reset before returning to pool for hygiene and to allow
-// GC to reclaim the previous string data.
+//
+// SCOPE NOTE: strings.Builder.Reset() drops the internal buffer entirely
+// (buf = nil), so this pool recycles only the small builder struct header —
+// each GetBuilder/Write cycle still allocates a fresh byte buffer on first
+// write. That is the minimum allocation profile anyway for callers that
+// return builder.String() (zero-copy into a fresh buffer, no hazard when the
+// builder is reused); pooling a reusable buffer instead (e.g. bytes.Buffer)
+// would not reduce the total: String() must copy out, and retained pooled
+// buffers would hold stale contents.
 //
 // SECURITY LIMITATION: strings.Builder does not expose its internal buffer,
-// so we cannot directly clear the contents before pooling. However, the data
-// will be overwritten when the builder is reused. For environments requiring
-// strict data clearing, consider not using the pool for sensitive operations.
-// The Go standard library guarantees that Reset() only sets len to 0,
-// preserving the underlying buffer capacity.
+// so we cannot directly clear the contents before pooling. However, Reset()
+// releases the buffer (it is not retained, and any String() result already
+// holds the only reference to its bytes). For environments requiring strict
+// data clearing, consider not using the pool for sensitive operations.
 func PutBuilder(sb *strings.Builder) {
 	if sb == nil {
 		return
 	}
-	// Reset before capacity check and pooling for hygiene
-	// Note: Reset() sets len=0 but doesn't clear the underlying buffer
-	// The data will be overwritten when the builder is reused
+	// Reset drops the buffer reference (allowing GC of the previous string
+	// data) and returns the builder struct to its zero state before pooling.
+	// Cap() is always 0 after Reset (buf = nil), so no size gate is possible
+	// or needed — only the struct header is ever pooled (see SCOPE NOTE).
 	sb.Reset()
-	// Don't pool very large builders
-	if sb.Cap() <= MaxPooledBuilderSize {
-		builderPool.Put(sb)
-	}
+	builderPool.Put(sb)
 }
 
 // ============================================================================

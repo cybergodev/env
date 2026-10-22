@@ -1,7 +1,9 @@
-// Package internal provides variable expansion with security limits.
+// Provides variable expansion with security limits.
+
 package internal
 
 import (
+	"fmt"
 	"regexp"
 	"sort"
 	"strings"
@@ -12,21 +14,74 @@ import (
 type Mode int
 
 const (
-	// ModeEnv expands $VAR and ${VAR} syntax.
+	// ModeEnv expands $VAR and ${VAR} syntax, including the brace operators
+	// (${VAR:-default}, ${VAR:=default}, ${VAR:?err}) — the same treatment a
+	// POSIX shell gives an expansion. Brace operators are NOT disabled in
+	// this mode.
 	// This is the zero value, making it the default when Mode is not explicitly set.
 	ModeEnv Mode = iota
 	// ModeNone disables variable expansion entirely.
 	ModeNone
-	// ModeAll expands $VAR, ${VAR}, and ${VAR:-default} syntax.
+	// ModeAll expands $VAR, ${VAR}, and the brace operators. Behaviorally
+	// identical to ModeEnv — expansion is all-or-nothing, gated only on
+	// ModeNone; it exists for explicitness at call sites.
 	ModeAll
 )
 
 // braceOperators is a lookup table for valid brace expansion operators.
-// Used for O(1) operator validation in expandBracedVariable.
+// Used for O(1) operator validation in parseBraceOperator.
 var braceOperators = [256]bool{
 	'-': true, // ${VAR:-default}
 	'=': true, // ${VAR:=default}
 	'?': true, // ${VAR:?error}
+}
+
+// findClosingBrace returns the index of the '}' that matches the '{' at s[1],
+// accounting for nested braces, or -1 when the braces are unbalanced. Shared
+// by the single-variable fast path and the general expansion path so the
+// matching rules cannot drift apart.
+// Precondition: len(s) >= 2, s[0] == '$', s[1] == '{'.
+func findClosingBrace(s string) int {
+	depth := 0
+	for i := 0; i < len(s); i++ {
+		switch s[i] {
+		case '{':
+			depth++
+		case '}':
+			depth--
+			if depth == 0 {
+				return i
+			}
+		}
+	}
+	return -1
+}
+
+// parseBraceOperator splits ${...} content at the first valid :-, := or :?
+// operator (validated via braceOperators). It returns the variable name, the
+// default/error text after the operator, the operator byte, and whether an
+// operator was present at all. Single source of truth for both expansion
+// paths: they previously re-implemented this scan independently, and the
+// divergence produced the :? regression fixed in expandBracedVariable.
+func parseBraceOperator(content string) (key, def string, op byte, hasDefault bool) {
+	for i := 0; i < len(content)-1; i++ {
+		if content[i] == ':' && braceOperators[content[i+1]] {
+			return content[:i], content[i+2:], content[i+1], true
+		}
+	}
+	return content, "", 0, false
+}
+
+// scanVarName extracts the $VAR name at the start of s ('$' at s[0]) and
+// returns it together with the index just past the last variable character.
+// Returns end == 1 when no valid variable character follows the '$'.
+// Precondition: len(s) >= 2, s[0] == '$'.
+func scanVarName(s string) (key string, end int) {
+	end = 1
+	for end < len(s) && isVarChar(s[end]) {
+		end++
+	}
+	return s[1:end], end
 }
 
 // visitedMapPool provides a pool of reusable visited maps for cycle detection.
@@ -82,6 +137,13 @@ type ExpanderConfig struct {
 	Lookup     func(string) (string, bool)
 	Mode       Mode
 	KeyPattern *regexp.Regexp // For key validation
+	// MaxValueLength bounds the OUTPUT of expanding a single value. Raw
+	// values are length-checked at parse time, but a multi-reference chain
+	// (V1=${V2}x${V2}) doubles per level without ever cycling, so the
+	// expanded result could otherwise grow as 2^depth × raw size.
+	// <=0 means DefaultMaxValueLength; values above HardMaxValueLength are
+	// clamped to it.
+	MaxValueLength int
 }
 
 // Expander handles variable expansion with security limits.
@@ -91,6 +153,15 @@ type Expander struct {
 	mode            Mode
 	keyPattern      *regexp.Regexp
 	useDefaultCheck bool // If true, use isValidDefaultKey instead of regex
+	maxValueLen     int  // Bound on one expanded value; always >0 via NewExpander
+	// literal names keys whose values came from single-quoted .env source
+	// and must be inserted verbatim wherever they are referenced (bash '...'
+	// semantics). Nil on standalone expanders — no keys are literal.
+	literal map[string]struct{}
+	// assignments collects ':=' write-backs. It is non-nil only on the
+	// per-batch expander built by ExpandAllInMap; a standalone Expander has
+	// nowhere to store an assignment, so ':=' degrades to ':-' there.
+	assignments map[string]string
 }
 
 // NewExpander creates a new Expander with the specified configuration.
@@ -101,6 +172,14 @@ func NewExpander(cfg ExpanderConfig) *Expander {
 	}
 	if maxDepth > HardMaxExpansionDepth {
 		maxDepth = HardMaxExpansionDepth
+	}
+
+	maxValueLen := cfg.MaxValueLength
+	if maxValueLen <= 0 {
+		maxValueLen = DefaultMaxValueLength
+	}
+	if maxValueLen > HardMaxValueLength {
+		maxValueLen = HardMaxValueLength
 	}
 
 	lookup := cfg.Lookup
@@ -125,6 +204,7 @@ func NewExpander(cfg ExpanderConfig) *Expander {
 		mode:            mode,
 		keyPattern:      keyPattern,
 		useDefaultCheck: useDefaultCheck,
+		maxValueLen:     maxValueLen,
 	}
 }
 
@@ -180,6 +260,22 @@ func (e *Expander) Expand(s string) (string, error) {
 // This is an optimized path that avoids builder allocation for simple cases.
 //
 // Precondition: len(s) >= 2 and s[0] == '$' (caller is responsible for ensuring this)
+// boundValue enforces the MaxValueLength output bound on single-variable
+// fast paths, which return looked-up values directly (external lookups are
+// os.LookupEnv results that never passed parse-time validation) instead of
+// going through the builder the general path checks after every write
+// (GEN-001). Mirrors the general path's error exactly.
+func (e *Expander) boundValue(value string) (string, error) {
+	if len(value) > e.maxValueLen {
+		return "", &ValidationError{
+			Field:   "value",
+			Rule:    "max_length",
+			Message: "expanded value exceeds maximum length",
+		}
+	}
+	return value, nil
+}
+
 func (e *Expander) expandSingleVar(s string) (string, error) {
 	// Note: Caller (Expand) guarantees len(s) >= 2, so we skip the check here
 
@@ -202,11 +298,7 @@ func (e *Expander) expandFull(s string) (string, error) {
 // expandSingleSimpleVar handles $VAR syntax with leaf-value fast path.
 // Skips the visited map allocation when the resolved value has no further $ references.
 func (e *Expander) expandSingleSimpleVar(s string) (string, error) {
-	// Extract variable name
-	end := 1
-	for end < len(s) && isVarChar(s[end]) {
-		end++
-	}
+	key, end := scanVarName(s)
 	if end == 1 {
 		// No valid variable name after $ — fall back to full expansion
 		// which handles the remaining characters correctly
@@ -214,7 +306,6 @@ func (e *Expander) expandSingleSimpleVar(s string) (string, error) {
 		defer putVisitedMap(visited)
 		return e.expandWithDepth(s, 0, visited)
 	}
-	key := s[1:end]
 
 	// Look up value
 	value, ok := e.lookup(key)
@@ -227,12 +318,24 @@ func (e *Expander) expandSingleSimpleVar(s string) (string, error) {
 		return e.expandFull(s)
 	}
 
+	// Literal (single-quoted) source: insert verbatim. The whole-string case
+	// returns directly; with a suffix the general path resolves the reference
+	// through expandSimpleVariable's literal check and keeps expanding only
+	// the suffix.
+	if _, literal := e.literal[key]; literal {
+		if end == len(s) {
+			return value, nil
+		}
+		return e.expandFull(s)
+	}
+
 	// Fast path: if the value is a leaf (no $), no recursion needed.
 	// This avoids the visited map pool Get/Put + map set/delete overhead.
 	if strings.IndexByte(value, '$') == -1 {
-		// If the entire string was consumed, return directly
+		// If the entire string was consumed, return directly (bounded —
+		// see boundValue)
 		if end == len(s) {
-			return value, nil
+			return e.boundValue(value)
 		}
 		// Otherwise fall back to full expansion
 		visited := getVisitedMap()
@@ -240,18 +343,12 @@ func (e *Expander) expandSingleSimpleVar(s string) (string, error) {
 		return e.expandWithDepth(s, 0, visited)
 	}
 
-	// Value has $ references — need full expansion with cycle detection
+	// Value has $ references — need full expansion with cycle detection.
+	// visited is freshly acquired (and therefore empty), so no pre-check is
+	// needed: the cycle test runs inside expandWithDepth once the reference
+	// is marked below.
 	visited := getVisitedMap()
 	defer putVisitedMap(visited)
-
-	// SECURITY: Check for cycles before recursing
-	if visited[key] {
-		return "", &ExpansionError{
-			Key:   key,
-			Depth: 0,
-			Chain: e.buildChain(visited),
-		}
-	}
 
 	visited[key] = true
 	expanded, err := e.expandWithDepth(value, 1, visited)
@@ -273,20 +370,7 @@ func (e *Expander) expandSingleSimpleVar(s string) (string, error) {
 // Skips the visited map allocation when the resolved value has no further $ references.
 func (e *Expander) expandSingleBracedVar(s string) (string, error) {
 	// Fast path: try to resolve without visited map first
-	// Find the matching closing brace
-	braceDepth := 0
-	end := -1
-	for i := 0; i < len(s); i++ {
-		if s[i] == '{' {
-			braceDepth++
-		} else if s[i] == '}' {
-			braceDepth--
-			if braceDepth == 0 {
-				end = i
-				break
-			}
-		}
-	}
+	end := findClosingBrace(s)
 	if end == -1 {
 		return s, nil
 	}
@@ -300,44 +384,26 @@ func (e *Expander) expandSingleBracedVar(s string) (string, error) {
 		return e.expandFull(s)
 	}
 
-	// Parse operator (:-,:=,:?)
-	var key, defaultValue string
-	var hasDefault bool
-	var opType byte
+	// Parse operator (:-,:=,:?) via the shared parser
+	key, defaultValue, opType, hasDefault := parseBraceOperator(content)
 
-	colonIdx := -1
-	for i := 0; i < len(content)-1; i++ {
-		if content[i] == ':' && braceOperators[content[i+1]] {
-			colonIdx = i
-			opType = content[i+1]
-			break
-		}
-	}
-
-	if colonIdx != -1 {
-		key = content[:colonIdx]
-		defaultValue = content[colonIdx+2:]
-		hasDefault = true
-
-		if opType == '?' {
-			value, ok := e.lookup(key)
-			if !ok || value == "" {
-				// SECURITY (SEC-05): do not echo the file-supplied :? message
-				// into the error struct (see expandBracedVariable).
-				return "", &ExpansionError{
-					Key:   key,
-					Kind:  ExpansionRequiredKind,
-					Chain: "required variable not set",
-				}
+	if hasDefault && opType == '?' {
+		value, ok := e.lookup(key)
+		if !ok || value == "" {
+			// SECURITY (SEC-05): do not echo the file-supplied :? message
+			// into the error struct (see expandBracedVariable).
+			return "", &ExpansionError{
+				Key:   key,
+				Kind:  ExpansionRequiredKind,
+				Chain: "required variable not set",
 			}
-			// Value is set — if entire string consumed and no $, return directly
-			if end+1 == len(s) && strings.IndexByte(value, '$') == -1 {
-				return value, nil
-			}
-			// Fall through to full expansion
 		}
-	} else {
-		key = content
+		// Value is set — if entire string consumed and no $, return directly
+		// (bounded — see boundValue)
+		if end+1 == len(s) && strings.IndexByte(value, '$') == -1 {
+			return e.boundValue(value)
+		}
+		// Fall through to full expansion
 	}
 
 	// Validate key
@@ -358,6 +424,9 @@ func (e *Expander) expandSingleBracedVar(s string) (string, error) {
 
 	// Look up the value
 	value, ok := e.lookup(key)
+	// ':=' on an unset variable assigns the expanded default; on this leaf
+	// fast path the raw default has no '$', so it is already expanded.
+	assign := !ok && hasDefault && opType == '='
 	if !ok {
 		if hasDefault {
 			value = defaultValue
@@ -369,9 +438,25 @@ func (e *Expander) expandSingleBracedVar(s string) (string, error) {
 		}
 	}
 
-	// Fast path: leaf value (no $) and entire string consumed
+	// Literal (single-quoted) source: verbatim when the reference spans the
+	// whole string; otherwise the general path inserts it verbatim via
+	// expandBracedVariable's literal check.
+	if ok {
+		if _, literal := e.literal[key]; literal {
+			if end+1 == len(s) {
+				return value, nil
+			}
+			return e.expandFull(s)
+		}
+	}
+
+	// Fast path: leaf value (no $) and entire string consumed (bounded —
+	// see boundValue)
 	if end+1 == len(s) && strings.IndexByte(value, '$') == -1 {
-		return value, nil
+		if assign {
+			e.recordAssign(key, value)
+		}
+		return e.boundValue(value)
 	}
 
 	// Need full expansion with cycle detection
@@ -391,18 +476,9 @@ func (e *Expander) expandSingleBracedVar(s string) (string, error) {
 }
 
 // expandWithDepth performs expansion with depth tracking and cycle detection.
-// SECURITY: Includes stack overflow protection to prevent deep recursion crashes.
+// SECURITY: recursion is bounded by maxDepth, which NewExpander clamps to
+// HardMaxExpansionDepth — no separate stack-depth guard is needed.
 func (e *Expander) expandWithDepth(s string, depth int, visited map[string]bool) (string, error) {
-	// SECURITY: Stack overflow protection - use a reasonable limit even if maxDepth is high
-	// This prevents stack exhaustion on systems with small stack sizes
-	const maxStackDepth = 100 // Conservative limit for stack safety
-	if depth >= maxStackDepth {
-		return "", &ExpansionError{
-			Depth: depth,
-			Limit: maxStackDepth,
-			Chain: "stack depth limit exceeded (potential stack overflow)",
-		}
-	}
 	// Use >= to ensure maxDepth is the actual maximum depth (not maxDepth+1)
 	if depth >= e.maxDepth {
 		return "", &ExpansionError{
@@ -480,6 +556,19 @@ func (e *Expander) expandWithDepth(s string, depth int, visited map[string]bool)
 				return "", err
 			}
 			result.WriteString(expanded)
+			// SECURITY: bound the builder as it grows. Multi-reference DAG
+			// amplification (V1=${V2}x${V2}) doubles per level without ever
+			// cycling, so depth and cycle checks cannot see it; checking
+			// here aborts the moment any intermediate expansion crosses
+			// maxValueLen, keeping peak memory O(depth × maxValueLen)
+			// instead of 2^depth × raw size.
+			if result.Len() > e.maxValueLen {
+				return "", &ValidationError{
+					Field:   "value",
+					Rule:    "max_length",
+					Message: "expanded value exceeds maximum length",
+				}
+			}
 			i += consumed
 			segStart = i
 		} else {
@@ -489,6 +578,15 @@ func (e *Expander) expandWithDepth(s string, depth int, visited map[string]bool)
 	// Write any remaining segment
 	if segStart < len(s) {
 		result.WriteString(s[segStart:])
+	}
+	// SECURITY: covers the tail segment written above (and doubles as the
+	// final output bound for this level of the recursion).
+	if result.Len() > e.maxValueLen {
+		return "", &ValidationError{
+			Field:   "value",
+			Rule:    "max_length",
+			Message: "expanded value exceeds maximum length",
+		}
 	}
 
 	return result.String(), nil
@@ -519,20 +617,7 @@ func (e *Expander) expandVariable(s string, depth int, visited map[string]bool) 
 // Handles nested braces correctly by counting brace depth.
 func (e *Expander) expandBracedVariable(s string, depth int, visited map[string]bool) (string, int, error) {
 	// Find the matching closing brace, handling nested braces
-	// We need to find '}' at depth 1 (not inside any nested braces)
-	braceDepth := 0
-	end := -1
-	for i := 0; i < len(s); i++ {
-		if s[i] == '{' {
-			braceDepth++
-		} else if s[i] == '}' {
-			braceDepth--
-			if braceDepth == 0 {
-				end = i
-				break
-			}
-		}
-	}
+	end := findClosingBrace(s)
 	if end == -1 {
 		// SECURITY: No closing brace - return the original string unchanged
 		// This makes it clear that expansion failed rather than returning a confusing placeholder
@@ -545,63 +630,48 @@ func (e *Expander) expandBracedVariable(s string, depth int, visited map[string]
 		return "{}", end + 1, nil
 	}
 
-	// Check for default value syntax using a single scan
-	var key, defaultValue string
-	var hasDefault bool
-	var opType byte // '-' for :-, '=' for :=, '?' for :?
+	// Check for default value syntax (:-, :=, :?) via the shared parser
+	key, defaultValue, opType, hasDefault := parseBraceOperator(content)
 
-	// Single scan to find colon operator using lookup table for O(1) validation
-	colonIdx := -1
-	for i := 0; i < len(content)-1; i++ {
-		if content[i] == ':' && braceOperators[content[i+1]] {
-			colonIdx = i
-			opType = content[i+1]
-			break
+	// Handle :? operator specially
+	if hasDefault && opType == '?' {
+		value, ok := e.lookup(key)
+		if !ok || value == "" {
+			// SECURITY (SEC-05): the :? message is file content — echoing
+			// it into the error leaks attacker-controlled (or
+			// secret-bearing) text; the masked Key already identifies the
+			// variable.
+			return "", end + 1, &ExpansionError{
+				Key:   key,
+				Kind:  ExpansionRequiredKind,
+				Chain: "required variable not set",
+			}
 		}
-	}
-
-	if colonIdx != -1 {
-		key = content[:colonIdx]
-		defaultValue = content[colonIdx+2:]
-		hasDefault = true
-
-		// Handle :? operator specially
-		if opType == '?' {
-			value, ok := e.lookup(key)
-			if !ok || value == "" {
-				// SECURITY (SEC-05): the :? message is file content — echoing
-				// it into the error leaks attacker-controlled (or
-				// secret-bearing) text; the masked Key already identifies the
-				// variable.
-				return "", end + 1, &ExpansionError{
-					Key:   key,
-					Kind:  ExpansionRequiredKind,
-					Chain: "required variable not set",
-				}
-			}
-			// The set-value must be expanded like the plain ${VAR} path below:
-			// it may itself contain $VAR references (HOST=$BASE with
-			// ${HOST:?required} must yield the expansion of $BASE, not the raw
-			// "$BASE" — regression: this branch previously returned the value
-			// unexpanded). Cycle detection mirrors the main path so a required
-			// variable that participates in a cycle errors instead of recursing.
-			if visited[key] {
-				return "", end + 1, &ExpansionError{
-					Key:   key,
-					Depth: depth,
-					Chain: e.buildChain(visited),
-				}
-			}
-			visited[key] = true
-			expanded, err := e.expandWithDepth(value, depth+1, visited)
-			delete(visited, key)
-			if err != nil {
-				return "", end + 1, err
-			}
-			return expanded, end + 1, nil
+		// The set-value must be expanded like the plain ${VAR} path below:
+		// it may itself contain $VAR references (HOST=$BASE with
+		// ${HOST:?required} must yield the expansion of $BASE, not the raw
+		// "$BASE" — regression: this branch previously returned the value
+		// unexpanded). Cycle detection mirrors the main path so a required
+		// variable that participates in a cycle errors instead of recursing.
+		// Literal (single-quoted) source values are the exception: insert
+		// verbatim, no recursion.
+		if _, literal := e.literal[key]; literal {
+			return value, end + 1, nil
 		}
-	} else {
-		key = content
+		if visited[key] {
+			return "", end + 1, &ExpansionError{
+				Key:   key,
+				Depth: depth,
+				Chain: e.buildChain(visited),
+			}
+		}
+		visited[key] = true
+		expanded, err := e.expandWithDepth(value, depth+1, visited)
+		delete(visited, key)
+		if err != nil {
+			return "", end + 1, err
+		}
+		return expanded, end + 1, nil
 	}
 
 	// Validate the key
@@ -627,6 +697,9 @@ func (e *Expander) expandBracedVariable(s string, depth int, visited map[string]
 
 	// Look up the value
 	value, ok := e.lookup(key)
+	// ':=' on an unset variable assigns the expanded default (POSIX ':=');
+	// the write-back is recorded after the value is fully expanded below.
+	assign := !ok && hasDefault && opType == '='
 	if !ok {
 		// Variable not set - use default if available
 		if hasDefault {
@@ -636,6 +709,15 @@ func (e *Expander) expandBracedVariable(s string, depth int, visited map[string]
 		}
 	}
 	// Note: An empty string is a valid explicit value and should NOT trigger the default
+
+	// Literal (single-quoted) source values insert verbatim — no recursion
+	// and no cycle participation (a cycle through a literal key is
+	// unreachable, matching DetectCycle's treatment of them).
+	if ok {
+		if _, literal := e.literal[key]; literal {
+			return value, end + 1, nil
+		}
+	}
 
 	// Mark as visited for cycle detection
 	visited[key] = true
@@ -648,23 +730,20 @@ func (e *Expander) expandBracedVariable(s string, depth int, visited map[string]
 		return "", end + 1, err
 	}
 
+	if assign {
+		e.recordAssign(key, expanded)
+	}
+
 	return expanded, end + 1, nil
 }
 
 // expandSimpleVariable expands $VAR syntax.
 func (e *Expander) expandSimpleVariable(s string, depth int, visited map[string]bool) (string, int, error) {
-	// Extract the variable name
-	end := 1
-	for end < len(s) && isVarChar(s[end]) {
-		end++
-	}
-
+	key, end := scanVarName(s)
 	if end == 1 {
 		// No valid variable name after $
 		return "$", 1, nil
 	}
-
-	key := s[1:end]
 
 	// Check for cycles
 	if visited[key] {
@@ -679,6 +758,12 @@ func (e *Expander) expandSimpleVariable(s string, depth int, visited map[string]
 	value, ok := e.lookup(key)
 	if !ok {
 		return "", end, nil // Return empty for unset variables
+	}
+
+	// Literal (single-quoted) source values insert verbatim — no recursion
+	// and no cycle participation.
+	if _, literal := e.literal[key]; literal {
+		return value, end, nil
 	}
 
 	// Mark as visited
@@ -710,11 +795,12 @@ func (e *Expander) buildChain(visited map[string]bool) string {
 	sort.Strings(keys)
 
 	// Calculate total length to pre-allocate builder
-	// Use actual masked key length for accurate pre-allocation
+	// Use the masked length for sensitive keys (MaskKey returns the fixed
+	// "[MASKED]" token, SEC-005), otherwise the full key length.
 	totalLen := 0
 	for _, k := range keys {
 		if IsKey(k) {
-			totalLen += len(MaskKey(k)) // Actual masked length (3 or 5 chars)
+			totalLen += len(MaskKey(k))
 		} else {
 			totalLen += len(k)
 		}
@@ -738,8 +824,10 @@ func (e *Expander) buildChain(visited map[string]bool) string {
 }
 
 // DetectCycle checks if expanding the given variables would cause a cycle.
+// The noExpand set names keys whose values are literal (single-quoted) and
+// contribute no dependency edges; nil considers every key.
 // Returns the key that causes the cycle and true if a cycle is detected.
-func DetectCycle(vars map[string]string) (string, bool) {
+func DetectCycle(vars map[string]string, noExpand map[string]struct{}) (string, bool) {
 	// Use pooled maps to reduce allocations
 	visited := getVisitedMap()
 	inStack := getVisitedMap()
@@ -754,6 +842,16 @@ func DetectCycle(vars map[string]string) (string, bool) {
 		// If we exceed this limit, return no cycle found — the expansion depth
 		// limit will catch actual issues during expansion.
 		if dfsDepth > 1000 {
+			return "", false
+		}
+		// Literal (single-quoted) values contribute no dependency edges —
+		// not just as scan roots (the outer loop skips those) but also when
+		// reached through another value's reference: their '$' runs are
+		// literal text the expander never follows. Without this guard,
+		// A='$B' (literal) with B=$A still closed a false cycle through
+		// dfs(B) scanning A's literal text.
+		if _, literal := noExpand[key]; literal {
+			visited[key] = true
 			return "", false
 		}
 		visited[key] = true
@@ -779,32 +877,26 @@ func DetectCycle(vars map[string]string) (string, bool) {
 				nextChar := value[i+1]
 
 				if nextChar == '{' {
-					// ${VAR} syntax - find matching closing brace (handle nesting)
-					start := i + 2
-					end := start
-					braceDepth := 1
-					for end < len(value) {
-						if value[end] == '{' {
-							braceDepth++
-						} else if value[end] == '}' {
-							braceDepth--
-							if braceDepth == 0 {
-								break
-							}
-						}
-						end++
-					}
-					if end < len(value) && braceDepth == 0 {
-						// Handle default syntax - find colon manually
-						// Extract key directly to avoid intermediate allocation
-						keyEnd := end
-						for j := start; j < keyEnd; j++ {
-							if value[j] == ':' {
-								keyEnd = j
-								break
-							}
-						}
-						refKey = value[start:keyEnd]
+					// ${VAR} syntax — reuse the shared brace matcher and
+					// operator parser (findClosingBrace / parseBraceOperator)
+					// so the edge set here cannot drift from what expansion
+					// actually follows. DetectCycle previously split at ANY
+					// colon, so a single-colon ${A:x} — which the expander
+					// treats as an invalid key and emits verbatim — created a
+					// phantom edge to A and could close a false cycle,
+					// rejecting the whole file.
+					if end := findClosingBrace(value[i:]); end != -1 {
+						refKey, _, _, _ = parseBraceOperator(value[i+2 : i+end])
+						// Skip past '}': references inside operator default
+						// text (${B:-$C}) are conditional, not unconditional
+						// edges. Continuing the scan at i+1 made the $C in
+						// the default look like a hard dependency, so
+						// B=x / A=${B:-$C} / C=$A was rejected as a cycle
+						// even though A resolves without ever consulting the
+						// default. Loops reachable only through an unused
+						// default are still caught at expansion time by the
+						// visited-map checks.
+						i += end
 					}
 				} else if nextChar == '$' {
 					// Escaped dollar sign, skip
@@ -812,12 +904,7 @@ func DetectCycle(vars map[string]string) (string, bool) {
 					continue
 				} else if isVarChar(nextChar) {
 					// $VAR syntax - extract variable name
-					start := i + 1
-					end := start
-					for end < len(value) && isVarChar(value[end]) {
-						end++
-					}
-					refKey = value[start:end]
+					refKey, _ = scanVarName(value[i:])
 				}
 
 				if refKey != "" {
@@ -838,6 +925,9 @@ func DetectCycle(vars map[string]string) (string, bool) {
 	}
 
 	for key := range vars {
+		if _, literal := noExpand[key]; literal {
+			continue // literal values contribute no edges
+		}
 		if !visited[key] {
 			if cycle, found := dfs(key, 0); found {
 				return cycle, true
@@ -851,13 +941,26 @@ func DetectCycle(vars map[string]string) (string, bool) {
 // ExpandAllInMap expands all variables in a map using this expander.
 // This is the primary method for batch expansion, used by parsers.
 //
+// The noExpand set names keys whose values are literal (single-quoted in the
+// source .env) and must be copied through unchanged; nil expands every value.
+// Exempt values still answer lookups from other values' references, and the
+// text they contribute is never rescanned for further references.
+//
+// Brace-operator semantics: ${VAR:=default} assigns the expanded default to
+// VAR when VAR is unset everywhere (map and external lookup). The assigned
+// value becomes visible to references in keys sorted later in the pass and
+// is materialized in the returned map. Keys are processed in sorted order so
+// the outcome never depends on Go's random map iteration order. A standalone
+// Expander (used via Expand, without a map context) has nowhere to store an
+// assignment, so ':=' degrades to ':-' there.
+//
 // The method:
 // 1. Checks if any values need expansion (fast path for no variables)
 // 2. Detects cycles to prevent infinite loops
 // 3. Expands all values recursively using a cached lookup for performance
 //
 // Returns the original map if no expansion is needed, avoiding allocations.
-func (e *Expander) ExpandAllInMap(vars map[string]string) (map[string]string, error) {
+func (e *Expander) ExpandAllInMap(vars map[string]string, noExpand map[string]struct{}) (map[string]string, error) {
 	// ModeNone: expansion is disabled, return input unchanged.
 	if e.mode == ModeNone {
 		return vars, nil
@@ -878,28 +981,37 @@ func (e *Expander) ExpandAllInMap(vars map[string]string) (map[string]string, er
 	}
 
 	// Check for cycles only when expansion is needed
-	if cycle, found := DetectCycle(vars); found {
+	if cycle, found := DetectCycle(vars, noExpand); found {
 		return nil, &ExpansionError{
 			Key:   cycle,
 			Chain: "cycle detected",
 		}
 	}
 
-	// Build a lookup cache that first checks vars, then falls back to e.lookup.
-	// This avoids repeated os.LookupEnv syscalls for variables already present
-	// in the parsed map (the most common case for $VAR references).
+	// Build a lookup cache for EXTERNAL lookups only. References resolved
+	// from the parsed map itself (the most common case) are answered by a
+	// direct map probe — caching them would add a second probe plus a cache
+	// write per hit for no benefit. Only e.lookup results (os.LookupEnv
+	// syscalls, expensive and frequently repeated for missing keys) are
+	// cached. Resolution order and results are identical to the previous
+	// cache-everything variant. ':=' assignments are probed after vars: an
+	// assignment only exists for a key that was absent from vars AND the
+	// external lookup, so it can never shadow a genuinely set variable.
+	assignments := make(map[string]string)
 	lookupCache := getLookupCache()
 	defer putLookupCache(lookupCache)
 	cachedLookup := func(key string) (string, bool) {
+		// Check vars first (most common source for $VAR refs)
+		if v, ok := vars[key]; ok {
+			return v, true
+		}
+		if v, ok := assignments[key]; ok {
+			return v, true
+		}
 		if r, ok := lookupCache[key]; ok {
 			return r.value, r.ok
 		}
-		// Check vars first (most common source for $VAR refs)
-		if v, ok := vars[key]; ok {
-			lookupCache[key] = lookupResult{v, true}
-			return v, true
-		}
-		// Fall back to external lookup (os.LookupEnv)
+		// Fall back to external lookup (os.LookupEnv) and cache the result
 		v, ok := e.lookup(key)
 		lookupCache[key] = lookupResult{v, ok}
 		return v, ok
@@ -912,18 +1024,55 @@ func (e *Expander) ExpandAllInMap(vars map[string]string) (map[string]string, er
 		mode:            e.mode,
 		keyPattern:      e.keyPattern,
 		useDefaultCheck: e.useDefaultCheck,
+		maxValueLen:     e.maxValueLen,
+		literal:         noExpand,
+		assignments:     assignments,
 	}
 
+	// Expand in sorted key order. ':=' write-backs become visible to keys
+	// sorted later in the pass, so the outcome must not depend on Go's
+	// random map iteration order. (A POSIX shell applies the same rule in
+	// document order; alphabetical order is this library's deterministic
+	// equivalent.)
+	keys := make([]string, 0, len(vars))
+	for key := range vars {
+		keys = append(keys, key)
+	}
+	sort.Strings(keys)
+
 	// Pre-allocate result map with exact size
-	result := make(map[string]string, len(vars))
+	result := make(map[string]string, len(vars)+len(assignments))
 
 	// Expand all values using the cached expander
-	for key, value := range vars {
+	for _, key := range keys {
+		value := vars[key]
+		// Literal (single-quoted) values pass through untouched but remain
+		// visible as lookup sources through the vars map above.
+		if _, literal := noExpand[key]; literal {
+			result[key] = value
+			continue
+		}
 		expanded, err := cached.Expand(value)
 		if err != nil {
 			return nil, err
 		}
 		result[key] = expanded
+	}
+
+	// ':=' assignments materialize as variables in the returned map, so
+	// later pipeline stages (validation, Apply) treat them like any other
+	// parsed variable. Bound them by the hard variable ceiling: the parse
+	// path enforces MaxVariables on the PARSED map, and a crafted document
+	// could otherwise bypass it through many small assignment references
+	// (raw values are length-bounded, but a 1 KB value still holds ~100 of
+	// them).
+	if len(assignments) > HardMaxVariables-len(vars) {
+		return nil, &ExpansionError{
+			Chain: fmt.Sprintf("':=' assignments exceed the hard variable limit (%d)", HardMaxVariables),
+		}
+	}
+	for key, value := range assignments {
+		result[key] = value
 	}
 
 	return result, nil
@@ -933,6 +1082,15 @@ func (e *Expander) ExpandAllInMap(vars map[string]string) (map[string]string, er
 type lookupResult struct {
 	value string
 	ok    bool
+}
+
+// recordAssign stores a ':=' write-back when this expander is bound to a map
+// context (ExpandAllInMap). Standalone expanders have a nil map and ':='
+// degrades to ':-' — there is nowhere to store the assignment.
+func (e *Expander) recordAssign(key, value string) {
+	if e.assignments != nil {
+		e.assignments[key] = value
+	}
 }
 
 // lookupCachePool pools the per-expansion lookup cache. The cache is only

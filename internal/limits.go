@@ -1,4 +1,5 @@
-// Package internal provides security limits for the env package.
+// Provides security limits for the env package.
+
 package internal
 
 // ============================================================================
@@ -8,20 +9,37 @@ package internal
 // Default security limits for high-security configurations.
 // These values are intentionally conservative to prevent various attacks.
 const (
-	// DefaultMaxFileSize is the maximum allowed file size (2 MB).
-	DefaultMaxFileSize int64 = 2 * 1024 * 1024
+	// DefaultMaxFileSize is the maximum allowed file size (8 MB).
+	// Kept self-consistent with the per-variable limits: a document at
+	// DefaultMaxVariables entries of DefaultMaxValueLength bytes each
+	// (~8.2MB with keys and syntax) always fits, so a size-legal-by-
+	// per-variable document never fails the file-size check instead.
+	DefaultMaxFileSize int64 = 8 * 1024 * 1024
 
 	// DefaultMaxLineLength is the maximum allowed line length.
-	DefaultMaxLineLength int = 1024
+	// Sized for single-line values that carry long credentials (browser
+	// cookie exports, JWTs), which commonly reach 2-8KB; the hard limit
+	// (HardMaxLineLength) remains the actual DoS ceiling.
+	DefaultMaxLineLength int = 8 * 1024
 
 	// DefaultMaxKeyLength is the maximum allowed key length.
-	DefaultMaxKeyLength int = 64
+	// Structured formats flatten nested documents into compound keys
+	// (A_B_C_D...); 8 realistic path segments already produce 65-128
+	// chars, so the default must accommodate them.
+	DefaultMaxKeyLength int = 128
 
 	// DefaultMaxValueLength is the maximum allowed value length.
-	DefaultMaxValueLength int = 4096
+	// On .env parse paths the LINE check is the binding constraint: a line
+	// is KEY + '=' + value, so the reachable file value ceiling is
+	// DefaultMaxLineLength - len(key) - 1; the full DefaultMaxValueLength
+	// is reachable only via Loader.Set (long credentials: cookie exports,
+	// JWTs — 2-8KB is common).
+	DefaultMaxValueLength int = 8 * 1024
 
 	// DefaultMaxVariables is the maximum number of variables per file.
-	DefaultMaxVariables int = 500
+	// Sized for credential-export files (one domain/entry per variable)
+	// and large structured configs, which reach into the hundreds.
+	DefaultMaxVariables int = 1000
 
 	// DefaultMaxExpansionDepth is the maximum variable expansion depth.
 	DefaultMaxExpansionDepth int = 5
@@ -73,10 +91,6 @@ const (
 // Objects larger than these limits are not returned to pools to prevent
 // memory bloat from holding onto large allocations.
 const (
-	// MaxPooledBuilderSize is the maximum capacity for pooled strings.Builder objects.
-	// Builders larger than this are discarded instead of pooled.
-	MaxPooledBuilderSize = 16 * 1024 // 16KB
-
 	// MaxPooledScannerBufferSize is the maximum capacity for pooled scanner buffers.
 	// Buffers larger than this are discarded instead of pooled.
 	MaxPooledScannerBufferSize = 256 * 1024 // 256KB
@@ -91,7 +105,7 @@ const (
 
 	// MaxPooledYAMLTokenCount is the maximum capacity for pooled YAML token
 	// slices (each token is ~56 bytes). 8192 tokens (~450KB) covers documents
-	// several times larger than the DefaultMaxVariables (500) ceiling, which
-	// produces roughly 1500 tokens; larger tokenizations allocate fresh slices.
+	// several times larger than the DefaultMaxVariables (1000) ceiling, which
+	// produces roughly 3000 tokens; larger tokenizations allocate fresh slices.
 	MaxPooledYAMLTokenCount = 8192
 )

@@ -1,10 +1,11 @@
-// Package internal provides JSON flattening utilities.
+// Provides JSON flattening utilities.
+
 package internal
 
 import (
+	"bytes"
 	"encoding/json"
 	"fmt"
-	"strconv"
 )
 
 // JSONFlattenConfig holds configuration for JSON flattening.
@@ -22,12 +23,20 @@ type JSONFlattenConfig struct {
 	BoolAsString bool
 	// MaxDepth limits the maximum nesting depth to prevent stack overflow.
 	MaxDepth int
+	// DuplicateKey resolves duplicate keys inside the document (see
+	// DuplicateKeyPolicy). The zero value keeps the historical behavior:
+	// encoding/json resolves duplicate object keys by decode order (last
+	// occurrence wins).
+	DuplicateKey DuplicateKeyPolicy
 }
 
 // FlattenJSON converts nested JSON data to a flat map of string key-value pairs.
 // Keys are converted to uppercase with the configured delimiter.
 func FlattenJSON(data []byte, cfg JSONFlattenConfig) (map[string]string, error) {
-	if len(data) == 0 {
+	// A document that is empty or contains only whitespace flattens to an
+	// empty map, consistent with the .env and YAML paths (a bare "\n" would
+	// otherwise surface as a JSON syntax error).
+	if len(bytes.TrimSpace(data)) == 0 {
 		return make(map[string]string), nil
 	}
 
@@ -48,6 +57,32 @@ func FlattenJSON(data []byte, cfg JSONFlattenConfig) (map[string]string, error) 
 	if nodesExceeded {
 		return nil, &JSONError{
 			Message: fmt.Sprintf("maximum node count exceeded (%d)", HardMaxJSONNodes),
+		}
+	}
+
+	// Duplicate-key policy. Enforced before decoding (fail fast — the whole
+	// document is JSON here, unlike the YAML inline path whose maybe-JSON
+	// scalars check after a successful parse). A document WITHOUT duplicates
+	// resolves identically under every policy and is never rejected here;
+	// FirstWins rejects only documents the pre-scan proves to contain
+	// duplicates (encoding/json discards earlier occurrences during decoding,
+	// so the policy cannot be honored for them).
+	switch cfg.DuplicateKey {
+	case DuplicateKeyFirstWins:
+		if key, dup := detectJSONDuplicateKeys(data, cfg.MaxDepth); dup {
+			return nil, &JSONError{
+				Message: fmt.Sprintf(
+					"duplicate object key %q cannot be resolved with DuplicateKeyFirstWins "+
+						"(encoding/json discards earlier occurrences); use LastWins or Error", key),
+				Err: ErrDuplicateKey,
+			}
+		}
+	case DuplicateKeyError:
+		if key, dup := detectJSONDuplicateKeys(data, cfg.MaxDepth); dup {
+			return nil, &JSONError{
+				Message: fmt.Sprintf("duplicate object key %q", key),
+				Err:     ErrDuplicateKey,
+			}
 		}
 	}
 
@@ -124,90 +159,57 @@ func scanJSONLimits(data []byte, startDepth, maxDepth, maxNodes int) (depthExcee
 	return false, false
 }
 
-// flattenValue recursively flattens a JSON value.
+// jsonDepthError builds the standalone path's depth-limit error.
+func jsonDepthError(path string, maxDepth int) error {
+	return &JSONError{
+		Path:    path,
+		Message: fmt.Sprintf("maximum nesting depth exceeded (%d)", maxDepth),
+	}
+}
+
+// jsonUnsupportedError builds the terminal-type error (unreachable through
+// json.Unmarshal; exercised by tests with foreign types).
+func jsonUnsupportedError(path string, v interface{}) error {
+	return &JSONError{
+		Path:    path,
+		Message: fmt.Sprintf("unsupported JSON type: %T", v),
+	}
+}
+
+// flattenValue recursively flattens a JSON value through the shared
+// decoded-JSON walker (see flatten_keys.go); the format-specific parts are
+// injected as setFlatJSONValue (leaf store + collision check) and the two
+// error constructors above.
 func flattenValue(value interface{}, prefix string, cfg JSONFlattenConfig, result map[string]string, depth int) error {
-	// Check depth limit - use >= for strict enforcement
-	if depth >= cfg.MaxDepth {
+	return flattenDecoded(value, prefix, decodedFlattenOpts{
+		maxDepth:       cfg.MaxDepth,
+		nullAsEmpty:    cfg.NullAsEmpty,
+		numberAsString: cfg.NumberAsString,
+		delim:          cfg.KeyDelimiter,
+		indexFmt:       cfg.ArrayIndexFormat,
+	}, result, depth, setFlatJSONValue, jsonDepthError, jsonUnsupportedError)
+}
+
+// setFlatJSONValue stores a flattened leaf and rejects flat-key collisions:
+// two DIFFERENT source paths collapsing onto the same flattened key (e.g.
+// {"a_b":1,"A":{"b":2}}, or a literal "a_0" next to an array "a"). Before
+// this check the winner depended on Go map iteration order, so the same file
+// could produce different values across runs. Collisions are always an
+// error — there is no previous behavior worth preserving. Mirrors
+// setFlatYAMLValue in yaml_flatten.go.
+func setFlatJSONValue(result map[string]string, prefix, value string) error {
+	if _, exists := result[prefix]; exists {
 		return &JSONError{
-			Path:    prefix,
-			Message: fmt.Sprintf("maximum nesting depth exceeded (%d)", cfg.MaxDepth),
+			Path: prefix,
+			Message: fmt.Sprintf(
+				"flat-key collision on %q: two different source paths collapse to the same flattened key",
+				prefix),
+			Err: ErrDuplicateKey,
 		}
 	}
-
-	switch v := value.(type) {
-	case nil:
-		if prefix == "" {
-			return nil
-		}
-		if cfg.NullAsEmpty {
-			result[prefix] = ""
-		} else {
-			result[prefix] = "null"
-		}
-
-	case bool:
-		if prefix == "" {
-			return nil
-		}
-		// BoolAsString does not apply here: a decoded JSON bool has no raw
-		// text to preserve, so both settings render the canonical form.
-		result[prefix] = strconv.FormatBool(v)
-
-	case float64:
-		if prefix == "" {
-			return nil
-		}
-		if cfg.NumberAsString {
-			// Format as integer if it's a whole number
-			if v == float64(int64(v)) {
-				result[prefix] = strconv.FormatInt(int64(v), 10)
-			} else {
-				result[prefix] = strconv.FormatFloat(v, 'f', -1, 64)
-			}
-		} else {
-			result[prefix] = fmt.Sprintf("%v", v)
-		}
-
-	case string:
-		if prefix == "" {
-			return nil
-		}
-		result[prefix] = v
-
-	case map[string]interface{}:
-		for key, val := range v {
-			newPrefix := buildKey(prefix, key, cfg)
-			if err := flattenValue(val, newPrefix, cfg, result, depth+1); err != nil {
-				return err
-			}
-		}
-
-	case []interface{}:
-		for i := range v {
-			newPrefix := buildArrayIndex(prefix, i, cfg)
-			if err := flattenValue(v[i], newPrefix, cfg, result, depth+1); err != nil {
-				return err
-			}
-		}
-
-	default:
-		return &JSONError{
-			Path:    prefix,
-			Message: fmt.Sprintf("unsupported JSON type: %T", value),
-		}
-	}
-
+	result[prefix] = value
 	return nil
 }
 
-// buildKey constructs a key from prefix and key parts.
-// Delegates to the shared flattener key builder (see flatten_keys.go).
-func buildKey(prefix, key string, cfg JSONFlattenConfig) string {
-	return buildFlatKey(prefix, key, cfg.KeyDelimiter)
-}
-
-// buildArrayIndex constructs a key for array elements.
-// Delegates to the shared flattener key builder (see flatten_keys.go).
-func buildArrayIndex(prefix string, index int, cfg JSONFlattenConfig) string {
-	return buildFlatArrayIndex(prefix, index, cfg.KeyDelimiter, cfg.ArrayIndexFormat)
-}
+// Key construction goes through the shared builders in flatten_keys.go
+// (buildFlatKey / buildFlatArrayIndex), invoked by flattenDecoded.

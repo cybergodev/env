@@ -49,6 +49,13 @@ func main() {
 	fmt.Printf("  cache.hosts:    %v\n", hosts)
 	fmt.Printf("  cache.hosts.0:  %q\n", env.GetString("cache.hosts.0"))
 
+	// Comma-separated values are supported too — the element type comes from
+	// the type parameter (string, int, bool, ...).
+	if err := env.Set("DB_REPLICAS", "10.0.0.1,10.0.0.2,10.0.0.3"); err != nil {
+		log.Fatalf("Failed to set: %v", err)
+	}
+	fmt.Printf("  DB_REPLICAS:    %v\n", env.GetSlice[string]("DB_REPLICAS"))
+
 	// --- Lookup ---
 	fmt.Println("\n=== Lookup ===")
 	if val, ok := env.Lookup("app.port"); ok {
@@ -57,4 +64,22 @@ func main() {
 	if _, ok := env.Lookup("nonexistent"); !ok {
 		fmt.Println("  nonexistent: not found")
 	}
+
+	// --- Slice in instance mode (GetSliceFrom) ---
+	// GetSliceFrom is the Loader-based form of GetSlice — Go methods cannot
+	// have type parameters, so the instance variant is a generic function.
+	fmt.Println("\n=== Slice, instance mode ===")
+	cfg := env.DefaultConfig()
+	cfg.Filenames = []string{"examples/data/config.json"}
+
+	loader, err := env.New(cfg)
+	if err != nil {
+		log.Fatalf("Failed to create loader: %v", err)
+	}
+	defer func() { _ = loader.Close() }() // best-effort cleanup
+
+	fmt.Printf("  cache.hosts:    %v\n", env.GetSliceFrom[string](loader, "cache.hosts"))
+
+	// A scalar (non-indexed, non-comma) value resolves to a one-element slice.
+	fmt.Printf("  cache.max_size: %v\n", env.GetSliceFrom[int](loader, "cache.max_size"))
 }

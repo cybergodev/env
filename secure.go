@@ -110,6 +110,13 @@ func NewSecureValueStrict(value string) (*SecureValue, error) {
 // ensuring no concurrent reads can observe partial state. We mark the
 // SecureValue as open (closed=false) only after data is fully prepared.
 //
+// Lock ordering: secureMap reaches this method under its shard lock
+// (shard.mu.Lock → sv.mu.Lock). secureMap.Get deliberately skips sv.mu and
+// reads sv.data under shard.mu.RLock alone, so every writer of sv.data —
+// this method included — MUST be reached through shard.mu.Lock (see the lock
+// analysis on secureMap.Get). Do not add an sv.data write path that is not
+// shard-locked.
+//
 // Memory Locking: If enabled globally, attempts to lock the memory
 // to prevent swapping to disk. Locking failures are handled according
 // to strict mode configuration.
@@ -127,7 +134,10 @@ func (sv *SecureValue) reset(value string) {
 			internal.UnlockMemory(sv.data)
 			sv.locked = false
 		}
-		clear(sv.data) // Use builtin for efficient zeroing (Go 1.21+)
+		// SECURITY: clear the full capacity, not just len — the buffer is
+		// dropped or re-sliced below, and clearing to cap guarantees no byte
+		// of the old value can survive in [len, cap) slack.
+		clear(sv.data[:cap(sv.data)])
 	}
 
 	// Reset lock error state
@@ -145,13 +155,8 @@ func (sv *SecureValue) reset(value string) {
 	// This reduces allocations for frequently reused SecureValue objects
 	// The 2x limit prevents unbounded memory growth while allowing efficient reuse
 	if sv.data != nil && cap(sv.data) >= valueLen && cap(sv.data) <= valueLen*2 {
-		// SECURITY: Clear the entire capacity before reusing to prevent
-		// residual data from remaining in unused capacity.
-		// This is important because sv.data may have been cleared above
-		// with only the current length, not the full capacity.
-		oldCap := cap(sv.data)
-		fullSlice := sv.data[:oldCap]
-		clear(fullSlice)
+		// The full-capacity clear above already wiped the whole buffer, so
+		// shrinking to valueLen leaves only zeroed slack in [valueLen, cap).
 		sv.data = sv.data[:valueLen]
 		copy(sv.data, value)
 		// Attempt to lock memory if enabled
@@ -231,12 +236,22 @@ func (sv *SecureValue) finalize() {
 	sv.closed.Store(true)
 }
 
-// clearDataLocked securely zeros the data slice.
+// clearDataLocked securely zeros the data slice's full capacity, including
+// any [len, cap) slack left by earlier re-slices.
 // Uses volatile-style writes through unsafe.Pointer to prevent compiler optimization.
 // Must be called with sv.mu held.
+//
+// Like reset, this is a writer of sv.data and participates in the secureMap
+// lock-order contract: secureMap.Delete/Clear remove the SV from the shard
+// map under shard.mu.Lock and release it outside that lock, so by the time
+// this method runs the SV is no longer reachable through the map (see the
+// lock analysis on secureMap.Get). Do not add an sv.data write path that
+// bypasses that ordering.
 func (sv *SecureValue) clearDataLocked() {
-	// SECURITY: len(slice) == 0 handles both nil and empty slices.
-	if len(sv.data) == 0 {
+	// SECURITY: operate on the full capacity so bytes in [len, cap) slack are
+	// wiped too. cap == 0 covers both nil and empty slices.
+	full := sv.data[:cap(sv.data)]
+	if len(full) == 0 {
 		return
 	}
 
@@ -247,11 +262,11 @@ func (sv *SecureValue) clearDataLocked() {
 	}
 
 	// Use volatile-style clearing to prevent compiler optimization
-	dataPtr := unsafe.Pointer(&sv.data[0])
-	for i := range sv.data {
-		*(*byte)(unsafe.Pointer(uintptr(dataPtr) + uintptr(i))) = 0
+	dataPtr := unsafe.Pointer(&full[0])
+	for i := range full {
+		*(*byte)(unsafe.Add(dataPtr, i)) = 0
 	}
-	runtime.KeepAlive(sv.data)
+	runtime.KeepAlive(full)
 	sv.data = nil
 	sv.lockErr = nil
 }
@@ -453,11 +468,21 @@ func (sv *SecureValue) MemoryLockError() error {
 // ============================================================================
 
 // numSecureMapShards defines the number of shards in secureMap.
-// Value 8 provides good balance between concurrency and memory overhead:
-//   - Reduces lock contention by distributing keys across multiple shards
-//   - Each shard has its own mutex, allowing parallel reads/writes
-//   - Memory overhead is minimal compared to single-lock design
-const numSecureMapShards = 8
+//
+// Chosen by interleaved benchmarking of 8/16/32 shards plus a padded-8
+// variant (same binary, alternating runs to cancel machine drift on this
+// hybrid P/E-core system): 32 shards cut ConcurrentGet by ~42% (the RWMutex
+// readerCount RMW was the top CPU item under concurrent reads — fewer
+// readers per shard means fewer caches bouncing the same lock word) and
+// match or beat the smaller counts on single-goroutine Get/Lookup. The one
+// measured cost is batch SetAll (+~18% for 100 keys: more per-shard locks
+// and map heads), a load-time-only operation. Shard-struct cache padding was
+// tested and rejected: it inflated the loader working set and slowed every
+// access path. Shard maps are created lazily, so an empty loader allocates
+// none of them.
+//
+// Must remain a power of two (HashKey masks with numSecureMapShards-1).
+const numSecureMapShards = 32
 
 // secureMapShard represents a single shard of the secure map.
 type secureMapShard struct {
@@ -481,7 +506,7 @@ func hashKey(key string) uint32 {
 // newSecureMap creates a new secureMap with sharded storage.
 // Shard maps are created lazily on first write: reads and iteration over a
 // nil map are valid no-ops in Go, so an empty (or briefly-used) loader does
-// not pay for eight empty map headers up front.
+// not pay for any of the 32 empty map headers up front.
 func newSecureMap() *secureMap {
 	return &secureMap{}
 }
@@ -808,7 +833,10 @@ func (sm *secureMap) Len() int {
 }
 
 // ToMap returns a copy of all values as a regular map.
-// The caller should be aware that this creates copies of sensitive data.
+// The caller should be aware that this creates copies of sensitive data
+// outside SecureValue's protected lifecycle (SEC-010): the strings are
+// ordinary Go memory that is neither zeroed on release nor memory-lockable.
+// Prefer GetSecure for values that must remain protected.
 //
 // Note: Uses atomic counter for O(1) allocation sizing.
 // In concurrent scenarios, the returned map may have slightly different

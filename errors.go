@@ -11,6 +11,11 @@ var (
 	// ErrFileNotFound indicates the specified file does not exist.
 	ErrFileNotFound = errors.New("file not found")
 
+	// ErrAuditFailed indicates an audit event was lost while fail-closed
+	// auditing (Config.AuditFailClosed) was enabled. Re-exported from
+	// internal/errors for errors.Is matching.
+	ErrAuditFailed = ierrors.ErrAuditFailed
+
 	// ErrFileTooLarge indicates the file exceeds the maximum allowed size.
 	// Re-exported from internal/errors for backward compatibility.
 	ErrFileTooLarge = ierrors.ErrFileTooLarge
@@ -48,9 +53,11 @@ var (
 	ErrMissingRequired = ierrors.ErrMissingRequired
 
 	// ErrDuplicateKey indicates a duplicate key was encountered.
-	// Reserved: duplicate keys are currently skipped (not an error) when
-	// OverwriteExisting is false; no code path returns this sentinel yet.
-	ErrDuplicateKey = errors.New("duplicate key encountered")
+	// Matches, via errors.Is, the parse errors returned under the
+	// DuplicateKeyError policy (.env / YAML / JSON, including inline JSON
+	// inside YAML) and the always-on flat-key collision errors from
+	// YAML/JSON flattening. Re-exported from internal/errors.
+	ErrDuplicateKey = ierrors.ErrDuplicateKey
 
 	// ErrClosed indicates the loader has been closed.
 	ErrClosed = errors.New("loader has been closed")

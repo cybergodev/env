@@ -21,7 +21,7 @@
 | 🚀 **一行配置** | `env.Load(".env")` 即可加载并应用到 `os.Environ` |
 | 🔒 **类型安全** | `GetString`、`GetInt`、`GetBool`、`GetDuration`、`GetSlice[T]` |
 | 📁 **多格式支持** | 自动检测 `.env`、`.json`、`.yaml` 文件 |
-| ⚡ **线程安全** | 分片存储（8 分片）+ RWMutex，高并发优化 |
+| ⚡ **线程安全** | 分片存储（32 分片）+ RWMutex，高并发优化 |
 | 🛡️ **内存安全** | `SecureValue` 敏感数据自动清零，支持内存池 |
 | 🔄 **变量展开** | 完整支持 `${VAR}` 语法及默认值 |
 | 📝 **审计日志** | 内置 JSON/Log/Channel 处理器，满足合规需求 |
@@ -96,8 +96,15 @@ func main() {
 
 ```go
 // 多文件初始化（默认配置下先加载的值生效；
-// 设置 cfg.OverwriteExisting = true 后，后加载的文件才会覆盖）
+// 需要后加载的文件覆盖时，用下面的 Overload）
 if err := env.Load(".env", "config.json", ".env.local"); err != nil {
+    log.Fatal(err)
+}
+
+// 或者：后加载的文件覆盖先前的，且覆盖进程已有环境变量
+// （godotenv Overload 惯例——若部署平台注入的变量必须保持优先于文件值，
+// 请改用 Load）
+if err := env.Overload("config.json", "config.yaml"); err != nil {
     log.Fatal(err)
 }
 
@@ -115,11 +122,50 @@ all := env.All()                  // 获取所有变量为 map
 count := env.Len()                // 变量数量
 ```
 
-> **注意：** 包级函数（`GetString`、`Set`、`Lookup` 等）必须先调用 `Load()` 或
-> `LoadWithConfig()` 才能使用。未初始化时，`Get*`/`Lookup`/`Keys`/`All`/`Len`/`GetSecure`
+> **注意：** 包级函数（`GetString`、`Set`、`Lookup` 等）必须先调用 `Load()`、
+> `Overload()` 或 `LoadWithConfig()` 才能使用。未初始化时，`Get*`/`Lookup`/`Keys`/`All`/`Len`/`GetSecure`
 > 会静默返回默认值/零值，而 `Set`、`Delete`、`Validate`、`ParseInto` 会返回 `ErrNotInitialized`。
-> `Load()` 只能初始化默认加载器一次，重复调用返回 `ErrAlreadyInitialized`；
+> `Load()` 只能初始化默认加载器一次（三个初始化函数共享同一个默认加载器），
+> 重复调用返回 `ErrAlreadyInitialized`；
 > 如需重新初始化（例如测试之间），请先调用 `ResetDefaultLoader()`。
+
+### 重复键与合并顺序
+
+**跨文件**（`.env`/`.json`/`.yaml` 任意混用——嵌套键会展平到统一的大写键空间，
+`.env` 里的 `DATABASE_HOST` 与 YAML 里的 `database: {host: ...}` 是同一个键）：
+按文件列表顺序加载。默认（`OverwriteExisting = false`）**先加载的文件优先**，
+后加载的同名键被跳过；设为 `true` 时后加载的覆盖先前的。包级 `Overload`
+初始化函数即该设置的快捷方式（godotenv 惯例）——注意它同时会覆盖进程
+已有环境变量，而 `Load` 永远不会。
+
+**同一文件内**，默认的重复键解析规则因格式而异：
+
+| 格式 | 文件内重复 `KEY` 的结果 |
+|------|--------------------------|
+| `.env` | `OverwriteExisting=false`（默认）首个生效；`true` 时后者生效 |
+| YAML | 恒为后者生效（与 `OverwriteExisting` 无关） |
+| JSON | 恒为后者生效（`encoding/json` 解码顺序，与 `OverwriteExisting` 无关） |
+
+可配置 `DuplicateKeyPolicy` 统一或收紧该行为：
+
+```go
+cfg := env.DefaultConfig()
+cfg.DuplicateKeyPolicy = env.DuplicateKeyError // 重复键直接报错（匹配 env.ErrDuplicateKey）
+// 其他取值：DuplicateKeyFirstWins / DuplicateKeyLastWins / DuplicateKeyInherit（默认）
+```
+
+说明：
+
+- `DuplicateKeyFirstWins` 适用于 `.env` 与 YAML。对 JSON 数据（含 YAML 内联 JSON），
+  **确实含重复键**的文档会被拒绝——`encoding/json` 解码时即丢弃先出现的键，无法
+  兑现该策略；无重复键的 JSON 文档正常加载（其在任何策略下解析结果相同）。
+  `DuplicateKeyError` 模式（及 FirstWins 的含重复键判定）下，JSON 重复键由保守
+  预扫描按原始字节比较检测；同一键的转义等价拼写不会被检出。
+- **扁平键碰撞恒为错误**（与策略无关）：两个不同源路径展平到同一个键
+  （`a_b: 1` 与 `a: {b: 2}` 并存、字面 `a_0` 与数组 `a`、仅大小写不同的两个键），
+  此前按 map 遍历顺序随机定胜者，跨运行结果不确定；现在以 `env.ErrDuplicateKey` 报错。
+- **大小写：** YAML/JSON 键展平时统一转大写；`.env` 键按原样存储，因此仅大小写
+  不同的键跨格式不会碰撞、会共存。查找时先精确匹配再尝试大写形式（见 `Lookup`）。
 
 ### 类型访问
 
@@ -320,7 +366,8 @@ URL=${HOST}:${PORT}                    # → "localhost:8080"
 # 未设置时使用默认值（空字符串会被保留）
 TIMEOUT=${TIMEOUT:-30s}
 
-# 未设置时赋值默认值（本库中行为与 :- 相同）
+# 未设置时赋值默认值 — 赋值结果成为真实变量，
+# 对同文件中后续引用以及 Get/Apply 可见
 NAME=${NAME:=default_value}
 
 # 必需变量 — 未设置或为空时报错
@@ -329,6 +376,13 @@ API_KEY=${API_KEY:?API_KEY must be set}
 # 组合展开
 FULL_URL=https://${HOST}:${PORT:-443}
 ```
+
+与 POSIX shell 行为的两处刻意差异:
+
+- **`EMPTY` 设为空字符串时,`${EMPTY:-default}` 保留空字符串**。`:-` 默认值仅在变量**未设置**时生效(空字符串是有效的显式值),而 POSIX 中 `:-` 对空值同样生效。
+- **`${}` 展开为字面量 `{}`**,而不是像 bash 那样报 "bad substitution" 错误。
+
+`:=` 赋值语义:文件加载期间,展开后的默认值会赋给该变量 —— 对本次遍历中排在后面的键的引用可见(键按排序顺序处理,结果因此是确定性的),并且像普通解析变量一样出现在加载结果 map 中。已经设置过的变量(文件内或进程环境中)不会被重新赋值。
 
 ---
 
@@ -410,9 +464,9 @@ if err := loader.LoadFiles("app.env"); err != nil {
     log.Fatal(err)
 }
 // 输出: {"timestamp":"...","action":"parse","reason":"parsed: app.env","success":true,"duration_ns":150000}
-//       {"timestamp":"...","action":"set","key":"[MASKED:7 chars]","reason":"loaded","success":true,"masked":true}
+//       {"timestamp":"...","action":"set","key":"[MASKED]","reason":"loaded","success":true,"masked":true}
 //
-// 敏感键（如 API_KEY）在审计输出中会被掩码为 [MASKED:<len> chars]。
+// 敏感键（如 API_KEY）在审计输出中会被掩码为 [MASKED]。
 ```
 
 **内置处理器：**
@@ -463,12 +517,12 @@ func TestMain(m *testing.M) {
 env.IsSensitiveKey("API_SECRET")  // true
 env.IsSensitiveKey("HOST")        // false
 
-// 值掩码 — 敏感键返回 "[MASKED:n chars]"；
+// 值掩码 — 敏感键返回 "[MASKED]"；
 // 非敏感值 ≤ 20 字符原样返回，超长则截断并追加 "..."
-env.MaskValue("API_KEY", "secret123")  // "[MASKED:9 chars]"
+env.MaskValue("API_KEY", "secret123")  // "[MASKED]"
 
-// 键掩码用于日志 — 保留前 2 个字符 + "***"（≤3 字符时返回 "***"）
-env.MaskKey("DB_PASSWORD")  // "DB***"
+// 键掩码用于日志 — 敏感键返回固定 token "[MASKED]"
+env.MaskKey("DB_PASSWORD")  // "[MASKED]"
 
 // 日志安全处理
 safe := env.SanitizeForLog(userInput)
@@ -493,8 +547,10 @@ database_url, db_password, ssn, credit_card,
 mnemonic, seed, recovery, wallet, service_account
 ```
 
-> **注意：** 以上为代表性子集，完整列表包含 40+ 个模式。
-> 匹配方式为子串匹配且不区分大小写 — 例如 `MY_API_KEY` 会因包含 `API_KEY` 而匹配。
+> **注意：** 以上为代表性子集，完整列表包含 50 个模式。
+> 匹配不区分大小写；绝大多数模式按子串匹配（例如 `MY_API_KEY` 因包含 `API_KEY` 而匹配），
+> 但 `AUTH`、`PAN`、`PWD`、`USERNAME` 四个短模式仅在标识符边界匹配，
+> 因此 `AUTHOR`、`EXPAND` 这类键不会被误判为敏感。
 
 ---
 
@@ -517,8 +573,8 @@ env.ProductionConfig()  // 严格安全 + 审计
 | `OverwriteExisting` | false | **true** | **true** | false |
 | `ValidateValues` | **true** | **true** | **true** | **true** |
 | `AuditEnabled` | false | false | false | **true** |
-| `MaxFileSize` | 2 MB | 10 MB | 64 KB | 64 KB |
-| `MaxVariables` | 500 | 500 | 50 | 50 |
+| `MaxFileSize` | 8 MB | 10 MB | 64 KB | 64 KB |
+| `MaxVariables` | 1,000 | 1,000 | 50 | 50 |
 
 ### 完整配置选项
 
@@ -537,35 +593,41 @@ cfg.AllowedKeys    = []string{"PORT", "DEBUG"}  // 空 = 允许所有
 cfg.ForbiddenKeys  = []string{"PATH"}           // 阻止危险键
 cfg.ValidateValues = true
 cfg.ValidateUTF8   = true
+cfg.KeyPattern     = nil                  // nil = DefaultKeyPattern
 
 // === 安全限制（LimitsConfig）===
-cfg.MaxFileSize       = 2 << 20   // 2 MB
-cfg.MaxVariables      = 500
-cfg.MaxLineLength     = 1024
-cfg.MaxKeyLength      = 64
-cfg.MaxValueLength    = 4096
+cfg.MaxFileSize       = 8 << 20   // 8 MB
+cfg.MaxVariables      = 1000
+cfg.MaxLineLength     = 8192
+cfg.MaxKeyLength      = 128
+cfg.MaxValueLength    = 8192
 cfg.MaxExpansionDepth = 5
 
 // === 解析（ParsingConfig）===
-cfg.AllowExportPrefix = true    // 允许 "export KEY=value" 语法
-cfg.AllowYamlSyntax   = false   // .env 中的 YAML 风格值
-cfg.ExpandVariables   = true    // 展开 ${VAR} 引用
+cfg.AllowExportPrefix  = true                     // 允许 "export KEY=value" 语法
+cfg.AllowYamlSyntax    = false                    // .env 中的 YAML 风格值
+cfg.ExpandVariables    = true                     // 展开 ${VAR}(仅 .env;JSON/YAML 不展开)
+cfg.DuplicateKeyPolicy = env.DuplicateKeyInherit  // Inherit / FirstWins / LastWins / Error
+cfg.ExpansionScope     = env.ExpansionFileOnly    // ${VAR} 仅从文件内变量解析(SEC-03)
 
 // === JSON 选项（JSONConfig）===
 cfg.JSONNullAsEmpty    = true
 cfg.JSONNumberAsString = true
 cfg.JSONBoolAsString   = true
-cfg.JSONMaxDepth       = 10
+cfg.JSONMaxDepth       = 16
 
 // === YAML 选项（YAMLConfig）===
 cfg.YAMLNullAsEmpty    = true
 cfg.YAMLNumberAsString = true
 cfg.YAMLBoolAsString   = true
-cfg.YAMLMaxDepth       = 10
+cfg.YAMLMaxDepth       = 16
 
 // === 高级选项（ComponentConfig）===
-cfg.Prefix     = "APP_"      // 仅加载带前缀的键
-cfg.FileSystem = nil         // nil = 操作系统文件系统
+cfg.Prefix          = "APP_"  // 仅加载带前缀的键
+cfg.FileSystem      = nil     // nil = 操作系统文件系统
+cfg.CustomValidator = nil     // 替换内置键/值验证器
+cfg.CustomExpander  = nil     // 替换内置变量展开器
+cfg.CustomAuditor   = nil     // 替换内置审计日志器
 
 // === 审计日志（ComponentConfig）===
 cfg.AuditEnabled = true
@@ -576,16 +638,31 @@ cfg.AuditHandler = env.NewJSONAuditHandler(os.Stdout) // 仅演示；生产环�
 > `JSONConfig`、`YAMLConfig`、`ParsingConfig`、`ComponentConfig`）并通过字段提升访问。
 > 你可以直接访问字段（`cfg.Filenames`）或显式访问（`cfg.FileConfig.Filenames`）。
 
+> **配置风格（API 契约）：** `Config` 结构体是唯一的配置通道——本库没有函数选项，
+> 每个字段都在 `DefaultConfig()` 中有显式默认值。零值语义：全零的 `Config{}`
+> 会被 `New` 当作 `DefaultConfig()`；部分填写的 Config **不会**被自动补全
+> （未设置的限额会让 `Validate` 以 `ErrInvalidConfig` 拒绝）——始终从
+> `DefaultConfig()` 或某个预设出发。少数进程级开关刻意不放进 Config：
+> `SetMemoryLockEnabled` / `SetMemoryLockStrict`、`RegisterParser` /
+> `ForceRegisterParser` 以及 `DefaultFileSystem` 变量——请在程序初始化阶段设置。
+
 ### 默认限制
 
 | 设置 | 默认值 | 硬限制 |
 |------|--------|--------|
-| MaxFileSize | 2 MB | 100 MB |
-| MaxLineLength | 1,024 字符 | 64 KB |
-| MaxKeyLength | 64 字符 | 1,024 字符 |
-| MaxValueLength | 4,096 字符 | 1 MB |
-| MaxVariables | 500 | 10,000 |
+| MaxFileSize | 8 MB | 100 MB |
+| MaxLineLength | 8,192 字符 | 64 KB |
+| MaxKeyLength | 128 字符 | 1,024 字符 |
+| MaxValueLength | 8,192 字符 | 1 MB |
+| MaxVariables | 1,000 | 10,000 |
 | MaxExpansionDepth | 5 | 20 |
+| JSONMaxDepth / YAMLMaxDepth | 16 | 100 |
+
+> **行长限制的适用范围：** `MaxLineLength` 对所有格式生效，包括 JSON 与 YAML。
+> 压缩为单行的 JSON（minified）在检查中算作一行，必须落在该限制内——其硬上限
+> 为 64 KB，因此更大的单行压缩文档无法仅靠调大配置加载，请改为带换行的格式化输出。
+> `MaxVariables` 在 `.env` 解析中途强制；JSON/YAML 在解析并展平后按扁平键数量检查
+> （解析期的内存上界由 YAML token / JSON 节点数上限承担）。
 
 ---
 
@@ -614,7 +691,7 @@ if errors.As(err, &parseErr) {
 **哨兵错误：** `ErrFileNotFound`、`ErrFileTooLarge`、`ErrLineTooLong`、`ErrInvalidKey`、
 `ErrForbiddenKey`、`ErrSecurityViolation`、`ErrInvalidValue`、`ErrMissingRequired`、
 `ErrMaxVariables`、`ErrExpansionDepth`、`ErrClosed`、`ErrInvalidConfig`、
-`ErrNotInitialized`、`ErrAlreadyInitialized`、`ErrDuplicateKey`
+`ErrNotInitialized`、`ErrAlreadyInitialized`、`ErrDuplicateKey`、`ErrAuditFailed`
 
 **结构化错误类型：** `ParseError`（文件/行号）、`ValidationError`、`SecurityError`、
 `FileError`、`ExpansionError`、`JSONError`、`YAMLError`、`MarshalError` —
@@ -626,11 +703,19 @@ if errors.As(err, &parseErr) {
 
 ## 📖 API 参考
 
+两层 API 互为镜像：下表中的每个包级函数都是同名 `Loader` 方法的薄代理，
+签名一致（`env.GetString` ↔ `loader.GetString`、`env.Set` ↔ `loader.Set` 等）。
+例外：`Load` / `Overload` / `LoadWithConfig` 初始化共享的默认加载器
+（实例层对应 `New`）；`GetSlice` 与 `GetSliceFrom` 成对（Go 方法不支持
+类型参数）；无状态的一次性解析 / 序列化 / 工具 / 内存锁 / 解析器注册族
+在设计上没有实例层对应。
+
 ### 包函数
 
 | 函数 | 说明 |
 |:-----|:-----|
 | `Load(files...)` | 加载文件并应用到 `os.Environ`（仅可调用一次，见上文说明） |
+| `Overload(files...)` | 同 `Load`，但后加载的文件覆盖先前的，且覆盖进程已有环境变量 |
 | `LoadWithConfig(cfg)` | 使用自定义配置加载（强制 `AutoApply = true`） |
 | `GetString(key, def...)` | 获取字符串值 |
 | `GetInt(key, def...)` | 获取 `int64` 值 |
@@ -651,7 +736,9 @@ if errors.As(err, &parseErr) {
 | `ParseInto(&struct)` | 从环境变量填充结构体 |
 | `Marshal(data, format?)` | 将 map/struct 转换为格式字符串 |
 | `UnmarshalMap(string, format?)` | 解析格式字符串为 map |
+| `UnmarshalMapWithConfig(cfg, string, format?)` | 按完整 Config 语义一次性解析（策略/限额/校验） |
 | `UnmarshalStruct(string, &struct, format?)` | 解析字符串到结构体 |
+| `UnmarshalStructWithConfig(cfg, string, &struct, format?)` | 按完整 Config 语义解析到结构体 |
 | `UnmarshalInto(map, &struct)` | 从 map 填充结构体 |
 | `MarshalStruct(struct)` | 将结构体转换为 map |
 | `IsMarshalError(err)` | 检查是否为序列化错误 |
@@ -659,7 +746,7 @@ if errors.As(err, &parseErr) {
 | `DevelopmentConfig()` | 宽松限制 + 允许覆盖 |
 | `TestingConfig()` | 紧凑限制，隔离测试 |
 | `ProductionConfig()` | 严格安全 + 启用审计 |
-| `New(cfg...)` | 创建新加载器（cfg 可选；零值 → 默认配置） |
+| `New(cfg...)` | 创建加载器（最多 1 个 Config，传入多个返回 `ErrInvalidConfig`；全零 → `DefaultConfig()`；部分填写必须从 `DefaultConfig()` 出发） |
 | `NewSecureValue(string)` | 从字符串创建 SecureValue |
 | `NewSecureValueStrict(string)` | 创建 SecureValue，锁定失败时返回错误 |
 | `ResetDefaultLoader()` | 重置单例（测试用，返回 error） |
@@ -777,7 +864,7 @@ err := env.ForceRegisterParser(env.FormatEnv, customFactory)
 
 | 指标 | 数值 |
 |:-----|:-----|
-| **分片并发** | 8 分片实现并行访问 |
+| **分片并发** | 32 分片实现并行访问 |
 | **内存池** | 可复用的 SecureValue、Builder、Scanner 池 |
 | **零分配** | 简单键查找的快速路径 |
 | **基准测试** | 运行 `go test -bench=. -benchmem` |
@@ -792,15 +879,17 @@ err := env.ForceRegisterParser(env.FormatEnv, customFactory)
 |:-----|:-----|
 | [01_quickstart](examples/01_quickstart/) | 全局模式基础：`Load`、类型访问器、`Lookup`、`Set` |
 | [02_loader_config](examples/02_loader_config/) | 实例模式、配置预设、前缀过滤、必需键、生命周期 |
-| [03_type_access](examples/03_type_access/) | 所有类型 getter：string、int、bool、duration、float、uint、slice |
+| [03_type_access](examples/03_type_access/) | 所有类型 getter：string、int、bool、duration、float、uint、slice（全局 + 实例） |
 | [04_struct_mapping](examples/04_struct_mapping/) | `env` 标签结构体序列化/反序列化、嵌套结构体、默认值 |
-| [05_secure_values](examples/05_secure_values/) | `SecureValue` 生命周期、`Close` 与 `Release`、内存锁定 |
-| [06_audit_logging](examples/06_audit_logging/) | JSON、Channel 和 Log 审计处理器 |
-| [07_marshal_unmarshal](examples/07_marshal_unmarshal/) | 格式转换：map ↔ string、struct ↔ map、多格式输出 |
+| [05_secure_values](examples/05_secure_values/) | `SecureValue` 生命周期、`Close` 与 `Release`、JSON 掩码、内存锁定 |
+| [06_audit_logging](examples/06_audit_logging/) | JSON、Channel 和 Log 审计处理器、`AuditEvent` 字段 |
+| [07_marshal_unmarshal](examples/07_marshal_unmarshal/) | 格式转换：map ↔ string、struct ↔ map、多格式输出、重复键策略 |
 | [08_utilities](examples/08_utilities/) | 内省（`Keys`/`All`/`Len`）、脱敏、格式检测 |
-| [09_error_handling](examples/09_error_handling/) | 哨兵错误（`errors.Is`）、类型化错误（`errors.As`） |
+| [09_error_handling](examples/09_error_handling/) | 哨兵错误（`errors.Is`）、类型化错误（`errors.As`）、键策略、展开错误 |
 | [10_concurrency](examples/10_concurrency/) | 并发读、写和混合访问 |
-| [11_advanced](examples/11_advanced/) | 变量展开、多文件覆盖、前缀过滤 |
+| [11_advanced](examples/11_advanced/) | 变量展开（含 file-only 作用域）、多文件覆盖、前缀过滤、全局加载器控制 |
+| [12_extensibility](examples/12_extensibility/) | 自定义解析器注册（`RegisterParser`）、接口化消费（`EnvGetter`）、自定义组件 |
+| [13_customization](examples/13_customization/) | 自定义 `Validator`/`Expander`/`FileSystem`、fail-closed 审计（`ErrAuditFailed`）、自定义 `Marshaler`/`Unmarshaler`、花括号展开运算符 |
 
 示例共享的数据文件位于 [`examples/data/`](examples/data/)。
 

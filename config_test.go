@@ -2,129 +2,102 @@ package env
 
 import (
 	"errors"
+	"fmt"
+	"reflect"
 	"regexp"
 	"testing"
+
+	"github.com/cybergodev/env/internal"
 )
 
 // ============================================================================
-// Config Preset Tests (Table-Driven)
+// Config Preset Tests
 // ============================================================================
 
 func TestConfigPresets(t *testing.T) {
-	tests := []struct {
-		name    string
-		factory func() Config
-		checks  []struct {
-			desc string
-			ok   bool
+	t.Run("DefaultConfig", func(t *testing.T) {
+		cfg := DefaultConfig()
+
+		// File handling
+		if len(cfg.Filenames) != 1 || cfg.Filenames[0] != ".env" {
+			t.Error("Filenames should be [.env]")
 		}
-	}{
-		{
-			name:    "DefaultConfig",
-			factory: DefaultConfig,
-			checks: []struct {
-				desc string
-				ok   bool
-			}{
-				{"Filenames=[.env]", false}, // placeholder; real checks below
-			},
-		},
-		{
-			name:    "DevelopmentConfig",
-			factory: DevelopmentConfig,
-			checks:  nil, // checked via assertions below
-		},
-		{
-			name:    "TestingConfig",
-			factory: TestingConfig,
-			checks:  nil,
-		},
-		{
-			name:    "ProductionConfig",
-			factory: ProductionConfig,
-			checks:  nil,
-		},
-	}
+		if cfg.FailOnMissingFile || cfg.OverwriteExisting {
+			t.Error("FailOnMissingFile/OverwriteExisting should be false")
+		}
+		if !cfg.AllowExportPrefix || cfg.AllowYamlSyntax {
+			t.Error("AllowExportPrefix=true, AllowYamlSyntax=false expected")
+		}
+		// Size limits
+		if cfg.MaxFileSize != DefaultMaxFileSize || cfg.MaxLineLength != DefaultMaxLineLength {
+			t.Error("Size limits should match defaults")
+		}
+		if cfg.MaxKeyLength != DefaultMaxKeyLength || cfg.MaxValueLength != DefaultMaxValueLength {
+			t.Error("Length limits should match defaults")
+		}
+		if cfg.MaxVariables != DefaultMaxVariables || cfg.MaxExpansionDepth != DefaultMaxExpansionDepth {
+			t.Error("Variable/depth limits should match defaults")
+		}
+		// Validation
+		if cfg.KeyPattern != nil || len(cfg.AllowedKeys) != 0 || len(cfg.ForbiddenKeys) != 0 || len(cfg.RequiredKeys) != 0 {
+			t.Error("Validation config should be empty/nil by default")
+		}
+		if !cfg.ValidateValues || !cfg.ExpandVariables {
+			t.Error("ValidateValues and ExpandVariables should be true")
+		}
+		if cfg.AuditEnabled {
+			t.Error("AuditEnabled should be false")
+		}
+		// JSON/YAML
+		if !cfg.JSONNullAsEmpty || !cfg.JSONNumberAsString || !cfg.JSONBoolAsString || cfg.JSONMaxDepth != defaultStructuredMaxDepth {
+			t.Error("JSON defaults incorrect")
+		}
+		if !cfg.YAMLNullAsEmpty || !cfg.YAMLNumberAsString || !cfg.YAMLBoolAsString || cfg.YAMLMaxDepth != defaultStructuredMaxDepth {
+			t.Error("YAML defaults incorrect")
+		}
+	})
 
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			cfg := tt.factory()
+	t.Run("DevelopmentConfig", func(t *testing.T) {
+		cfg := DevelopmentConfig()
 
-			switch tt.name {
-			case "DefaultConfig":
-				// File handling
-				if len(cfg.Filenames) != 1 || cfg.Filenames[0] != ".env" {
-					t.Error("Filenames should be [.env]")
-				}
-				if cfg.FailOnMissingFile || cfg.OverwriteExisting {
-					t.Error("FailOnMissingFile/OverwriteExisting should be false")
-				}
-				if !cfg.AllowExportPrefix || cfg.AllowYamlSyntax {
-					t.Error("AllowExportPrefix=true, AllowYamlSyntax=false expected")
-				}
-				// Size limits
-				if cfg.MaxFileSize != DefaultMaxFileSize || cfg.MaxLineLength != DefaultMaxLineLength {
-					t.Error("Size limits should match defaults")
-				}
-				if cfg.MaxKeyLength != DefaultMaxKeyLength || cfg.MaxValueLength != DefaultMaxValueLength {
-					t.Error("Length limits should match defaults")
-				}
-				if cfg.MaxVariables != DefaultMaxVariables || cfg.MaxExpansionDepth != DefaultMaxExpansionDepth {
-					t.Error("Variable/depth limits should match defaults")
-				}
-				// Validation
-				if cfg.KeyPattern != nil || len(cfg.AllowedKeys) != 0 || len(cfg.ForbiddenKeys) != 0 || len(cfg.RequiredKeys) != 0 {
-					t.Error("Validation config should be empty/nil by default")
-				}
-				if !cfg.ValidateValues || !cfg.ExpandVariables {
-					t.Error("ValidateValues and ExpandVariables should be true")
-				}
-				if cfg.AuditEnabled {
-					t.Error("AuditEnabled should be false")
-				}
-				// JSON/YAML
-				if !cfg.JSONNullAsEmpty || !cfg.JSONNumberAsString || !cfg.JSONBoolAsString || cfg.JSONMaxDepth != 10 {
-					t.Error("JSON defaults incorrect")
-				}
-				if !cfg.YAMLNullAsEmpty || !cfg.YAMLNumberAsString || !cfg.YAMLBoolAsString || cfg.YAMLMaxDepth != 10 {
-					t.Error("YAML defaults incorrect")
-				}
+		if cfg.FailOnMissingFile || !cfg.OverwriteExisting || !cfg.AllowYamlSyntax {
+			t.Error("DevelopmentConfig: FailOnMissing=false, Overwrite=true, Yaml=true")
+		}
+		if cfg.MaxFileSize != 10*1024*1024 || cfg.MaxVariables != DefaultMaxVariables {
+			t.Errorf("DevelopmentConfig: MaxFileSize=%d, MaxVariables=%d", cfg.MaxFileSize, cfg.MaxVariables)
+		}
+		if !cfg.ValidateValues {
+			t.Error("DevelopmentConfig: ValidateValues should be true")
+		}
+	})
 
-			case "DevelopmentConfig":
-				if cfg.FailOnMissingFile || !cfg.OverwriteExisting || !cfg.AllowYamlSyntax {
-					t.Error("DevelopmentConfig: FailOnMissing=false, Overwrite=true, Yaml=true")
-				}
-				if cfg.MaxFileSize != 10*1024*1024 || cfg.MaxVariables != 500 {
-					t.Errorf("DevelopmentConfig: MaxFileSize=%d, MaxVariables=%d", cfg.MaxFileSize, cfg.MaxVariables)
-				}
-				if !cfg.ValidateValues {
-					t.Error("DevelopmentConfig: ValidateValues should be true")
-				}
+	t.Run("TestingConfig", func(t *testing.T) {
+		cfg := TestingConfig()
 
-			case "TestingConfig":
-				if cfg.FailOnMissingFile || !cfg.OverwriteExisting {
-					t.Error("TestingConfig: FailOnMissing=false, Overwrite=true")
-				}
-				if cfg.MaxFileSize != 64*1024 || cfg.MaxVariables != 50 {
-					t.Errorf("TestingConfig: MaxFileSize=%d, MaxVariables=%d", cfg.MaxFileSize, cfg.MaxVariables)
-				}
-				if cfg.AuditEnabled {
-					t.Error("TestingConfig: AuditEnabled should be false")
-				}
+		if cfg.FailOnMissingFile || !cfg.OverwriteExisting {
+			t.Error("TestingConfig: FailOnMissing=false, Overwrite=true")
+		}
+		if cfg.MaxFileSize != 64*1024 || cfg.MaxVariables != 50 {
+			t.Errorf("TestingConfig: MaxFileSize=%d, MaxVariables=%d", cfg.MaxFileSize, cfg.MaxVariables)
+		}
+		if cfg.AuditEnabled {
+			t.Error("TestingConfig: AuditEnabled should be false")
+		}
+	})
 
-			case "ProductionConfig":
-				if !cfg.FailOnMissingFile || cfg.OverwriteExisting {
-					t.Error("ProductionConfig: FailOnMissing=true, Overwrite=false")
-				}
-				if !cfg.AuditEnabled || !cfg.ValidateValues {
-					t.Error("ProductionConfig: AuditEnabled=true, ValidateValues=true")
-				}
-				if cfg.MaxFileSize != 64*1024 || cfg.MaxVariables != 50 {
-					t.Errorf("ProductionConfig: MaxFileSize=%d, MaxVariables=%d", cfg.MaxFileSize, cfg.MaxVariables)
-				}
-			}
-		})
-	}
+	t.Run("ProductionConfig", func(t *testing.T) {
+		cfg := ProductionConfig()
+
+		if !cfg.FailOnMissingFile || cfg.OverwriteExisting {
+			t.Error("ProductionConfig: FailOnMissing=true, Overwrite=false")
+		}
+		if !cfg.AuditEnabled || !cfg.ValidateValues {
+			t.Error("ProductionConfig: AuditEnabled=true, ValidateValues=true")
+		}
+		if cfg.MaxFileSize != 64*1024 || cfg.MaxVariables != 50 {
+			t.Errorf("ProductionConfig: MaxFileSize=%d, MaxVariables=%d", cfg.MaxFileSize, cfg.MaxVariables)
+		}
+	})
 }
 
 // ============================================================================
@@ -139,123 +112,176 @@ func TestConfig_Validate(t *testing.T) {
 		}
 	})
 
-	t.Run("invalid key pattern", func(t *testing.T) {
-		cfg := DefaultConfig()
-		cfg.KeyPattern = regexp.MustCompile(`^[a-z]+$`)
-		if err := cfg.Validate(); err == nil {
-			t.Error("Validate() should fail with invalid key pattern")
-		}
-	})
+	// JSONMaxDepth and YAMLMaxDepth share the valid range 1..100 inclusive
+	// (validateFormatConfig: `<= 0 || > 100`). Note that 0 is an ERROR at the
+	// Validate layer — defaulting only happens when a fully-zero Config is
+	// replaced by DefaultConfig() in New. 1 and 100 are the at-boundary valid
+	// rows; 0 and 101 sit just outside.
+	setters := []struct {
+		name string
+		set  func(*Config, int)
+	}{
+		{"JSONMaxDepth", func(c *Config, v int) { c.JSONMaxDepth = v }},
+		{"YAMLMaxDepth", func(c *Config, v int) { c.YAMLMaxDepth = v }},
+	}
+	for _, setter := range setters {
+		for _, tt := range []struct {
+			val     int
+			wantErr bool
+		}{
+			{val: 0, wantErr: true},
+			{val: 1, wantErr: false},
+			{val: 100, wantErr: false},
+			{val: 101, wantErr: true},
+		} {
+			t.Run(fmt.Sprintf("%s=%d", setter.name, tt.val), func(t *testing.T) {
+				cfg := DefaultConfig()
+				setter.set(&cfg, tt.val)
 
-	t.Run("invalid JSON max depth zero", func(t *testing.T) {
-		cfg := DefaultConfig()
-		cfg.JSONMaxDepth = 0
-		if err := cfg.Validate(); err == nil {
-			t.Error("Validate() should fail with zero JSONMaxDepth")
+				err := cfg.Validate()
+				if (err != nil) != tt.wantErr {
+					t.Fatalf("Validate() error = %v, wantErr %v", err, tt.wantErr)
+				}
+				if !tt.wantErr {
+					return
+				}
+				var ve *ValidationError
+				if !errors.As(err, &ve) {
+					t.Fatalf("Validate() error = %T (%v), want *ValidationError", err, err)
+				}
+				if ve.Field != setter.name {
+					t.Errorf("ValidationError.Field = %q, want %q", ve.Field, setter.name)
+				}
+			})
 		}
-	})
+	}
 
-	t.Run("invalid JSON max depth too large", func(t *testing.T) {
+	// ExpansionScope is an enum with exactly two legal values; anything else
+	// (here 99) must be rejected. DuplicateKeyPolicy has equivalent coverage
+	// in duplicate_key_test.go; this closes the asymmetry.
+	t.Run("invalid ExpansionScope enum value", func(t *testing.T) {
 		cfg := DefaultConfig()
-		cfg.JSONMaxDepth = 101
-		if err := cfg.Validate(); err == nil {
-			t.Error("Validate() should fail with JSONMaxDepth > 100")
+		cfg.ExpansionScope = ExpansionScope(99)
+
+		err := cfg.Validate()
+		if err == nil {
+			t.Fatal("Validate() error = nil, want enum rejection")
 		}
-	})
-
-	t.Run("invalid YAML max depth zero", func(t *testing.T) {
-		cfg := DefaultConfig()
-		cfg.YAMLMaxDepth = 0
-		if err := cfg.Validate(); err == nil {
-			t.Error("Validate() should fail with zero YAMLMaxDepth")
+		var ve *ValidationError
+		if !errors.As(err, &ve) {
+			t.Fatalf("Validate() error = %T (%v), want *ValidationError", err, err)
 		}
-	})
-
-	t.Run("invalid YAML max depth too large", func(t *testing.T) {
-		cfg := DefaultConfig()
-		cfg.YAMLMaxDepth = 101
-		if err := cfg.Validate(); err == nil {
-			t.Error("Validate() should fail with YAMLMaxDepth > 100")
-		}
-	})
-
-	t.Run("valid custom key pattern", func(t *testing.T) {
-		cfg := DefaultConfig()
-		cfg.KeyPattern = regexp.MustCompile(`^[A-Z][A-Z0-9_]*$`)
-		if err := cfg.Validate(); err != nil {
-			t.Errorf("Validate() with valid pattern error = %v", err)
+		if ve.Field != "ExpansionScope" {
+			t.Errorf("ValidationError.Field = %q, want %q", ve.Field, "ExpansionScope")
 		}
 	})
 }
 
 // ============================================================================
-// KeyPattern Edge Case Tests
+// KeyPattern Validation (table)
 // ============================================================================
 
-func TestKeyPattern_EdgeCases(t *testing.T) {
-	// Test the default key pattern behavior
-	t.Run("nil pattern allows standard keys", func(t *testing.T) {
-		cfg := DefaultConfig()
-		// KeyPattern is nil by default for fast byte-level validation
-		if cfg.KeyPattern != nil {
-			t.Error("KeyPattern should be nil by default")
-		}
+// TestValidateKeyPattern drives every branch of validateKeyPattern through
+// Config.Validate and pins which rule fires. For rejected patterns it also
+// asserts New() refuses the configuration.
+func TestValidateKeyPattern(t *testing.T) {
+	tests := []struct {
+		name      string
+		pattern   *regexp.Regexp
+		wantValid bool
+		wantRule  string // ValidationError.Rule of the rejecting branch; "" when valid
+	}{
+		{name: "nil pattern uses the default validation", pattern: nil, wantValid: true},
+		{name: "uppercase pattern is valid", pattern: regexp.MustCompile(`^[A-Z][A-Z0-9_]*$`), wantValid: true},
+		{
+			name:      "pattern not matching TEST_KEY is rejected",
+			pattern:   regexp.MustCompile(`^[a-z]+$`),
+			wantValid: false,
+			wantRule:  "valid_pattern",
+		},
+		{
+			name:      "pattern allowing numeric start is rejected",
+			pattern:   regexp.MustCompile(`^[A-Z0-9][A-Z0-9_]*$`),
+			wantValid: false,
+			wantRule:  "reject_numeric_start",
+		},
+		{
+			// A pattern matching the empty string would accept empty key
+			// names (config.go reject_empty branch); previously untested.
+			name:      "pattern matching empty string is rejected",
+			pattern:   regexp.MustCompile(`^[A-Z0-9_]*$`),
+			wantValid: false,
+			wantRule:  "reject_empty",
+		},
+		{
+			// One representative of the SEC-06 unsafe-character probes; the
+			// full pattern matrix lives in sec_regression_test.go
+			// (TestSEC06_KeyPatternRejectsInjectionEnablers).
+			name:      "pattern matching separator characters is rejected",
+			pattern:   regexp.MustCompile(`^[A-Z][A-Z=_]*$`),
+			wantValid: false,
+			wantRule:  "reject_unsafe_chars",
+		},
+	}
 
-		loader, err := New(cfg)
-		if err != nil {
-			t.Fatalf("New() error = %v", err)
-		}
-		defer loader.Close()
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			cfg := DefaultConfig()
+			cfg.KeyPattern = tt.pattern
+			cfg.Filenames = nil // no auto-load: rejection must come from validation alone
 
-		// Standard keys should work
-		if err := loader.Set("TEST_KEY", "value"); err != nil {
-			t.Errorf("Set() error = %v", err)
-		}
-		if err := loader.Set("API_KEY_123", "value"); err != nil {
-			t.Errorf("Set() error = %v", err)
-		}
-	})
+			err := cfg.Validate()
+			if tt.wantValid {
+				if err != nil {
+					t.Fatalf("Validate() error = %v, want nil", err)
+				}
+				return
+			}
 
-	t.Run("custom pattern matches valid keys", func(t *testing.T) {
-		cfg := DefaultConfig()
-		// Pattern that matches uppercase with underscores and numbers (and TEST_KEY)
-		cfg.KeyPattern = regexp.MustCompile(`^[A-Z][A-Z0-9_]*$`)
+			var ve *ValidationError
+			if !errors.As(err, &ve) {
+				t.Fatalf("Validate() error = %T (%v), want *ValidationError", err, err)
+			}
+			if ve.Rule != tt.wantRule {
+				t.Errorf("ValidationError.Rule = %q, want %q", ve.Rule, tt.wantRule)
+			}
+			loader, err := New(cfg)
+			if err == nil {
+				_ = loader.Close()
+				t.Error("New() error = nil, want the invalid pattern to be rejected")
+			}
+		})
+	}
+}
 
-		loader, err := New(cfg)
-		if err != nil {
-			t.Fatalf("New() error = %v", err)
-		}
-		defer loader.Close()
+// ============================================================================
+// KeyPattern Edge Case Tests (runtime behavior)
+// ============================================================================
 
-		// Keys matching the pattern should work
-		if err := loader.Set("VALID_KEY", "value"); err != nil {
-			t.Errorf("Set() error = %v", err)
-		}
-	})
+// (TestKeyPattern_EdgeCases's "nil pattern allows standard keys" case was
+// removed: DefaultConfig ships KeyPattern nil (asserted in TestConfigPresets)
+// and the nil-pattern Set path is the default configuration under which every
+// other loader test in this package already runs.)
 
-	t.Run("pattern must match TEST_KEY during validation", func(t *testing.T) {
-		cfg := DefaultConfig()
-		// Pattern that only allows lowercase - this will fail validation
-		// because it can't match TEST_KEY
-		cfg.KeyPattern = regexp.MustCompile(`^[a-z]+$`)
+// TestKeyPattern_CustomPattern merges config-level validity of
+// ^[A-Z][A-Z0-9_]*$ plus the runtime Set behavior under that pattern.
+func TestKeyPattern_CustomPattern(t *testing.T) {
+	cfg := DefaultConfig()
+	cfg.KeyPattern = regexp.MustCompile(`^[A-Z][A-Z0-9_]*$`)
+	if err := cfg.Validate(); err != nil {
+		t.Fatalf("Validate() with valid pattern error = %v", err)
+	}
+	cfg.Filenames = nil
 
-		_, err := New(cfg)
-		if err == nil {
-			t.Error("New() should fail with pattern that doesn't match TEST_KEY")
-		}
-	})
+	loader, err := New(cfg)
+	if err != nil {
+		t.Fatalf("New() error = %v", err)
+	}
+	defer func() { _ = loader.Close() }() // best-effort cleanup
 
-	t.Run("pattern must not allow numeric start", func(t *testing.T) {
-		cfg := DefaultConfig()
-		// Pattern that allows keys starting with numbers
-		// This should fail validation because it allows numeric-start keys
-		cfg.KeyPattern = regexp.MustCompile(`^[A-Z0-9][A-Z0-9_]*$`)
-
-		_, err := New(cfg)
-		if err == nil {
-			t.Error("New() should fail with pattern that allows numeric-start keys")
-		}
-	})
+	if err := loader.Set("VALID_KEY", "value"); err != nil {
+		t.Errorf("Set() error = %v", err)
+	}
 }
 
 // ============================================================================
@@ -282,6 +308,69 @@ func TestValidateConfigLimits(t *testing.T) {
 			maxValLen:  DefaultMaxValueLength,
 			maxVars:    DefaultMaxVariables,
 			maxDepth:   DefaultMaxExpansionDepth,
+			wantErr:    false,
+		},
+		{
+			// At-cap boundary rows: validateConfigLimits compares with a
+			// strict `>` against the HardMax* constants, so a value exactly at
+			// the cap must pass. A regression to `>=` fails these rows.
+			name:       "max file size at hard cap passes",
+			maxSize:    internal.HardMaxFileSize,
+			maxLineLen: DefaultMaxLineLength,
+			maxKeyLen:  DefaultMaxKeyLength,
+			maxValLen:  DefaultMaxValueLength,
+			maxVars:    DefaultMaxVariables,
+			maxDepth:   DefaultMaxExpansionDepth,
+			wantErr:    false,
+		},
+		{
+			name:       "max line length at hard cap passes",
+			maxSize:    DefaultMaxFileSize,
+			maxLineLen: internal.HardMaxLineLength,
+			maxKeyLen:  DefaultMaxKeyLength,
+			maxValLen:  DefaultMaxValueLength,
+			maxVars:    DefaultMaxVariables,
+			maxDepth:   DefaultMaxExpansionDepth,
+			wantErr:    false,
+		},
+		{
+			name:       "max key length at hard cap passes",
+			maxSize:    DefaultMaxFileSize,
+			maxLineLen: DefaultMaxLineLength,
+			maxKeyLen:  internal.HardMaxKeyLength,
+			maxValLen:  DefaultMaxValueLength,
+			maxVars:    DefaultMaxVariables,
+			maxDepth:   DefaultMaxExpansionDepth,
+			wantErr:    false,
+		},
+		{
+			name:       "max value length at hard cap passes",
+			maxSize:    DefaultMaxFileSize,
+			maxLineLen: DefaultMaxLineLength,
+			maxKeyLen:  DefaultMaxKeyLength,
+			maxValLen:  internal.HardMaxValueLength,
+			maxVars:    DefaultMaxVariables,
+			maxDepth:   DefaultMaxExpansionDepth,
+			wantErr:    false,
+		},
+		{
+			name:       "max variables at hard cap passes",
+			maxSize:    DefaultMaxFileSize,
+			maxLineLen: DefaultMaxLineLength,
+			maxKeyLen:  DefaultMaxKeyLength,
+			maxValLen:  DefaultMaxValueLength,
+			maxVars:    internal.HardMaxVariables,
+			maxDepth:   DefaultMaxExpansionDepth,
+			wantErr:    false,
+		},
+		{
+			name:       "max expansion depth at hard cap passes",
+			maxSize:    DefaultMaxFileSize,
+			maxLineLen: DefaultMaxLineLength,
+			maxKeyLen:  DefaultMaxKeyLength,
+			maxValLen:  DefaultMaxValueLength,
+			maxVars:    DefaultMaxVariables,
+			maxDepth:   internal.HardMaxExpansionDepth,
 			wantErr:    false,
 		},
 		{
@@ -464,6 +553,16 @@ func TestNewValidationError(t *testing.T) {
 	if err.Message != "test message" {
 		t.Errorf("Message = %q, want %q", err.Message, "test message")
 	}
+	if err.Value != "test_value" {
+		t.Errorf("Value = %q, want %q (benign values pass through unmasked)", err.Value, "test_value")
+	}
+
+	// Values that look sensitive are masked before reaching the error
+	// (newValidationError routes Value through MaskSensitiveInString).
+	masked := newValidationError("PasswordField", "password=hunter2", "test_rule", "test message")
+	if masked.Value != "password=[MASKED]" {
+		t.Errorf("Value = %q, want %q (sensitive-looking values must be masked)", masked.Value, "password=[MASKED]")
+	}
 }
 
 // ============================================================================
@@ -481,7 +580,7 @@ func TestConfig_WithAuditHandler(t *testing.T) {
 	if err != nil {
 		t.Fatalf("New() error = %v", err)
 	}
-	defer loader.Close()
+	defer func() { _ = loader.Close() }() // best-effort cleanup
 
 	// The configured handler must receive audit events produced by loader
 	// operations, not just be accepted during construction. New() emits
@@ -512,182 +611,275 @@ func TestConfig_WithAuditHandler(t *testing.T) {
 }
 
 // ============================================================================
-// Config with AllowedKeys Tests
+// Config Policy Behavior (AllowedKeys / ForbiddenKeys / RequiredKeys /
+// OverwriteExisting), table-driven
 // ============================================================================
 
-func TestConfig_WithAllowedKeys(t *testing.T) {
-	cfg := DefaultConfig()
-	cfg.AllowedKeys = []string{"ALLOWED_KEY"}
-
-	loader, err := New(cfg)
-	if err != nil {
-		t.Fatalf("New() error = %v", err)
-	}
-	defer loader.Close()
-
-	t.Run("allowed key", func(t *testing.T) {
-		if err := loader.Set("ALLOWED_KEY", "value"); err != nil {
-			t.Errorf("Set() allowed key error = %v", err)
-		}
-	})
-
-	t.Run("non-allowed key", func(t *testing.T) {
-		if err := loader.Set("NOT_ALLOWED", "value"); err == nil {
-			t.Error("Set() should fail with non-allowed key")
-		}
-	})
+// rmConfigPolicyCase is one row of the merged policy table: build a Config,
+// run the loader operations, then check the op error sentinel and the
+// resulting key/value state.
+type rmConfigPolicyCase struct {
+	name   string
+	setup  func(*Config)
+	ops    func(*Loader) error
+	wantOp error // errors.Is target for the error returned by ops; nil expects success
+	wantKV map[string]string
 }
 
-// ============================================================================
-// Config with ForbiddenKeys Tests
-// ============================================================================
-
-func TestConfig_WithForbiddenKeys(t *testing.T) {
-	cfg := DefaultConfig()
-	cfg.ForbiddenKeys = []string{"FORBIDDEN_KEY"}
-	cfg.OverwriteExisting = true
-
-	loader, err := New(cfg)
-	if err != nil {
-		t.Fatalf("New() error = %v", err)
+func TestConfigPolicyBehavior(t *testing.T) {
+	tests := []rmConfigPolicyCase{
+		{
+			name:   "allowed key is accepted",
+			setup:  func(c *Config) { c.AllowedKeys = []string{"ALLOWED_KEY"} },
+			ops:    func(l *Loader) error { return l.Set("ALLOWED_KEY", "value") },
+			wantKV: map[string]string{"ALLOWED_KEY": "value"},
+		},
+		{
+			name:   "key outside AllowedKeys is rejected",
+			setup:  func(c *Config) { c.AllowedKeys = []string{"ALLOWED_KEY"} },
+			ops:    func(l *Loader) error { return l.Set("NOT_ALLOWED", "value") },
+			wantOp: ErrForbiddenKey,
+		},
+		{
+			name:   "ForbiddenKeys entry is rejected",
+			setup:  func(c *Config) { c.ForbiddenKeys = []string{"FORBIDDEN_KEY"}; c.OverwriteExisting = true },
+			ops:    func(l *Loader) error { return l.Set("FORBIDDEN_KEY", "value") },
+			wantOp: ErrForbiddenKey,
+		},
+		{
+			name: "overwrite disabled keeps first value",
+			ops: func(l *Loader) error {
+				if err := l.Set("KEY", "value1"); err != nil {
+					return err
+				}
+				return l.Set("KEY", "value2")
+			},
+			wantKV: map[string]string{"KEY": "value1"},
+		},
+		{
+			name:  "overwrite enabled takes last value",
+			setup: func(c *Config) { c.OverwriteExisting = true },
+			ops: func(l *Loader) error {
+				if err := l.Set("KEY", "value1"); err != nil {
+					return err
+				}
+				return l.Set("KEY", "value2")
+			},
+			wantKV: map[string]string{"KEY": "value2"},
+		},
+		{
+			// RequiredKeys-through-config wiring row. The full loader-level
+			// scenario (multiple required keys, ordering) lives in
+			// loader_test.go TestLoader_Validate; this row pins that a Config
+			// carrying RequiredKeys drives Loader.Validate: missing -> error,
+			// set -> nil.
+			name:  "required key drives Validate",
+			setup: func(c *Config) { c.RequiredKeys = []string{"REQUIRED_KEY"} },
+			ops: func(l *Loader) error {
+				if err := l.Validate(); err == nil {
+					return errors.New("Validate() = nil, want failure while REQUIRED_KEY is missing")
+				}
+				if err := l.Set("REQUIRED_KEY", "value"); err != nil {
+					return err
+				}
+				return l.Validate()
+			},
+			wantKV: map[string]string{"REQUIRED_KEY": "value"},
+		},
 	}
-	defer loader.Close()
 
-	if err := loader.Set("FORBIDDEN_KEY", "value"); err == nil {
-		t.Error("Set() should fail with forbidden key")
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			cfg := DefaultConfig()
+			cfg.Filenames = nil // no auto-load: the ops below are the scenario
+			if tt.setup != nil {
+				tt.setup(&cfg)
+			}
+
+			loader, err := New(cfg)
+			if err != nil {
+				t.Fatalf("New() error = %v", err)
+			}
+			defer func() { _ = loader.Close() }()
+
+			opErr := tt.ops(loader)
+			if tt.wantOp == nil {
+				if opErr != nil {
+					t.Errorf("ops error = %v, want nil", opErr)
+				}
+			} else if !errors.Is(opErr, tt.wantOp) {
+				t.Errorf("ops error = %v, want errors.Is(err, %v)", opErr, tt.wantOp)
+			}
+
+			for key, want := range tt.wantKV {
+				if got := loader.GetString(key); got != want {
+					t.Errorf("GetString(%q) = %q, want %q", key, got, want)
+				}
+			}
+		})
 	}
-}
-
-// ============================================================================
-// Config with RequiredKeys Tests
-// ============================================================================
-
-func TestConfig_WithRequiredKeys(t *testing.T) {
-	cfg := DefaultConfig()
-	cfg.RequiredKeys = []string{"REQUIRED_KEY"}
-
-	loader, err := New(cfg)
-	if err != nil {
-		t.Fatalf("New() error = %v", err)
-	}
-	defer loader.Close()
-
-	t.Run("validate without required key", func(t *testing.T) {
-		if err := loader.Validate(); err == nil {
-			t.Error("Validate() should fail without required key")
-		}
-	})
-
-	t.Run("validate with required key", func(t *testing.T) {
-		if err := loader.Set("REQUIRED_KEY", "value"); err != nil {
-			t.Fatalf("Set() error = %v", err)
-		}
-		if err := loader.Validate(); err != nil {
-			t.Errorf("Validate() error = %v", err)
-		}
-	})
-}
-
-// ============================================================================
-// Config OverwriteExisting Tests
-// ============================================================================
-
-func TestConfig_OverwriteExisting(t *testing.T) {
-	t.Run("overwrite disabled", func(t *testing.T) {
-		cfg := DefaultConfig()
-		cfg.OverwriteExisting = false
-
-		loader, err := New(cfg)
-		if err != nil {
-			t.Fatalf("New() error = %v", err)
-		}
-		defer loader.Close()
-
-		if err := loader.Set("KEY", "value1"); err != nil {
-			t.Fatalf("Set() error = %v", err)
-		}
-		if err := loader.Set("KEY", "value2"); err != nil {
-			t.Fatalf("Set() error = %v, want nil", err)
-		}
-
-		// Value should not change
-		if loader.GetString("KEY") != "value1" {
-			t.Errorf("GetString(\"KEY\") = %q, want %q", loader.GetString("KEY"), "value1")
-		}
-	})
-
-	t.Run("overwrite enabled", func(t *testing.T) {
-		cfg := DefaultConfig()
-		cfg.OverwriteExisting = true
-
-		loader, err := New(cfg)
-		if err != nil {
-			t.Fatalf("New() error = %v", err)
-		}
-		defer loader.Close()
-
-		if err := loader.Set("KEY", "value1"); err != nil {
-			t.Fatalf("Set() error = %v", err)
-		}
-		if err := loader.Set("KEY", "value2"); err != nil {
-			t.Fatalf("Set() error = %v", err)
-		}
-
-		// Value should change
-		if loader.GetString("KEY") != "value2" {
-			t.Errorf("GetString(\"KEY\") = %q, want %q", loader.GetString("KEY"), "value2")
-		}
-	})
 }
 
 // ============================================================================
 // Config.IsZero Completeness Tests
 // ============================================================================
 
-func TestConfigIsZero_Completeness(t *testing.T) {
-	// Zero-value config should be detected as zero
+// (TestConfigIsZero_Completeness and its rmIsZero* stubs were removed: the
+// reflection walk in TestConfigIsZero_CoversEveryField below makes the same
+// per-field assertion for EVERY Config leaf field — including fields added
+// later, which the former hand-maintained table silently missed.)
+
+// Stubs for the Config interface fields in TestConfigIsZero_CoversEveryField.
+type izValidator struct{}
+
+func (izValidator) ValidateKey(string) error               { return nil }
+func (izValidator) ValidateValue(string) error             { return nil }
+func (izValidator) ValidateRequired(map[string]bool) error { return nil }
+
+type izExpander struct{}
+
+func (izExpander) Expand(s string) (string, error) { return s, nil }
+
+type izAuditor struct{}
+
+func (izAuditor) LogError(AuditAction, string, string) error { return nil }
+
+type izHandler struct{}
+
+func (izHandler) Log(AuditEvent) error { return nil }
+func (izHandler) Close() error         { return nil }
+
+// nonZeroConfigValue synthesizes a non-zero value of type t for the IsZero
+// coverage walk. The SECOND return is invalid for kinds the synthesizer does
+// not know (reported by the test).
+func nonZeroConfigValue(t reflect.Type) reflect.Value {
+	switch t.Kind() {
+	case reflect.Bool:
+		return reflect.ValueOf(true).Convert(t)
+	case reflect.Int, reflect.Int8, reflect.Int16, reflect.Int32, reflect.Int64:
+		return reflect.ValueOf(1).Convert(t)
+	case reflect.String:
+		return reflect.ValueOf("x").Convert(t)
+	case reflect.Slice:
+		return reflect.MakeSlice(t, 1, 1)
+	case reflect.Pointer:
+		return reflect.New(t.Elem())
+	}
+	return reflect.Value{}
+}
+
+// TestConfigIsZero_CoversEveryField locks IsZero's field coverage against
+// drift: setting ANY single leaf field of Config (including fields promoted
+// through the embedded sections) to a non-zero value must make IsZero report
+// false. Two real bugs — ExpansionScope and DuplicateKeyPolicy silently
+// replaced by DefaultConfig() — came from fields missing here while the
+// compiler stayed silent.
+func TestConfigIsZero_CoversEveryField(t *testing.T) {
+	// Lead assertions (from the former TestConfigIsZero_Completeness): the
+	// zero value IS zero, and DefaultConfig is not.
 	var zeroCfg Config
 	if !zeroCfg.IsZero() {
 		t.Error("Zero-value Config should return true for IsZero()")
 	}
-
-	// DefaultConfig should NOT be zero
 	defaultCfg := DefaultConfig()
 	if defaultCfg.IsZero() {
 		t.Error("DefaultConfig() should return non-zero Config")
 	}
 
-	// Each non-zero-default field should make IsZero return false
-	tests := []struct {
-		name string
-		cfg  Config
-	}{
-		{"MaxFileSize", Config{LimitsConfig: LimitsConfig{MaxFileSize: 1}}},
-		{"MaxVariables", Config{LimitsConfig: LimitsConfig{MaxVariables: 1}}},
-		{"MaxLineLength", Config{LimitsConfig: LimitsConfig{MaxLineLength: 1}}},
-		{"MaxKeyLength", Config{LimitsConfig: LimitsConfig{MaxKeyLength: 1}}},
-		{"MaxValueLength", Config{LimitsConfig: LimitsConfig{MaxValueLength: 1}}},
-		{"MaxExpansionDepth", Config{LimitsConfig: LimitsConfig{MaxExpansionDepth: 1}}},
-		{"ValidateValues", Config{ValidationConfig: ValidationConfig{ValidateValues: true}}},
-		{"JSONNullAsEmpty", Config{JSONConfig: JSONConfig{JSONNullAsEmpty: true}}},
-		{"JSONNumberAsString", Config{JSONConfig: JSONConfig{JSONNumberAsString: true}}},
-		{"JSONBoolAsString", Config{JSONConfig: JSONConfig{JSONBoolAsString: true}}},
-		{"YAMLNullAsEmpty", Config{YAMLConfig: YAMLConfig{YAMLNullAsEmpty: true}}},
-		{"YAMLNumberAsString", Config{YAMLConfig: YAMLConfig{YAMLNumberAsString: true}}},
-		{"YAMLBoolAsString", Config{YAMLConfig: YAMLConfig{YAMLBoolAsString: true}}},
-		{"AllowExportPrefix", Config{ParsingConfig: ParsingConfig{AllowExportPrefix: true}}},
-		{"ExpandVariables", Config{ParsingConfig: ParsingConfig{ExpandVariables: true}}},
-		{"ExpansionScope", Config{ParsingConfig: ParsingConfig{ExpansionScope: ExpansionFileOnly}}},
-		{"KeyPattern", Config{ValidationConfig: ValidationConfig{KeyPattern: regexp.MustCompile(".")}}},
-		{"Filenames", Config{FileConfig: FileConfig{Filenames: []string{".env"}}}},
-		{"FileSystem", Config{ComponentConfig: ComponentConfig{FileSystem: DefaultFileSystem}}},
+	// Concrete implementations for the interface-typed fields, keyed by
+	// field name.
+	interfaceImpls := map[string]any{
+		"FileSystem":      DefaultFileSystem,
+		"CustomValidator": izValidator{},
+		"CustomExpander":  izExpander{},
+		"CustomAuditor":   izAuditor{},
+		"AuditHandler":    izHandler{},
 	}
 
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			if tt.cfg.IsZero() {
-				t.Errorf("Config with %s set should not be detected as zero", tt.name)
+	var walk func(section reflect.Type, prefix string)
+	walk = func(section reflect.Type, prefix string) {
+		for i := 0; i < section.NumField(); i++ {
+			f := section.Field(i)
+			if f.Anonymous && f.Type.Kind() == reflect.Struct {
+				walk(f.Type, prefix+f.Name+".")
+				continue
 			}
-		})
+
+			var v reflect.Value
+			if f.Type.Kind() == reflect.Interface {
+				impl, ok := interfaceImpls[f.Name]
+				if !ok {
+					t.Errorf("%s%s: interface field without a test stub — add one so coverage stays complete", prefix, f.Name)
+					continue
+				}
+				v = reflect.ValueOf(impl)
+				if !v.Type().Implements(f.Type) {
+					t.Errorf("%s%s: stub %T does not implement %s", prefix, f.Name, impl, f.Type)
+					continue
+				}
+			} else {
+				v = nonZeroConfigValue(f.Type)
+			}
+			if !v.IsValid() {
+				t.Errorf("%s%s (%s): unsupported field kind — extend nonZeroConfigValue", prefix, f.Name, f.Type)
+				continue
+			}
+
+			cfgValue := reflect.ValueOf(&Config{}).Elem()
+			field := cfgValue.FieldByName(f.Name) // promoted through embedding
+			if !field.IsValid() || !field.CanSet() {
+				t.Fatalf("%s%s: not settable on Config", prefix, f.Name)
+			}
+			field.Set(v)
+			if cfgValue.Addr().Interface().(*Config).IsZero() {
+				t.Errorf("Config with only %s%s set reports IsZero()=true — the field is missing from IsZero", prefix, f.Name)
+			}
+		}
+	}
+	walk(reflect.TypeOf(Config{}), "")
+}
+
+// ============================================================================
+// Default Forbidden-Keys List (moved from the former limits_test.go — the
+// Set-level forbidden-key policy tests belong with the other Config policy
+// behavior)
+// ============================================================================
+
+// TestDefaultForbiddenKeysSlice guards the slice-literal conversion of the
+// default forbidden-key list: the previous map-derived initialization made
+// duplicates structurally impossible, so the literal needs an explicit check.
+func TestDefaultForbiddenKeysSlice(t *testing.T) {
+	seen := make(map[string]bool, len(defaultForbiddenKeysSlice))
+	for _, k := range defaultForbiddenKeysSlice {
+		if seen[k] {
+			t.Errorf("duplicate forbidden key: %s", k)
+		}
+		seen[k] = true
+	}
+	if len(defaultForbiddenKeysSlice) == 0 {
+		t.Error("defaultForbiddenKeysSlice must not be empty")
+	}
+}
+
+// TestDefaultForbiddenKeysRejectInjectionVectors pins SEC-003 (CWE-74/94): the
+// runtime/VM option-injection vectors added to the default forbidden-key list
+// must actually be rejected by a Loader built from DefaultConfig.
+func TestDefaultForbiddenKeysRejectInjectionVectors(t *testing.T) {
+	cfg := DefaultConfig()
+	cfg.Filenames = nil
+	loader, err := New(cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = loader.Close() }() // best-effort cleanup
+
+	for _, key := range []string{
+		"NODE_OPTIONS", "JAVA_TOOL_OPTIONS", "JDK_JAVA_OPTIONS", "_JAVA_OPTIONS",
+		"CLASSPATH", "PYTHONSTARTUP", "PYTHONINSPECT", "PS4", "SHELLOPTS", "BASHOPTS",
+		"GIT_CONFIG_COUNT", "GIT_PROXY_COMMAND", "PERL5LIB", "RUBYOPT",
+	} {
+		if err := loader.Set(key, "injected"); err == nil {
+			t.Errorf("Set(%q) = nil, want ErrForbiddenKey", key)
+		}
 	}
 }

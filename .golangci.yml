@@ -1,0 +1,73 @@
+version: "2"
+
+# Show every issue: the v2 default caps (max-same-issues: 3,
+# max-issues-per-linter: 50) silently hid ~130 errcheck findings during the
+# GEN-001 audit. A gate that truncates its own output is not a gate.
+issues:
+  max-same-issues: 0
+  max-issues-per-linter: 0
+
+linters:
+  # Add gosec on top of the v2 default set ("standard"). gosec audits the
+  # security-critical paths (secure.go's unsafe zeroing, mlock) and would
+  # catch G101 hardcoded credentials / G104 unchecked errors in future
+  # library code. Its findings on the deliberate unsafe/permission sites are
+  # scope-suppressed below with justification — nothing is blanket-disabled.
+  enable:
+    - gosec
+
+  exclusions:
+    # Frozen local development scratch — gitignored, never shipped, kept
+    # out of lint noise deliberately.
+    paths:
+      - dev_test
+
+    rules:
+      # QF1008 suggests removing explicit embedded-struct qualifiers
+      # (cfg.FileConfig.X -> cfg.X). The codebase deliberately keeps the
+      # explicit form: "explicit over implicit" is a stated project rule
+      # (CLAUDE.md, Design Philosophy), and the qualified form documents
+      # which embedded Config section a field belongs to.
+      - linters: [staticcheck]
+        text: "QF1008"
+
+      # --- gosec exclusions (GEN-001 hardening) ---
+
+      # G103 (unsafe): secure.go's volatile zeroing, internal/mlock_* and the
+      # mlock failure test use unsafe deliberately — they are exactly the code
+      # gosec exists to audit, and each site carries a SECURITY: comment
+      # documenting why the unsafe write is required (compiler-elision-proof
+      # secret clearing, mlock page pinning). Suppressed by path so gosec
+      # still audits every OTHER unsafe use.
+      - linters: [gosec]
+        path: "secure\\.go|mlock_"
+        text: "G103"
+
+      # G304 (file inclusion via variable): filesystem.go IS the injectable
+      # FileSystem seam — OSFileSystem.Open/OpenFile exist specifically to
+      # open caller-supplied paths. Not a finding; it is the abstraction's
+      # purpose.
+      - linters: [gosec]
+        path: "filesystem\\.go"
+        text: "G304"
+
+      # G115 (int->uint32 / uint32->rune): provably safe conversions —
+      #   keyutil.go shard index is guarded by the shards<=0 early-return and
+      #   is only ever called with power-of-two constants (8, 32);
+      #   yaml_flatten.go rune(v) widens a 0..0xFFFF \uXXXX hex4 codepoint,
+      #   always a valid rune. gosec cannot see the guards, so scope-suppress.
+      - linters: [gosec]
+        path: "keyutil\\.go|yaml_flatten\\.go"
+        text: "G115"
+
+      # G306/G301 (file/dir permissions) and G703 (path traversal via taint):
+      # examples write throwaway config files to a freshly-created temp dir
+      # for demonstration; 0o644/0o755 is fine for non-sensitive example
+      # data. G703 here is a false positive — gosec's taint flags the file
+      # *content* read from examples/data (a fixed repo path), not the
+      # destination path, which is a constant relative name in the temp dir.
+      # Library code (non-example, non-test) is NOT exempted, so real
+      # permission/traversal findings still fail the gate.
+      - linters: [gosec]
+        path: "examples[\\/]|_test\\.go"
+        text: "G306|G301|G703"

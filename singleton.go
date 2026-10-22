@@ -23,8 +23,8 @@ var (
 	defaultMu     sync.Mutex
 )
 
-// getDefaultLoader returns the default loader set by Load() or LoadWithConfig().
-// Returns ErrNotInitialized if no loader has been set.
+// getDefaultLoader returns the default loader set by Load(), Overload() or
+// LoadWithConfig(). Returns ErrNotInitialized if no loader has been set.
 func getDefaultLoader() (*Loader, error) {
 	if loader := defaultLoader.Load(); loader != nil {
 		return loader, nil
