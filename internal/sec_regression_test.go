@@ -93,12 +93,18 @@ func TestSEC02_YAMLTokenCap(t *testing.T) {
 }
 
 // TestSEC04_MaskInStringSanitizesPatterns verifies MaskInString masks
-// key=value secret pairs in addition to truncating long input.
+// key=value secret pairs in addition to truncating long input. The
+// truncation-boundary rows were ported from the removed TestMaskInString
+// (sensitive_test.go) with exact expectations.
 func TestSEC04_MaskInStringSanitizesPatterns(t *testing.T) {
 	tests := []struct{ input, want string }{
 		{"password=hunter2", "password=[MASKED]"},
 		{"api_key=sk-123", "api_key=[MASKED]"},
 		{"plain value", "plain value"},
+		// Exactly maxLen (50) characters is unchanged...
+		{strings.Repeat("b", 50), strings.Repeat("b", 50)},
+		// ...while anything longer is cut to 47 characters plus "...".
+		{strings.Repeat("a", 100), strings.Repeat("a", 47) + "..."},
 	}
 	for _, tt := range tests {
 		if got := MaskInString(tt.input); got != tt.want {
@@ -154,6 +160,11 @@ func TestSEC06_MarshalRejectsUnsafeKeys(t *testing.T) {
 		{"yaml key trailing colon", map[string]string{"A:": "1"}, FormatYAML},
 		{"yaml comment key", map[string]string{"A #c": "1"}, FormatYAML},
 		{"yaml dash-prefixed key", map[string]string{"- A": "1"}, FormatYAML},
+		{"json key with space", map[string]string{"A B": "1"}, FormatJSON},
+		{"json key with =", map[string]string{"A=B": "1"}, FormatJSON},
+		{"json empty key", map[string]string{"": "1"}, FormatJSON},
+		{"json bracket key", map[string]string{"A[0]": "1"}, FormatJSON},
+		{"json pure-digit key", map[string]string{"123": "1"}, FormatJSON},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -174,5 +185,33 @@ func TestSEC06_MarshalRejectsUnsafeKeys(t *testing.T) {
 		if _, err := MarshalEnvAs(safe, format, true); err != nil {
 			t.Errorf("MarshalEnvAs(%v) rejected safe keys: %v", format, err)
 		}
+	}
+	// JSON accepts the loader's own key space (IsValidJSONKey). "A#B" is
+	// env/YAML-safe but NOT loader-loadable from JSON, so it is excluded.
+	jsonSafe := map[string]string{"GOOD_KEY": "v", "cache.hosts.0": "h", "user@example": "u"}
+	if _, err := MarshalEnvAs(jsonSafe, FormatJSON, true); err != nil {
+		t.Errorf("MarshalEnvAs(FormatJSON) rejected safe keys: %v", err)
+	}
+}
+
+// TestSEC003_HashKeyNonPositiveShards pins the defensive total-function
+// contract for HashKey: a non-positive shard count returns 0 instead of
+// panicking on the modulo path. All production callers pass power-of-two
+// constants (8, 32), so this is a latent-input guard, but the function is
+// widely reachable and must never be a panic primitive.
+func TestSEC003_HashKeyNonPositiveShards(t *testing.T) {
+	for _, shards := range []int{0, -1, -32} {
+		if got := HashKey("KEY", shards); got != 0 {
+			t.Errorf("HashKey(%q, %d) = %d, want 0", "KEY", shards, got)
+		}
+	}
+	// Sanity: valid shard counts keep working in both hash branches.
+	for _, shards := range []int{8, 32} {
+		if got := HashKey("KEY", shards); int(got) >= shards {
+			t.Errorf("HashKey(%q, %d) = %d, out of range", "KEY", shards, got)
+		}
+	}
+	if got := HashKey("a.b.c", 7); int(got) >= 7 { // non-power-of-two modulo path
+		t.Errorf("HashKey(%q, 7) = %d, out of range", "a.b.c", got)
 	}
 }

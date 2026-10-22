@@ -33,9 +33,19 @@ type ValidationConfig struct {
 	ForbiddenKeys []string
 	// KeyPattern is a custom regexp for validating key names. Nil uses DefaultKeyPattern.
 	KeyPattern *regexp.Regexp
-	// ValidateValues enables security validation of values (e.g., injection detection).
+	// ValidateValues enables the validator's value checks on Set and
+	// structured (JSON/YAML) loads. With the built-in validator it no longer
+	// disables anything: the always-on baseline (see ValidateValueBasic)
+	// covers every check ValidateValue performs — maximum value length,
+	// control-character rejection, and the UTF-8 check when ValidateUTF8 is
+	// set — keeping those paths at parity with .env parsing, which has never
+	// had a switch for value validation. The flag remains effective for
+	// custom validators without the baseline capability, which skip value
+	// validation entirely when it is false.
 	ValidateValues bool
 	// ValidateUTF8 enables validation that all values are valid UTF-8.
+	// Honored on every write path (file loads and Set), independently of
+	// ValidateValues.
 	ValidateUTF8 bool
 }
 
@@ -43,9 +53,21 @@ type ValidationConfig struct {
 type LimitsConfig struct {
 	// MaxFileSize is the maximum allowed file size in bytes.
 	MaxFileSize int64
-	// MaxVariables is the maximum number of variables per file.
+	// MaxVariables is the maximum number of variables per file. Timing note:
+	// the .env parser enforces this mid-parse (it fails on the first
+	// variable beyond the limit), while the JSON/YAML parsers check the
+	// flattened key count after the document is parsed and flattened — for
+	// those formats the fail-fast memory bounds during parsing are the
+	// YAML token cap and the JSON structural-node cap (see
+	// internal.HardMaxYAMLTokens / HardMaxJSONNodes), not this limit.
 	MaxVariables int
-	// MaxLineLength is the maximum allowed line length in bytes.
+	// MaxLineLength is the maximum allowed line length in bytes. Enforced
+	// for ALL formats, including JSON and YAML. A minified (single-line)
+	// JSON document is one line for this purpose: it must fit within this
+	// limit, whose hard cap is 64KB (HardMaxLineLength) — a larger minified
+	// document cannot be loaded by raising the config alone; pretty-print
+	// it instead. Files whose long lines are legitimate (cookie exports,
+	// JWTs) fit the 8KB default this limit was sized for.
 	MaxLineLength int
 	// MaxKeyLength is the maximum allowed key length in bytes.
 	MaxKeyLength int
@@ -59,9 +81,16 @@ type LimitsConfig struct {
 type JSONConfig struct {
 	// JSONNullAsEmpty converts JSON null values to empty strings.
 	JSONNullAsEmpty bool
-	// JSONNumberAsString converts JSON numbers to strings instead of rejecting them.
+	// JSONNumberAsString renders JSON numbers as canonical decimal strings
+	// ("8080", "0.5"). When false, numbers still load but render with Go's
+	// default float formatting (fmt %v — 1e21 becomes "1e+21"). Numbers are
+	// never rejected.
 	JSONNumberAsString bool
-	// JSONBoolAsString converts JSON booleans to strings instead of rejecting them.
+	// JSONBoolAsString is retained for symmetry with YAMLBoolAsString but has
+	// no effect on JSON output: a decoded JSON bool carries no raw source text
+	// to preserve, so JSON booleans always render the canonical "true"/"false"
+	// (see internal/flatten_keys.go). Do not rely on it to gate JSON bool
+	// handling.
 	JSONBoolAsString bool
 	// JSONMaxDepth limits nesting depth for JSON objects. Must be between 1 and 100.
 	JSONMaxDepth int
@@ -71,7 +100,9 @@ type JSONConfig struct {
 type YAMLConfig struct {
 	// YAMLNullAsEmpty converts YAML null/~ values to empty strings.
 	YAMLNullAsEmpty bool
-	// YAMLNumberAsString converts YAML numbers to strings instead of rejecting them.
+	// YAMLNumberAsString canonicalizes number-looking scalar values ("007"
+	// becomes "7"). When false, scalars are kept verbatim as written.
+	// Values are never rejected.
 	YAMLNumberAsString bool
 	// YAMLBoolAsString converts YAML booleans to strings instead of rejecting them.
 	YAMLBoolAsString bool
@@ -86,15 +117,17 @@ type ExpansionScope int
 const (
 	// ExpansionFileThenProcess resolves references against the variables in
 	// the parsed file first, then falls back to the process environment
-	// (os.LookupEnv). This is the zero value and matches traditional dotenv
-	// semantics.
+	// (os.LookupEnv). This matches traditional dotenv semantics, but lets an
+	// untrusted configuration file capture unrelated process secrets (cloud
+	// credentials, tokens) into values that are later logged or persisted
+	// (SEC-03). It is now opt-in: the secure default is ExpansionFileOnly.
 	ExpansionFileThenProcess ExpansionScope = iota
 	// ExpansionFileOnly restricts expansion to variables defined in the
 	// parsed file(s) alone. References to variables that exist only in the
-	// process environment expand to the empty string. Use this when
-	// configuration files come from a less-trusted source: it prevents the
-	// file from capturing unrelated process secrets (cloud credentials,
-	// tokens) into values that are later logged or persisted (SEC-03).
+	// process environment expand to the empty string. This is the DEFAULT:
+	// it prevents a less-trusted configuration file from reading unrelated
+	// process secrets. Use ExpansionFileThenProcess only when the file source
+	// is fully trusted.
 	ExpansionFileOnly
 )
 
@@ -103,32 +136,66 @@ type ParsingConfig struct {
 	// AllowExportPrefix allows the "export KEY=value" shell syntax in .env files.
 	AllowExportPrefix bool
 	// AllowYamlSyntax enables YAML-style values (lists, maps) in .env files.
+	// It also enables ':' as a key/value separator: with the flag off (the
+	// default) only '=' separates, so prose lines such as
+	// "See: https://example.com" are dropped (and audited) instead of
+	// silently becoming variables.
 	AllowYamlSyntax bool
-	// ExpandVariables enables ${VAR} and $VAR expansion in values.
+	// ExpandVariables enables ${VAR} and $VAR expansion in .env values.
+	// JSON and YAML documents are never expanded; their values are taken
+	// literally.
 	ExpandVariables bool
 	// ExpansionScope restricts which variables ${VAR} references can resolve
-	// from. The default (ExpansionFileThenProcess) resolves file-local
-	// variables first and then falls back to the process environment.
-	// Set to ExpansionFileOnly to prevent an untrusted configuration file
-	// from reading unrelated process environment variables (SEC-03).
+	// from. The default (ExpansionFileOnly) resolves file-local variables only
+	// and blocks the process-environment fallback, so an untrusted
+	// configuration file cannot read unrelated process secrets (SEC-03).
+	// Set to ExpansionFileThenProcess to restore dotenv-style process fallback
+	// for files you trust.
 	ExpansionScope ExpansionScope
+	// DuplicateKeyPolicy resolves duplicate keys WITHIN one source document
+	// (see DuplicateKeyPolicy for the per-format semantics of the default).
+	// It does not govern cross-file merging (that is OverwriteExisting) nor
+	// the always-fatal flat-key collision check in YAML/JSON flattening.
+	DuplicateKeyPolicy DuplicateKeyPolicy
 }
 
 // ComponentConfig holds custom component implementations and advanced options.
+//
+// Concurrency contract: a custom component is shared by every Loader and
+// parser built from the Config and is invoked from concurrent goroutines
+// (concurrent Set/Get on one Loader, or several Loaders built from one
+// Config), so it must be safe for concurrent use. The built-in
+// implementations are.
 type ComponentConfig struct {
 	// CustomValidator replaces the built-in key/value validator. Nil uses the default.
+	// Must be safe for concurrent use.
 	CustomValidator Validator
 	// CustomExpander replaces the built-in variable expander. Nil uses the default.
+	// Must be safe for concurrent use.
 	CustomExpander VariableExpander
 	// CustomAuditor replaces the built-in audit logger. Nil uses the default.
+	// Must be safe for concurrent use.
 	CustomAuditor AuditLogger
 	// FileSystem overrides file system operations. Nil uses OSFileSystem. Useful for testing.
 	FileSystem FileSystem
 	// AuditHandler receives audit events when AuditEnabled is true.
+	// Must be safe for concurrent use: Log may be invoked from concurrent
+	// goroutines (Close is serialized against Log by the built-in auditor).
 	AuditHandler AuditHandler
 	// AuditEnabled activates audit logging for all loader operations.
 	AuditEnabled bool
+	// AuditFailClosed makes lost audit events fail the operations that
+	// emitted them: with auditing enabled, a handler error, handler panic,
+	// or event dropped on a full channel surfaces as an error (matching
+	// ErrAuditFailed) from LoadFiles, Apply, Set and Delete instead of being
+	// silently discarded. The built-in auditor latches the first failure;
+	// a CustomAuditor participates by implementing TakeFailure() error.
+	// Without this flag auditing stays fail-open: operation results never
+	// depend on the audit pipeline.
+	AuditFailClosed bool
 	// Prefix restricts processing to environment variables that start with this prefix.
+	// Matching is ASCII case-insensitive: Prefix "MyApp_" admits MYAPP_X and
+	// myapp_x as well.
 	Prefix string
 }
 
@@ -215,6 +282,13 @@ func (c *Config) validateAdvancedOptions() error {
 		return newValidationError("ExpansionScope", strconv.Itoa(int(c.ExpansionScope)), "enum",
 			"must be ExpansionFileThenProcess or ExpansionFileOnly")
 	}
+	switch c.DuplicateKeyPolicy {
+	case DuplicateKeyInherit, DuplicateKeyFirstWins, DuplicateKeyLastWins, DuplicateKeyError:
+		// ok
+	default:
+		return newValidationError("DuplicateKeyPolicy", strconv.Itoa(int(c.DuplicateKeyPolicy)), "enum",
+			"must be DuplicateKeyInherit, DuplicateKeyFirstWins, DuplicateKeyLastWins, or DuplicateKeyError")
+	}
 	if c.KeyPattern != nil {
 		return validateKeyPattern(c.KeyPattern)
 	}
@@ -281,16 +355,23 @@ func (c *Config) IsZero() bool {
 		c.YAMLNullAsEmpty || c.YAMLNumberAsString ||
 		c.YAMLBoolAsString || c.AllowExportPrefix || c.ExpandVariables ||
 		c.OverwriteExisting || c.AutoApply || c.FailOnMissingFile ||
-		c.AllowYamlSyntax || c.AuditEnabled {
+		c.AllowYamlSyntax || c.AuditEnabled || c.AuditFailClosed {
 		return false
 	}
 
 	// ExpansionScope is an enum, not a bool: any value other than the zero
-	// value (ExpansionFileThenProcess) means initialized. Without this check
-	// a Config whose only non-default field is the scope was mistaken for
-	// zero and silently replaced by DefaultConfig() in New(), dropping the
-	// SEC-03 file-only expansion restriction.
+	// value (ExpansionFileThenProcess) means initialized. The zero value is
+	// the legacy process-fallback mode, so a Config that does not explicitly
+	// opt into it must be treated as initialized rather than silently
+	// replaced by DefaultConfig() (which now sets ExpansionFileOnly).
 	if c.ExpansionScope != ExpansionFileThenProcess {
+		return false
+	}
+
+	// DuplicateKeyPolicy is an enum too (same bug class as ExpansionScope):
+	// a non-Inherit policy must keep the Config from being treated as zero
+	// and replaced by DefaultConfig() in New().
+	if c.DuplicateKeyPolicy != DuplicateKeyInherit {
 		return false
 	}
 
@@ -319,11 +400,14 @@ func (c *Config) IsZero() bool {
 // Configuration Factories
 // ============================================================================
 
-// defaultStructuredMaxDepth is the default nesting-depth limit for JSON and
-// YAML documents. It backs DefaultConfig (JSONMaxDepth/YAMLMaxDepth),
-// UnmarshalMap's structured paths, and the structured parsers' defensive
-// fallback when constructed with a non-positive depth.
-const defaultStructuredMaxDepth = 10
+// defaultStructuredMaxDepth bounds JSON/YAML document nesting. Real-world
+// structured configs (OpenAPI/JSON-Schema-style documents) commonly nest
+// 10-20 levels; 16 accommodates them while still bounding recursion well
+// below the validated maximum (100). It backs DefaultConfig
+// (JSONMaxDepth/YAMLMaxDepth), UnmarshalMap's structured paths, and the
+// structured parsers' defensive fallback when constructed with a non-positive
+// depth.
+const defaultStructuredMaxDepth = 16
 
 // DefaultConfig returns a Config with secure default values.
 // These defaults are suitable for high-security environments.
@@ -366,6 +450,13 @@ func DefaultConfig() Config {
 			AllowExportPrefix: true,
 			AllowYamlSyntax:   false,
 			ExpandVariables:   true,
+			// SEC-003: default to ExpansionFileOnly so an untrusted config file
+			// cannot capture unrelated process secrets. The legacy process
+			// fallback (ExpansionFileThenProcess) is opt-in for trusted files.
+			ExpansionScope: ExpansionFileOnly,
+			// DuplicateKeyPolicy zero value (DuplicateKeyInherit) keeps each
+			// format's historical duplicate-key behavior.
+			DuplicateKeyPolicy: DuplicateKeyInherit,
 		},
 		ComponentConfig: ComponentConfig{
 			CustomValidator: nil,
@@ -384,7 +475,7 @@ func DefaultConfig() Config {
 //   - FailOnMissingFile: false (graceful handling of missing .env files)
 //   - OverwriteExisting: true (easy iteration during development)
 //   - AllowYamlSyntax: true (supports YAML-style values)
-//   - Relaxed file-size limit (10MB; variable count keeps the default 500)
+//   - Relaxed file-size limit (10MB; variable count keeps the default)
 //   - Value validation ENABLED for security (prevents injection attacks)
 //
 // Example:
@@ -398,7 +489,6 @@ func DevelopmentConfig() Config {
 	cfg.FileConfig.OverwriteExisting = true
 	cfg.ParsingConfig.AllowYamlSyntax = true
 	cfg.LimitsConfig.MaxFileSize = 10 * 1024 * 1024
-	cfg.LimitsConfig.MaxVariables = 500
 	// ValidateValues remains true for security - never disable value validation
 	return cfg
 }

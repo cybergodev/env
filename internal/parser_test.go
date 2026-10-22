@@ -1,25 +1,18 @@
 package internal
 
 import (
+	"errors"
 	"fmt"
+	"strings"
 	"testing"
 )
 
+// TestParseLineBytes covers line-level concerns only: key/separator/export
+// prefix/blank lines plus the boundary pins. Value semantics (quoting,
+// comments, YAML scalars) are covered by TestParseValueBytes — ParseLineBytes
+// delegates value parsing to it.
 func TestParseLineBytes(t *testing.T) {
-	v := NewValidator(ValidatorConfig{
-		MaxKeyLength:   64,
-		MaxValueLength: 1024,
-	})
-	a := NewAuditor(nil, nil, nil, false)
-	e := NewExpander(ExpanderConfig{
-		MaxDepth: 5,
-		Mode:     ModeNone,
-	})
-
-	lp := NewLineParser(LineParserConfig{
-		AllowExportPrefix: true,
-		OverwriteExisting: true,
-	}, v, a, e)
+	lp := imNewLineParser(nil, ModeNone, LineParserConfig{AllowExportPrefix: true})
 
 	tests := []struct {
 		name      string
@@ -33,54 +26,106 @@ func TestParseLineBytes(t *testing.T) {
 			line:      "KEY=value",
 			wantKey:   "KEY",
 			wantValue: "value",
-			wantErr:   false,
 		},
 		{
 			name:      "export prefix",
 			line:      "export KEY=value",
 			wantKey:   "KEY",
 			wantValue: "value",
-			wantErr:   false,
 		},
 		{
-			name:      "double quoted",
-			line:      `KEY="value with spaces"`,
-			wantKey:   "KEY",
-			wantValue: "value with spaces",
-			wantErr:   false,
+			// PIN: ':' separates only in YAML-syntax mode (see
+			// TestParseLineBytes_ColonSeparatorGated); with the default
+			// config the line is dropped as a no-separator line instead of
+			// silently becoming a variable.
+			name: "colon separator dropped without AllowYamlSyntax",
+			line: "KEY:value",
 		},
 		{
-			name:      "single quoted",
-			line:      `KEY='value with spaces'`,
-			wantKey:   "KEY",
-			wantValue: "value with spaces",
-			wantErr:   false,
+			name: "no assignment",
+			line: "NO_ASSIGNMENT_HERE",
 		},
 		{
-			name:      "colon separator",
-			line:      "KEY:value",
+			name: "empty line",
+			line: "",
+		},
+		// BOUNDARY: a whitespace-only line has no separator and no
+		// non-space content — dropped silently like the empty line.
+		{
+			name: "whitespace-only line dropped",
+			line: "   ",
+		},
+		// BOUNDARY: whitespace around both the key and the value is trimmed.
+		{
+			name:      "whitespace around key and value trimmed",
+			line:      "  KEY  =  value",
 			wantKey:   "KEY",
 			wantValue: "value",
-			wantErr:   false,
 		},
+		// BOUNDARY: trailing spaces (unlike '\r' above) are trimmed from the
+		// value.
 		{
-			name:      "inline comment",
-			line:      "KEY=value # comment",
+			name:      "trailing spaces trimmed from value",
+			line:      "KEY=value   ",
 			wantKey:   "KEY",
 			wantValue: "value",
-			wantErr:   false,
+		},
+		// BOUNDARY: an inline comment needs at least one whitespace byte
+		// before '#'; two spaces behave like one.
+		{
+			name:      "double space before inline comment",
+			line:      "KEY=value  # comment",
+			wantKey:   "KEY",
+			wantValue: "value",
+		},
+		// BOUNDARY: an unterminated double quote is an invalid value, not a
+		// silently-truncated one.
+		{
+			name:    "unterminated double quote errors",
+			line:    `KEY="unterminated`,
+			wantErr: true,
+		},
+		// BOUNDARY: an empty key is rejected by the key validator
+		// (ValidateKey's non_empty rule), not silently skipped.
+		{
+			name:    "empty key errors",
+			line:    "=value",
+			wantErr: true,
+		},
+		// BOUNDARY: the export-prefix gate requires len(line) > 7. A line of
+		// exactly 7 bytes ("export=") is NOT stripped — it parses as a normal
+		// assignment to the key "export" — while 8 bytes ("export =")
+		// strips the prefix, leaves "=", and fails key validation.
+		{
+			name:      "export prefix at exactly 7 bytes is not stripped",
+			line:      "export=",
+			wantKey:   "export",
+			wantValue: "",
 		},
 		{
-			name:    "no assignment",
-			line:    "NO_ASSIGNMENT_HERE",
-			wantKey: "",
-			wantErr: false,
+			name:    "export prefix at 8 bytes is stripped",
+			line:    "export =",
+			wantErr: true,
+		},
+		// PIN: the caller's scanner strips only '\n' and ParseValueBytes
+		// trims spaces/tabs only, so a trailing '\r' survives into the value.
+		{
+			name:      "carriage return kept in value",
+			line:      "KEY=value\r",
+			wantKey:   "KEY",
+			wantValue: "value\r",
+		},
+		// BOUNDARY: value length against the configured MaxValueLength=1024.
+		{
+			name:      "value at max length accepted",
+			line:      "K=" + strings.Repeat("a", 1024),
+			wantKey:   "K",
+			wantValue: strings.Repeat("a", 1024),
 		},
 		{
-			name:    "empty line",
-			line:    "",
-			wantKey: "",
-			wantErr: false,
+			name:    "value over max length errors",
+			line:    "K=" + strings.Repeat("a", 1025),
+			wantErr: true,
 		},
 	}
 
@@ -149,6 +194,15 @@ func TestParseDoubleQuotedBytes(t *testing.T) {
 			input:   `"unclosed`,
 			wantErr: true,
 		},
+		{
+			// Unknown escapes keep their backslash (bash semantics):
+			// "C:\Users\foo" previously lost every backslash, and "\temp"
+			// turned into a TAB.
+			name:     "unknown escape keeps the backslash",
+			input:    `"C:\Users\foo"`,
+			expected: `C:\Users\foo`,
+			wantErr:  false,
+		},
 	}
 
 	for _, tt := range tests {
@@ -165,6 +219,9 @@ func TestParseDoubleQuotedBytes(t *testing.T) {
 	}
 }
 
+// TestIsYamlNumberBytes owns the YAML number filter rows ("123"/"3.14"/
+// "-123"/"1e10" and variants live here; TestTryParseYamlValueBytes keeps
+// only a single representative number row).
 func TestIsYamlNumberBytes(t *testing.T) {
 	tests := []struct {
 		input string
@@ -194,21 +251,12 @@ func TestIsYamlNumberBytes(t *testing.T) {
 // TestParseLineBytesScannerBufferSafety tests that parsed values are correctly
 // copied and not corrupted when the scanner buffer is reused.
 // This is a regression test for the scanner buffer data corruption bug.
+// Shrunk to the two rows that matter for the copy paths: the plain unquoted
+// control and the escaped double-quoted row (the pooled GetByteSlice copy
+// path); the unescaped-double and single-quoted paths are covered by the
+// other parser tables.
 func TestParseLineBytesScannerBufferSafety(t *testing.T) {
-	v := NewValidator(ValidatorConfig{
-		MaxKeyLength:   64,
-		MaxValueLength: 1024,
-	})
-	a := NewAuditor(nil, nil, nil, false)
-	e := NewExpander(ExpanderConfig{
-		MaxDepth: 5,
-		Mode:     ModeNone,
-	})
-
-	lp := NewLineParser(LineParserConfig{
-		AllowExportPrefix: true,
-		OverwriteExisting: true,
-	}, v, a, e)
+	lp := imNewLineParser(nil, ModeNone, LineParserConfig{AllowExportPrefix: true})
 
 	// Simulate scanner buffer reuse scenario
 	// Create a buffer that will be "reused" between parses
@@ -233,24 +281,9 @@ func TestParseLineBytesScannerBufferSafety(t *testing.T) {
 			wantVal2: "different_value",
 		},
 		{
-			name:     "double quoted values without escapes",
-			line1:    `KEY1="value with spaces"`,
-			line2:    `KEY2="another value"`,
-			wantKey1: "KEY1",
-			wantVal1: "value with spaces",
-			wantKey2: "KEY2",
-			wantVal2: "another value",
-		},
-		{
-			name:     "single quoted values",
-			line1:    `KEY1='single quoted'`,
-			line2:    `KEY2='another single'`,
-			wantKey1: "KEY1",
-			wantVal1: "single quoted",
-			wantKey2: "KEY2",
-			wantVal2: "another single",
-		},
-		{
+			// The pooled-buffer copy path: escaped double-quoted values are
+			// assembled in GetByteSlice() memory and must be copied out
+			// before the buffer is reused.
 			name:     "double quoted with escapes",
 			line1:    `KEY1="line1\nline2"`,
 			line2:    `KEY2="line3\nline4"`,
@@ -319,6 +352,11 @@ func TestKeysToUpperPooled(t *testing.T) {
 			expected: map[string]bool{},
 		},
 		{
+			name:     "nil map",
+			input:    nil,
+			expected: map[string]bool{},
+		},
+		{
 			name:     "single key",
 			input:    map[string]string{"key": "value"},
 			expected: map[string]bool{"KEY": true},
@@ -358,6 +396,12 @@ func TestKeysToUpperPooled(t *testing.T) {
 			}
 		})
 	}
+
+	// Folded in from the former TestPutKeysToUpperMap_Nil: returning a nil
+	// map to the pool must not panic.
+	t.Run("PutKeysToUpperMap nil is safe", func(t *testing.T) {
+		PutKeysToUpperMap(nil)
+	})
 }
 
 func TestKeysToUpperPooled_LargeMap(t *testing.T) {
@@ -377,20 +421,11 @@ func TestKeysToUpperPooled_LargeMap(t *testing.T) {
 	PutKeysToUpperMap(result)
 }
 
-// mockValueValidator is a separate value validator for testing SetValueValidator.
-type mockValueValidator struct {
-	err error
-}
-
-func (m *mockValueValidator) ValidateValue(value string) error {
-	return m.err
-}
-
+// TestParseValueBytes owns the value-semantics coverage (ParseLineBytes
+// delegates here): quoting, whitespace, comment stripping and the '#'
+// boundary pins.
 func TestParseValueBytes(t *testing.T) {
-	v := NewValidator(ValidatorConfig{MaxKeyLength: 64})
-	a := NewAuditor(nil, nil, nil, false)
-	e := NewExpander(ExpanderConfig{MaxDepth: 5, Mode: ModeNone})
-	lp := NewLineParser(LineParserConfig{}, v, a, e)
+	lp := imNewLineParser(nil, ModeNone, LineParserConfig{})
 
 	tests := []struct {
 		name    string
@@ -405,6 +440,19 @@ func TestParseValueBytes(t *testing.T) {
 		{"single quoted", "'hello world'", "hello world", false},
 		{"with trailing comment", "value # comment", "value", false},
 		{"with leading whitespace", "  value  ", "value", false},
+		// PIN: a '#' only starts a comment when preceded by a space
+		// (the parser looks for the " #" pair), so an inline '#' survives.
+		{"hash without preceding space stays", "val#ue", "val#ue", false},
+		// PIN: after trimming the leading whitespace, a value that STARTS
+		// with '#' is not a comment either — only " #" pairs are stripped.
+		{"value-leading hash after trim is not a comment", " # comment", "# comment", false},
+		// A closing quote followed by whitespace + '#' is accepted — these
+		// previously failed the whole file (the quoted parsers demanded the
+		// final byte be the quote).
+		{"double quoted with trailing comment", `"value" # comment`, "value", false},
+		{"single quoted keeps interior hash", `'lit # not a comment'`, "lit # not a comment", false},
+		{"junk after closing quote errors", `"value" x`, "", true},
+		{"comment glued to closing quote errors", `"value"#c`, "", true},
 	}
 
 	for _, tt := range tests {
@@ -415,6 +463,52 @@ func TestParseValueBytes(t *testing.T) {
 			}
 			if got != tt.want {
 				t.Errorf("ParseValueBytes() = %q, want %q", got, tt.want)
+			}
+		})
+	}
+}
+
+// TestParseValueBytes_YamlSyntax wires AllowYamlSyntax through a LineParser —
+// previously the flag was never set in any test. Bare YAML scalars are
+// accepted when the flag is on and treated as ordinary strings when off.
+// For true/123 the pass-through rendering is identical either way; the
+// observable difference is the null family (~, null), which collapses to the
+// empty string only when the flag is enabled.
+func TestParseValueBytes_YamlSyntax(t *testing.T) {
+	off := imNewLineParser(nil, ModeNone, LineParserConfig{})
+	on := imNewLineParser(nil, ModeNone, LineParserConfig{AllowYamlSyntax: true})
+
+	tests := []struct {
+		name    string
+		input   string
+		wantOff string
+		wantOn  string
+	}{
+		{"bool true", "true", "true", "true"},
+		{"bool True", "True", "True", "True"},
+		{"null collapses when enabled", "null", "null", ""},
+		{"tilde collapses when enabled", "~", "~", ""},
+		{"integer passes through", "123", "123", "123"},
+		{"float passes through", "3.14", "3.14", "3.14"},
+		{"plain word unaffected", "hello", "hello", "hello"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			gotOff, err := off.ParseValueBytes([]byte(tt.input))
+			if err != nil {
+				t.Fatalf("ParseValueBytes(yaml off, %q) error = %v", tt.input, err)
+			}
+			if gotOff != tt.wantOff {
+				t.Errorf("ParseValueBytes(yaml off, %q) = %q, want %q", tt.input, gotOff, tt.wantOff)
+			}
+
+			gotOn, err := on.ParseValueBytes([]byte(tt.input))
+			if err != nil {
+				t.Fatalf("ParseValueBytes(yaml on, %q) error = %v", tt.input, err)
+			}
+			if gotOn != tt.wantOn {
+				t.Errorf("ParseValueBytes(yaml on, %q) = %q, want %q", tt.input, gotOn, tt.wantOn)
 			}
 		})
 	}
@@ -448,6 +542,8 @@ func TestParseSingleQuotedBytes(t *testing.T) {
 	}
 }
 
+// TestTryParseYamlValueBytes keeps the null/~/bool coverage plus ONE number
+// row; the number filter matrix belongs to TestIsYamlNumberBytes.
 func TestTryParseYamlValueBytes(t *testing.T) {
 	tests := []struct {
 		input     string
@@ -463,10 +559,7 @@ func TestTryParseYamlValueBytes(t *testing.T) {
 		{"Null", "", true},
 		{"NULL", "", true},
 		{"~", "", true},
-		{"123", "123", true},
-		{"3.14", "3.14", true},
-		{"-42", "-42", true},
-		{"1e10", "1e10", true},
+		{"123", "123", true}, // one representative number; see TestIsYamlNumberBytes
 		{"hello", "", false},
 		{"", "", false},
 		{"abc", "", false},
@@ -485,87 +578,236 @@ func TestTryParseYamlValueBytes(t *testing.T) {
 	}
 }
 
-func TestSetValueValidator(t *testing.T) {
-	v := NewValidator(ValidatorConfig{MaxKeyLength: 64})
-	a := NewAuditor(nil, nil, nil, false)
-	e := NewExpander(ExpanderConfig{MaxDepth: 5, Mode: ModeNone})
-
-	lp := NewLineParser(LineParserConfig{}, v, a, e)
-
-	// Set a separate value validator - just verify it doesn't panic
-	lp.SetValueValidator(&mockValueValidator{err: nil})
-	lp.SetValueValidator(&mockValueValidator{err: fmt.Errorf("bad value")})
+// imSubstExpander is a non-*Expander LineExpander that substitutes $K and
+// ${K} references from its map — close enough to *Expander semantics for the
+// shared imExpandAllCases table while still driving the interface fallback
+// path (expandAllUsingInterface). It performs no cycle detection and honors
+// no Mode; cases needing either are marked skipInterface. Substitution is a
+// single pass over the original map (braced forms first), so chained
+// references beyond one hop are not supported — the shared cases avoid them.
+type imSubstExpander struct {
+	vars map[string]string
 }
 
-// mockExpander is a non-*Expander implementation for testing expandAllUsingInterface.
-type mockExpander struct {
-	expandErr error
-}
-
-func (m *mockExpander) Expand(s string) (string, error) {
-	if s == "$FAIL" {
-		return "", m.expandErr
+func (m *imSubstExpander) Expand(s string) (string, error) {
+	for k, v := range m.vars {
+		s = strings.ReplaceAll(s, "${"+k+"}", v)
+		s = strings.ReplaceAll(s, "$"+k, v)
 	}
-	return "expanded_" + s, nil
+	return s, nil
 }
 
+// imFailExpander fails every expansion, for the interface path's
+// error-propagation branch.
+type imFailExpander struct {
+	err error
+}
+
+func (f *imFailExpander) Expand(string) (string, error) { return "", f.err }
+
+// TestExpandAllUsingInterface runs the shared ExpandAll case table through
+// LineParser.ExpandAll with a non-*Expander LineExpander (the interface
+// fallback), then pins the error-propagation branch with a failing expander.
 func TestExpandAllUsingInterface(t *testing.T) {
 	v := NewValidator(ValidatorConfig{MaxKeyLength: 64})
 	a := NewAuditor(nil, nil, nil, false)
 
-	t.Run("uses interface expander", func(t *testing.T) {
-		me := &mockExpander{}
-		lp := NewLineParser(LineParserConfig{}, v, a, me)
-
-		vars := map[string]string{
-			"KEY1": "$VAR1",
-			"KEY2": "$VAR2",
+	for _, tt := range imExpandAllCases {
+		if tt.skipInterface {
+			continue
 		}
+		t.Run(tt.name, func(t *testing.T) {
+			// The mock resolves references against the union of the map
+			// being expanded and the case's external lookup vars.
+			mockVars := make(map[string]string, len(tt.vars)+len(tt.external))
+			for k, val := range tt.vars {
+				mockVars[k] = val
+			}
+			for k, val := range tt.external {
+				mockVars[k] = val
+			}
+			lp := NewLineParser(LineParserConfig{}, v, a, &imSubstExpander{vars: mockVars})
 
-		result, err := lp.ExpandAll(vars)
-		if err != nil {
-			t.Fatalf("ExpandAll() error = %v", err)
-		}
-		if result["KEY1"] != "expanded_$VAR1" {
-			t.Errorf("KEY1 = %q, want %q", result["KEY1"], "expanded_$VAR1")
-		}
-	})
+			result, err := lp.ExpandAll(tt.vars, nil)
+			if (err != nil) != tt.wantErr {
+				t.Fatalf("ExpandAll() error = %v, wantErr %v", err, tt.wantErr)
+			}
+			if tt.wantErr {
+				return
+			}
+			for k, want := range tt.expected {
+				if result[k] != want {
+					t.Errorf("ExpandAll()[%q] = %q, want %q", k, result[k], want)
+				}
+			}
+		})
+	}
 
-	t.Run("no expansion needed", func(t *testing.T) {
-		me := &mockExpander{}
-		lp := NewLineParser(LineParserConfig{}, v, a, me)
-
-		vars := map[string]string{
-			"KEY1": "plain_value",
-			"KEY2": "another_value",
-		}
-
-		result, err := lp.ExpandAll(vars)
-		if err != nil {
-			t.Fatalf("ExpandAll() error = %v", err)
-		}
-		// Should return the same map since no expansion needed
-		if result["KEY1"] != "plain_value" {
-			t.Errorf("KEY1 = %q, want %q", result["KEY1"], "plain_value")
-		}
-	})
-
-	t.Run("expansion error", func(t *testing.T) {
-		me := &mockExpander{expandErr: fmt.Errorf("expansion failed")}
-		lp := NewLineParser(LineParserConfig{}, v, a, me)
-
-		vars := map[string]string{
-			"KEY1": "$FAIL",
-		}
-
-		_, err := lp.ExpandAll(vars)
+	t.Run("expansion error propagates", func(t *testing.T) {
+		lp := NewLineParser(LineParserConfig{}, v, a, &imFailExpander{err: fmt.Errorf("expansion failed")})
+		_, err := lp.ExpandAll(map[string]string{"KEY1": "$FAIL"}, nil)
 		if err == nil {
 			t.Error("ExpandAll() should return error on expansion failure")
 		}
 	})
+
+	// BOUNDARY: single-quoted (literal) values are exempt for custom
+	// expanders too — the failing expander proves Expand is never called on
+	// the exempt value.
+	t.Run("literal values are exempt for custom expanders too", func(t *testing.T) {
+		lp := NewLineParser(LineParserConfig{}, v, a, &imFailExpander{err: fmt.Errorf("must not be called on a literal")})
+		result, err := lp.ExpandAll(map[string]string{"PW": "$BOOM"}, map[string]struct{}{"PW": {}})
+		if err != nil {
+			t.Fatalf("ExpandAll() error = %v, want nil (literal value skipped)", err)
+		}
+		if result["PW"] != "$BOOM" {
+			t.Errorf("ExpandAll()[PW] = %q, want %q inserted verbatim", result["PW"], "$BOOM")
+		}
+	})
 }
 
-func TestPutKeysToUpperMap_Nil(t *testing.T) {
-	// Should not panic with nil
-	PutKeysToUpperMap(nil)
+// TestExpandAll_RequiredErrorLoggedWithCause pins the built-in path's error
+// logging branch for ":?" required variables (audit.go previously collapsed
+// these into "cycle detected"): the returned error is the ExpansionRequired
+// kind, and the auditor (a no-op here) is consulted with the actual cause.
+func TestExpandAll_RequiredErrorLoggedWithCause(t *testing.T) {
+	lp := imNewLineParser(nil, ModeAll, LineParserConfig{ExpandVariables: true})
+
+	_, err := lp.ExpandAll(map[string]string{"KEY": "${MISSING:?req}"}, nil)
+	if err == nil {
+		t.Fatal("ExpandAll() error = nil, want required-variable error")
+	}
+	var expErr *ExpansionError
+	if !errors.As(err, &expErr) {
+		t.Fatalf("ExpandAll() error = %T, want *ExpansionError", err)
+	}
+	if expErr.Kind != ExpansionRequiredKind {
+		t.Errorf("ExpansionError.Kind = %v, want ExpansionRequiredKind", expErr.Kind)
+	}
+}
+
+// TestParseLineBytesQuote_ProvenanceAndExpansion pins the quote-provenance
+// channel end to end at the internal layer: single-quoted values are reported
+// and exempted from expansion (a '$' inside them stays literal), double-quoted
+// \$ survives the two-pass design as $$ and folds back to one dollar, and
+// values referencing a literal value adopt it without rescanning.
+func TestParseLineBytesQuote_ProvenanceAndExpansion(t *testing.T) {
+	lp := imNewLineParser(nil, ModeAll, LineParserConfig{ExpandVariables: true})
+
+	lines := []string{
+		`PASSWORD='my$ecret'`,
+		`NAME="world"`,
+		`GREET="hello $NAME"`,
+		`PRICE="cost: \$5"`,
+		`REF=$NAME`,
+	}
+	vars := map[string]string{}
+	noExpand := map[string]struct{}{}
+	for _, ln := range lines {
+		key, value, singleQuoted, err := lp.ParseLineBytesQuote([]byte(ln))
+		if err != nil {
+			t.Fatalf("ParseLineBytesQuote(%q) error = %v", ln, err)
+		}
+		vars[key] = value
+		if singleQuoted {
+			noExpand[key] = struct{}{}
+		} else {
+			delete(noExpand, key)
+		}
+	}
+	if _, ok := noExpand["PASSWORD"]; !ok {
+		t.Error("PASSWORD should be reported as single-quoted")
+	}
+	if _, ok := noExpand["NAME"]; ok {
+		t.Error("double-quoted NAME must not be flagged as literal")
+	}
+
+	out, err := lp.ExpandAll(vars, noExpand)
+	if err != nil {
+		t.Fatalf("ExpandAll() error = %v", err)
+	}
+	if got := out["PASSWORD"]; got != "my$ecret" {
+		t.Errorf("PASSWORD = %q, want literal %q (single quotes suppress expansion)", got, "my$ecret")
+	}
+	if got := out["GREET"]; got != "hello world" {
+		t.Errorf("GREET = %q, want %q", got, "hello world")
+	}
+	if got := out["PRICE"]; got != `cost: $5` {
+		t.Errorf("PRICE = %q, want %q (escaped dollar survives expansion)", got, `cost: $5`)
+	}
+	if got := out["REF"]; got != "world" {
+		t.Errorf("REF = %q, want %q", got, "world")
+	}
+}
+
+// TestParseLineBytesQuote_OverwriteClearsProvenance pins that the LAST write
+// to a key owns its quote provenance: a single-quoted value overwritten by an
+// unquoted one goes back into the expansion set.
+func TestParseLineBytesQuote_OverwriteClearsProvenance(t *testing.T) {
+	lp := imNewLineParser(nil, ModeAll, LineParserConfig{ExpandVariables: true})
+
+	_, first, single, err := lp.ParseLineBytesQuote([]byte(`A='x$y'`))
+	if err != nil || !single || first != "x$y" {
+		t.Fatalf("first parse = (%q, %v, %v), want (x$y, true, nil)", first, single, err)
+	}
+	_, second, single, err := lp.ParseLineBytesQuote([]byte(`A=x$y`))
+	if err != nil || single || second != "x$y" {
+		t.Fatalf("second parse = (%q, %v, %v), want (x$y, false, nil)", second, single, err)
+	}
+
+	out, err := lp.ExpandAll(map[string]string{"A": second}, nil)
+	if err != nil {
+		t.Fatalf("ExpandAll() error = %v", err)
+	}
+	if got := out["A"]; got != "x" {
+		t.Errorf("A = %q, want %q (unquoted value IS expanded)", got, "x")
+	}
+}
+
+// TestParseLineBytes_ColonSeparatorGated pins AllowYamlSyntax gating ':' as
+// a key/value separator: with the flag off (the default) a "KEY:value" line
+// is dropped as a no-separator line instead of silently becoming a variable;
+// with the flag on it parses like '='.
+func TestParseLineBytes_ColonSeparatorGated(t *testing.T) {
+	off := imNewLineParser(nil, ModeNone, LineParserConfig{})
+	on := imNewLineParser(nil, ModeNone, LineParserConfig{AllowYamlSyntax: true})
+
+	if key, value, err := off.ParseLineBytes([]byte("KEY:value")); err != nil || key != "" || value != "" {
+		t.Errorf("yaml off: ParseLineBytes = (%q, %q, %v), want dropped no-separator line", key, value, err)
+	}
+	key, value, err := on.ParseLineBytes([]byte("KEY:value"))
+	if err != nil || key != "KEY" || value != "value" {
+		t.Errorf("yaml on: ParseLineBytes = (%q, %q, %v), want (KEY, value, nil)", key, value, err)
+	}
+	// '=' still separates in both modes, and ':' inside a VALUE after '=' is
+	// not a separator.
+	for _, lp := range []*LineParser{off, on} {
+		if k, v, err := lp.ParseLineBytes([]byte("URL=https://example.com")); err != nil || k != "URL" || v != "https://example.com" {
+			t.Errorf("ParseLineBytes(URL line) = (%q, %q, %v), want (URL, https://example.com, nil)", k, v, err)
+		}
+	}
+}
+
+// TestParseLineBytes_ExportTabPrefix pins that a tab is accepted after the
+// export prefix (bash accepts any whitespace; only a space was recognized).
+func TestParseLineBytes_ExportTabPrefix(t *testing.T) {
+	lp := imNewLineParser(nil, ModeNone, LineParserConfig{AllowExportPrefix: true})
+	key, value, err := lp.ParseLineBytes([]byte("export\tKEY=value"))
+	if err != nil || key != "KEY" || value != "value" {
+		t.Errorf("ParseLineBytes(export<TAB>) = (%q, %q, %v), want (KEY, value, nil)", key, value, err)
+	}
+}
+
+// TestParseValueBytes_TabComment pins that a '#' preceded by a TAB starts an
+// inline comment, matching the space form (the tab form previously stayed in
+// the value).
+func TestParseValueBytes_TabComment(t *testing.T) {
+	lp := imNewLineParser(nil, ModeNone, LineParserConfig{})
+	got, err := lp.ParseValueBytes([]byte("value\t# comment"))
+	if err != nil {
+		t.Fatalf("ParseValueBytes() error = %v", err)
+	}
+	if got != "value" {
+		t.Errorf("ParseValueBytes() = %q, want %q", got, "value")
+	}
 }

@@ -54,7 +54,11 @@ func (l *Loader) GetString(key string, defaultValue ...string) string {
 }
 
 // Lookup retrieves a value by key and reports whether it exists.
-// Supports dot-notation path resolution for nested keys (e.g., "database.host" -> "DATABASE_HOST").
+// The exact stored key and its uppercase form are tried first, so keys that
+// literally contain dots (e.g. a YAML key "apnews.com", stored as
+// "APNEWS.COM") resolve to their stored value.
+// For dotted keys with no literal match, dot-notation path resolution applies
+// for nested keys (e.g., "database.host" -> "DATABASE_HOST").
 // For indexed access (e.g., "service.cors.origins.0"), falls back to comma-separated values
 // if indexed key is not found.
 // Returns the stored value as-is (no trimming): .env values are trimmed at
@@ -66,11 +70,15 @@ func (l *Loader) Lookup(key string) (string, bool) {
 	// checked atomically. Under high concurrency the RWMutex reader count is
 	// itself the contention bottleneck.
 	//
+	// The l.vars nil check makes a zero-value Loader (never passed through
+	// New) report a miss instead of dereferencing the nil map — consistent
+	// with enterRead/enterWrite failing closed.
+	//
 	// Semantics vs Close are unchanged: a read racing Close either observes
 	// the value or the cleared state — "graceful degradation", as documented
 	// in CONCURRENCY_SAFETY.md. Multi-key snapshots (All, ToMap, ParseInto)
 	// keep the read lock for cross-shard consistency.
-	if l == nil || l.closedFast.Load() {
+	if l == nil || l.vars == nil || l.closedFast.Load() {
 		return "", false
 	}
 
@@ -98,8 +106,9 @@ func (l *Loader) Lookup(key string) (string, bool) {
 // Uses the same key resolution strategy as Lookup (exact match, uppercase fallback,
 // dot-notation) via internal.ResolveKeyName to ensure consistency.
 func (l *Loader) GetSecure(key string) *SecureValue {
-	// Lock-free single-key read — see Lookup for the rationale.
-	if l == nil || l.closedFast.Load() {
+	// Lock-free single-key read — see Lookup for the rationale (including
+	// the zero-value Loader guard).
+	if l == nil || l.vars == nil || l.closedFast.Load() {
 		return nil
 	}
 
@@ -143,6 +152,12 @@ func (l *Loader) Keys() []string {
 }
 
 // All returns all environment variables as a map.
+//
+// SECURITY (SEC-010): the returned map copies every value into ordinary Go
+// strings, which live outside SecureValue's protected lifecycle (no zeroing,
+// no memory locking). Do not log, serialize, or long-term store this snapshot
+// when it may contain secrets — use GetSecure for values that must stay
+// protected.
 func (l *Loader) All() map[string]string {
 	if err := l.enterRead(); err != nil {
 		return nil
@@ -224,6 +239,11 @@ func (l *Loader) GetFloat64(key string, defaultValue ...float64) float64 {
 // GetBool retrieves a boolean value with optional default.
 // If the key is not found and no default is provided, returns false.
 //
+// A key that EXISTS with an empty value also yields false — not the default
+// (an empty string is a valid explicit value and parses as false), unlike
+// GetInt/GetFloat64/GetDuration, whose empty values fail parsing and fall
+// back to the default.
+//
 // Example:
 //
 //	debug := loader.GetBool("DEBUG")           // Returns false if not found
@@ -250,7 +270,8 @@ func (l *Loader) GetDuration(key string, defaultValue ...time.Duration) time.Dur
 // buildIndexedKey efficiently constructs an indexed key (e.g., "KEY_0", "KEY_1").
 // It uses a stack-allocated buffer to avoid heap allocations in the common case.
 //
-// SECURITY: Returns empty string if the resulting key would exceed hardMaxKeyLength.
+// SECURITY: Returns empty string if the resulting key would exceed
+// internal.HardMaxKeyLength.
 func buildIndexedKey(baseKey string, index int) string {
 	// SECURITY: Check for negative index
 	if index < 0 {
@@ -266,7 +287,7 @@ func buildIndexedKey(baseKey string, index int) string {
 	// Calculate total length
 	totalLen := len(baseKey) + 1 + indexLen
 
-	// SECURITY: Check against hardMaxKeyLength to prevent excessively long keys
+	// SECURITY: Check against internal.HardMaxKeyLength to prevent excessively long keys
 	if totalLen > internal.HardMaxKeyLength {
 		return ""
 	}
@@ -296,7 +317,14 @@ func buildIndexedKey(baseKey string, index int) string {
 
 // GetSliceFrom retrieves a slice of values from a loader by iterating through indexed keys.
 // If the key is not found and no default is provided, returns nil.
-// Supports dot-notation path resolution for nested keys.
+// The default is consulted only after every candidate base key misses; data
+// found under any candidate always wins over the default.
+//
+// Candidate base keys mirror Lookup's resolution order: the literal key and
+// its uppercase form first (keys may themselves contain dots — a YAML
+// "apnews.com" array flattens to APNEWS.COM_0, APNEWS.COM_1), then the
+// dot-notation candidates for nested keys (e.g., "database.host" ->
+// DATABASE_HOST_0, DATABASE_HOST_1).
 //
 // Indexed keys are searched in format: KEY_0, KEY_1, KEY_2, etc.
 // Also supports comma-separated values as fallback for .env files.
@@ -337,13 +365,14 @@ func GetSliceFrom[T sliceElement](loader *Loader, key string, defaultValue ...[]
 	}
 	defer loader.exitRead()
 
-	// GetString candidate keys from path resolver (handles dot-notation)
-	candidates := internal.ResolvePath(key)
-
-	// Try each candidate in priority order
-	for _, baseKey := range candidates {
-		result := getSliceFromIndexedKeys[T](loader, baseKey, defaultValue)
-		if len(result) > 0 {
+	// Candidate base keys mirror Lookup's resolution order (literal key and
+	// uppercase form first, then dot-notation candidates) so arrays under
+	// keys that literally contain dots resolve like nested-path arrays.
+	// Probe every candidate base key before consulting defaultValue: a miss
+	// on the first candidate (the literal key) must not shadow data stored
+	// under the uppercase or dot-notation candidates.
+	for _, baseKey := range internal.ResolveBaseKeys(key) {
+		if result, found := getSliceFromIndexedKeys[T](loader, baseKey, defaultValue); found {
 			return result
 		}
 	}
@@ -353,11 +382,24 @@ func GetSliceFrom[T sliceElement](loader *Loader, key string, defaultValue ...[]
 }
 
 // getSliceFromIndexedKeys tries to get a slice from indexed keys for a specific base key.
-func getSliceFromIndexedKeys[T sliceElement](loader *Loader, baseKey string, defaultValue [][]T) []T {
+// It reports found=true only when this base key produced a slice: indexed keys
+// were collected, or a comma-separated value exists (even one that parses to
+// nil or falls back to the default). A pure miss returns (nil, false) so the
+// caller keeps probing the remaining candidate base keys — returning the
+// default here instead would short-circuit GetSliceFrom's candidate loop and
+// shadow data stored under a later candidate.
+// getSliceFromIndexedKeys assembles a slice from indexed keys (KEY_0,
+// KEY_1, ...). Elements that fail element-type parsing are skipped (each
+// failure is audit-logged); consequently a base key whose indexed keys ALL
+// fail to parse reports a miss, falling through to the comma-separated
+// candidate and ultimately the caller's default — the per-element skips are
+// never surfaced as an error.
+func getSliceFromIndexedKeys[T sliceElement](loader *Loader, baseKey string, defaultValue [][]T) ([]T, bool) {
 	// Collect values from indexed keys: KEY_0, KEY_1, KEY_2, ...
-	// SECURITY: Add maximum slice size limit to prevent DoS via infinite loop
-	// This is consistent with hardMaxVariables (10000) from internal/limits.go
-	const maxSliceSize = 10000
+	// SECURITY: Add maximum slice size limit to prevent DoS via infinite loop.
+	// This mirrors the internal.HardMaxVariables ceiling (internal/limits.go)
+	// by reference, so the two cannot drift.
+	const maxSliceSize = internal.HardMaxVariables
 
 	var result []T
 	i := 0
@@ -389,14 +431,13 @@ func getSliceFromIndexedKeys[T sliceElement](loader *Loader, baseKey string, def
 	// If no indexed keys found, try comma-separated value
 	if len(result) == 0 {
 		if value, ok := loader.vars.Get(baseKey); ok {
-			return parseCommaSeparated[T](value, defaultValue...)
+			return parseCommaSeparated[T](value, defaultValue...), true
 		}
 	}
 
-	// Return default only if we collected nothing and have a default
-	if len(result) == 0 && len(defaultValue) > 0 {
-		return defaultValue[0]
+	if len(result) == 0 {
+		return nil, false
 	}
 
-	return result
+	return result, true
 }

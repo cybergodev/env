@@ -11,7 +11,8 @@
 //
 // ## Global Mode (Simple)
 //
-// Use package-level functions after calling Load(). Best for simple applications:
+// Use package-level functions after calling Load() — or Overload(), its
+// last-file-wins variant. Best for simple applications:
 //
 //	err := env.Load(".env")
 //	if err != nil {
@@ -80,6 +81,34 @@
 //   - TestingConfig: Isolated, compact limits
 //   - ProductionConfig: Strict limits, audit enabled
 //
+// # Configuration Style
+//
+// Configuration flows through exactly one channel: the Config struct, seeded
+// from DefaultConfig() or one of the presets above. The library has no
+// functional options — new settings are added as Config fields with an
+// explicit default in DefaultConfig().
+//
+// Zero-value semantics: a fully zero Config is treated as DefaultConfig() by
+// New; a partially-set Config is NOT auto-completed — unset limits stay zero
+// and are rejected by Validate with ErrInvalidConfig. Always start from
+// DefaultConfig() (or a preset) and modify fields.
+//
+// Every package-level accessor is a thin proxy for the same-named Loader
+// method with the same signature (env.GetString ↔ Loader.GetString,
+// env.Set ↔ Loader.Set, ...), so the two layers behave identically once a
+// default loader is set. Exceptions: GetSlice pairs with GetSliceFrom
+// because Go methods cannot take type parameters; the initializers
+// Load/Overload/LoadWithConfig set up the shared default loader (instance
+// counterpart: New); and the Loader-only lifecycle methods (LoadFiles,
+// Apply, Close, IsClosed, IsApplied, LoadTime, Config) plus the stateless
+// parse/marshal/utility families have no package-level counterpart by
+// design.
+//
+// A few process-wide knobs are deliberately NOT part of Config because they
+// are global rather than per-instance: SetMemoryLockEnabled/SetMemoryLockStrict
+// (memory locking), RegisterParser/ForceRegisterParser (the parser registry),
+// and the DefaultFileSystem variable. Set these during program initialization.
+//
 // # File Format Support
 //
 // Supported file formats:
@@ -114,6 +143,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"io/fs"
 	"os"
 	"sync"
 	"sync/atomic"
@@ -125,6 +155,11 @@ import (
 // Loader is the main type for loading and managing environment variables.
 // It provides thread-safe access to environment variables with full
 // security validation, audit logging, and error handling.
+//
+// The zero value is not usable: construct Loaders with New (directly or via
+// Load/Overload/LoadWithConfig). Method calls on a zero-value Loader fail
+// closed — ErrClosed from state-changing methods, zero values from getters —
+// rather than panicking.
 type Loader struct {
 	config      Config
 	factory     *ComponentFactory
@@ -143,6 +178,13 @@ type Loader struct {
 	appliedKeys map[string]struct{} // process-env keys this loader actually set
 	closed      bool
 	loadTime    time.Time
+
+	// Capability assertions resolved once at construction so the Set hot
+	// path does not repeat them on every call (see validateSetKV). The
+	// factory's validator is fixed for the Loader's lifetime, so caching
+	// the assertion result is equivalent to re-asserting per call.
+	setKeyCap   setKeyValidator
+	basicValCap basicValueValidator
 }
 
 // Compile-time check that Loader implements EnvLoader.
@@ -152,10 +194,11 @@ var _ EnvLoader = (*Loader)(nil)
 var _ io.Closer = (*Loader)(nil)
 
 // enterRead acquires the read lock and validates loader state.
-// Returns ErrClosed if the loader is nil or closed.
+// Returns ErrClosed if the loader is nil, not constructed by New (zero
+// value: vars is nil), or closed.
 // Caller must call exitRead() when done.
 func (l *Loader) enterRead() error {
-	if l == nil {
+	if l == nil || l.vars == nil {
 		return ErrClosed
 	}
 	l.mu.RLock()
@@ -170,10 +213,11 @@ func (l *Loader) enterRead() error {
 func (l *Loader) exitRead() { l.mu.RUnlock() }
 
 // enterWrite acquires the write lock and validates loader state.
-// Returns ErrClosed if the loader is nil or closed.
+// Returns ErrClosed if the loader is nil, not constructed by New (zero
+// value: vars is nil), or closed.
 // Caller must call exitWrite() when done.
 func (l *Loader) enterWrite() error {
-	if l == nil {
+	if l == nil || l.vars == nil {
 		return ErrClosed
 	}
 	l.mu.Lock()
@@ -204,11 +248,22 @@ func (l *Loader) cleanupOnError(err error, cleanup bool) error {
 // BEHAVIOR:
 //   - Does NOT set the package-level default loader
 //   - Does NOT auto-apply to os.Environ (unless cfg.AutoApply = true)
+//   - With no Config (or a fully zero one) it uses DefaultConfig, whose
+//     Filenames is [".env"] — an empty loader requires clearing Filenames
+//     explicitly; a partially-set Config is NOT auto-completed (see below)
 //   - Can be called multiple times to create independent instances
 //   - Requires explicit lifecycle management: defer loader.Close()
 //
-// If no configuration is provided or a zero-value Config is passed,
-// DefaultConfig() is used automatically.
+// Configuration semantics:
+//   - cfg is variadic for call-site convenience: New() and New(Config{})
+//     both mean DefaultConfig(). At most one Config is accepted; passing
+//     several is rejected with ErrInvalidConfig — silently ignoring the
+//     extras would hide a call-site bug (the caller believes the second
+//     Config took effect).
+//   - A fully zero Config is replaced by DefaultConfig(). A partially-set
+//     Config is NOT auto-completed — unset limits stay zero and Validate
+//     rejects them with ErrInvalidConfig. Always start from DefaultConfig()
+//     or one of the presets and modify fields.
 //
 // FOR SIMPLE USE CASES: Use Load() instead, which sets up
 // the package-level default and applies to os.Environ automatically.
@@ -229,6 +284,10 @@ func (l *Loader) cleanupOnError(err error, cleanup bool) error {
 //	cfg.AutoApply = true
 //	loader, err := env.New(cfg)
 func New(cfg ...Config) (*Loader, error) {
+	if len(cfg) > 1 {
+		return nil, fmt.Errorf("%w: New accepts at most one Config, got %d; "+
+			"extra Configs are never applied — pass exactly one", ErrInvalidConfig, len(cfg))
+	}
 	var c Config
 	if len(cfg) > 0 {
 		c = cfg[0]
@@ -273,6 +332,15 @@ func New(cfg ...Config) (*Loader, error) {
 		fs:          fs,
 		vars:        newSecureMap(),
 	}
+	// Resolve the optional validator capabilities once; a nil value means
+	// the capability is absent and validateSetKV falls back to the base
+	// interface methods, exactly as a per-call assertion would.
+	if v, ok := factory.Validator().(setKeyValidator); ok {
+		loader.setKeyCap = v
+	}
+	if bv, ok := factory.Validator().(basicValueValidator); ok {
+		loader.basicValCap = bv
+	}
 
 	// Auto-load files if Filenames is configured
 	if len(c.Filenames) > 0 {
@@ -289,6 +357,11 @@ func New(cfg ...Config) (*Loader, error) {
 // Files are loaded sequentially. A later file only overrides values from an
 // earlier one when OverwriteExisting is true; with the default (false) the
 // first file to set a key wins.
+//
+// Paths must be RELATIVE: absolute paths, Windows drive letters, UNC paths,
+// and any ".." component are rejected with SecurityError. Docker/Kubernetes
+// users mounting configs at absolute locations should chdir to the config
+// directory or pass paths relative to the working directory.
 //
 // Returns:
 //   - ErrClosed: if the loader is nil or has been closed
@@ -334,7 +407,9 @@ func (l *Loader) loadFilesInternal(filenames []string, cleanupOnErr bool) error 
 	for _, filename := range filenames {
 		if err := l.loadFileLocked(filename); err != nil {
 			if errors.Is(err, ErrFileNotFound) && !l.config.FailOnMissingFile {
-				_ = l.factory.Auditor().LogWithFile(internal.ActionLoad, "", filename, "file not found, skipping", true)
+				if l.config.AuditEnabled {
+					_ = l.factory.Auditor().LogWithFile(internal.ActionLoad, "", filename, "file not found, skipping", true)
+				}
 				continue
 			}
 			return l.cleanupOnError(err, cleanupOnErr)
@@ -352,6 +427,30 @@ func (l *Loader) loadFilesInternal(filenames []string, cleanupOnErr bool) error 
 		}
 	}
 
+	return l.auditCheckFailClosed()
+}
+
+// auditCheckFailClosed surfaces a latched audit failure when the loader is
+// configured with AuditFailClosed (GEN-001). The built-in auditor latches
+// the first handler failure; a CustomAuditor participates by implementing
+// TakeFailure() error, which is detected via interface assertion so the
+// AuditLogger interface itself stays unchanged. Checked at the end of
+// top-level mutating operations so a lost audit trail fails the operation
+// that caused it. With concurrent operations the latched failure is
+// delivered to whichever operation checks first — signaling is best-effort,
+// not exactly-once.
+func (l *Loader) auditCheckFailClosed() error {
+	if !l.config.AuditFailClosed {
+		return nil
+	}
+	taker, ok := l.factory.Auditor().(interface{ TakeFailure() error })
+	if !ok {
+		return nil
+	}
+	if err := taker.TakeFailure(); err != nil {
+		return fmt.Errorf("%w: audit event lost while fail-closed auditing was enabled: %v",
+			ErrAuditFailed, err)
+	}
 	return nil
 }
 
@@ -386,12 +485,16 @@ func (l *Loader) loadFileLocked(filename string) error {
 
 	file, err := l.fs.Open(filename)
 	if err != nil {
-		if os.IsNotExist(err) || errors.Is(err, ErrFileNotFound) {
+		// os.IsNotExist does not traverse wrapped error chains, so a custom
+		// FileSystem returning fmt.Errorf("...: %w", fs.ErrNotExist) is also
+		// checked via errors.Is — otherwise FailOnMissingFile=false never
+		// skipped such files.
+		if os.IsNotExist(err) || errors.Is(err, ErrFileNotFound) || errors.Is(err, fs.ErrNotExist) {
 			return newFileError(filename, "open", ErrFileNotFound)
 		}
 		return newFileError(filename, "open", err)
 	}
-	defer file.Close() // read-only handle; close error is not actionable
+	defer func() { _ = file.Close() }() // read-only handle; close error is not actionable
 
 	// Get file info for size check
 	// Note: This provides a fast-path check for obviously oversized files.
@@ -489,6 +592,11 @@ func (l *Loader) loadFileLocked(filename string) error {
 // Apply applies all loaded variables to the process environment.
 // Only sets variables that do not already exist unless OverwriteExisting is true.
 //
+// If an os.Setenv fails midway, the loop stops and returns the error WITHOUT
+// rolling back: keys already set remain in the process environment while
+// IsApplied reports false (the pass did not complete). Treat a failed Apply
+// as "partially applied", not as "nothing was applied".
+//
 // Returns:
 //   - ErrClosed: if the loader is nil or has been closed
 //   - Wrapped os errors: if setting an environment variable fails
@@ -498,7 +606,10 @@ func (l *Loader) Apply() error {
 	}
 	defer l.exitWrite()
 
-	return l.applyLocked()
+	if err := l.applyLocked(); err != nil {
+		return err
+	}
+	return l.auditCheckFailClosed()
 }
 
 // applyLocked applies variables to the environment.
@@ -510,7 +621,9 @@ func (l *Loader) applyLocked() error {
 		// "not set" and "empty string". This correctly handles the case where
 		// an environment variable is explicitly set to empty string.
 		if _, exists := l.fs.LookupEnv(key); exists && !l.config.OverwriteExisting {
-			_ = l.factory.Auditor().Log(internal.ActionSet, key, "skipped (existing)", false)
+			if l.config.AuditEnabled {
+				_ = l.factory.Auditor().Log(internal.ActionSet, key, "skipped (existing)", false)
+			}
 			continue
 		}
 
@@ -520,7 +633,9 @@ func (l *Loader) applyLocked() error {
 		}
 		l.markAppliedLocked(key)
 
-		_ = l.factory.Auditor().Log(internal.ActionSet, key, "applied", true)
+		if l.config.AuditEnabled {
+			_ = l.factory.Auditor().Log(internal.ActionSet, key, "applied", true)
+		}
 	}
 
 	l.applied = true
@@ -543,18 +658,58 @@ func (l *Loader) wasAppliedLocked(key string) bool {
 	return ok
 }
 
+// setKeyValidator is an optional capability of validators that can validate
+// programmatically-set keys under the structured-format key rules (dots,
+// hyphens and other characters the .env pattern rejects). It is defined here
+// (consumer side) so existing external Validator implementations keep
+// compiling; they simply fall back to ValidateKey.
+type setKeyValidator interface {
+	ValidateSetKey(key string) error
+}
+
+// basicValueValidator is an optional capability of validators that enforce a
+// baseline of value checks (maximum length, control-character rejection)
+// independent of the ValidateValues switch. Defined consumer-side (like
+// setKeyValidator above) so existing external Validator implementations keep
+// compiling; when ValidateValues is false they keep the previous behavior of
+// no value validation.
+type basicValueValidator interface {
+	ValidateValueBasic(value string) error
+}
+
 // validateSetKV validates a Set key/value pair and reports failures to the
-// auditor. Shared by both lock paths of Set.
+// auditor. Shared by both lock paths of Set. The optional-capability
+// assertions (setKeyCap / basicValCap) were resolved once in New.
 func (l *Loader) validateSetKV(key, value string) error {
-	// Validate key
-	if err := l.factory.Validator().ValidateKey(key); err != nil {
+	// Validate key. Programmatic keys follow the structured-format key rules
+	// (IsValidJSONKey) when the validator supports it: the store legitimately
+	// holds dotted keys loaded from YAML/JSON files, and Set must accept the
+	// same key space. Validators without the capability (custom minimal
+	// implementations) keep the stricter .env-pattern behavior.
+	if l.setKeyCap != nil {
+		if err := l.setKeyCap.ValidateSetKey(key); err != nil {
+			_ = l.factory.Auditor().LogError(internal.ActionSet, key, err.Error())
+			return err
+		}
+	} else if err := l.factory.Validator().ValidateKey(key); err != nil {
 		_ = l.factory.Auditor().LogError(internal.ActionSet, key, err.Error())
 		return err
 	}
 
-	// Validate value
+	// Validate value. ValidateValues gates whether the validator's full
+	// ValidateValue runs; when it is off, the baseline capability
+	// (ValidateValueBasic) still applies. For the built-in validator the two
+	// are equivalent, so Set matches the .env parse path for every flag
+	// combination (the UTF-8 check follows ValidateUTF8 alone); custom
+	// validators without the capability skip value checks when the switch is
+	// off, as before.
 	if l.config.ValidateValues {
 		if err := l.factory.Validator().ValidateValue(value); err != nil {
+			_ = l.factory.Auditor().LogError(internal.ActionSet, key, err.Error())
+			return err
+		}
+	} else if l.basicValCap != nil {
+		if err := l.basicValCap.ValidateValueBasic(value); err != nil {
 			_ = l.factory.Auditor().LogError(internal.ActionSet, key, err.Error())
 			return err
 		}
@@ -565,12 +720,36 @@ func (l *Loader) validateSetKV(key, value string) error {
 // Set sets a value for a key.
 // If OverwriteExisting is false and the key already exists, the call is silently skipped.
 //
+// With AutoApply enabled the value is also applied to the process
+// environment under the same skip policy as Apply: when OverwriteExisting is
+// false and the variable already exists in the process environment, the
+// environment copy is left unchanged (the loader's in-memory value is still
+// updated). If applying to the process environment fails, Set returns the
+// error with BOTH copies unchanged — the in-memory store is updated only
+// after a successful Setenv, so a failed Set can be retried.
+//
+// With the default configuration, keys follow the structured-format key rules
+// (letters, digits, '_', '@', '-', '.' — the same shape YAML/JSON file loads
+// accept), so keys containing dots such as "APNEWS.COM" are settable. A
+// custom KeyPattern keeps governing Set unchanged.
+//
 // Returns:
 //   - ErrClosed: if the loader is nil or has been closed
 //   - ErrInvalidKey: if the key fails validation
 //   - ErrForbiddenKey: if the key is rejected by the forbidden-keys or allowed-keys policy
 //   - ErrInvalidValue: if ValidateValues is true and the value fails validation
+//   - ErrAuditFailed: if AuditFailClosed is set and an audit event was lost
 func (l *Loader) Set(key, value string) error {
+	if err := l.set(key, value); err != nil {
+		return err
+	}
+	return l.auditCheckFailClosed()
+}
+
+// set is Set's implementation; the public wrapper adds the fail-closed
+// audit check so every success path (including the no-overwrite skip)
+// surfaces a lost audit event.
+func (l *Loader) set(key, value string) error {
 	// Fast path: with OverwriteExisting there is no Has→Set check-then-act to
 	// serialize, and without AutoApply, Set touches no loader-level state
 	// (applied/appliedKeys/loadTime) — only l.vars, which synchronizes
@@ -578,7 +757,9 @@ func (l *Loader) Set(key, value string) error {
 	// calls from serializing on the loader mutex; Close() still takes the
 	// write lock, so it fully excludes this path.
 	// l.config is immutable after New, so reading it here needs no lock.
-	if l != nil && l.config.OverwriteExisting && !l.config.AutoApply {
+	// The l.vars check mirrors enterRead/enterWrite: a zero-value Loader
+	// (never passed through New) fails closed instead of dereferencing nil.
+	if l != nil && l.vars != nil && l.config.OverwriteExisting && !l.config.AutoApply {
 		if err := l.enterRead(); err != nil {
 			return err
 		}
@@ -588,7 +769,9 @@ func (l *Loader) Set(key, value string) error {
 			return err
 		}
 		l.vars.Set(key, value)
-		_ = l.factory.Auditor().Log(internal.ActionSet, key, "set", true)
+		if l.config.AuditEnabled {
+			_ = l.factory.Auditor().Log(internal.ActionSet, key, "set", true)
+		}
 		return nil
 	}
 
@@ -605,23 +788,46 @@ func (l *Loader) Set(key, value string) error {
 	// Use Has (no allocation) instead of Get (allocates string copy).
 	if !l.config.OverwriteExisting {
 		if l.vars.Has(key) {
-			_ = l.factory.Auditor().Log(internal.ActionSet, key, "skipped (no overwrite)", false)
+			if l.config.AuditEnabled {
+				_ = l.factory.Auditor().Log(internal.ActionSet, key, "skipped (no overwrite)", false)
+			}
 			return nil
 		}
 	}
 
-	l.vars.Set(key, value)
-	_ = l.factory.Auditor().Log(internal.ActionSet, key, "set", true)
-
-	// Apply to environment if auto-apply is enabled
+	// With AutoApply, set the process environment FIRST and store in memory
+	// only on success: a failed Setenv previously left the new value stored
+	// while Set reported an error, and with OverwriteExisting=false a retry
+	// then hit the skip branch above — the caller could neither detect nor
+	// redo the failed Set.
 	if l.config.AutoApply {
+		// Mirror applyLocked's policy: with OverwriteExisting disabled, a
+		// variable that already exists in the process environment is left
+		// untouched there while the in-memory value is still updated.
+		if _, exists := l.fs.LookupEnv(key); exists && !l.config.OverwriteExisting {
+			l.vars.Set(key, value)
+			if l.config.AuditEnabled {
+				_ = l.factory.Auditor().Log(internal.ActionSet, key, "skipped (existing)", false)
+			}
+			return nil
+		}
 		if err := l.fs.Setenv(key, value); err != nil {
 			return fmt.Errorf("failed to set environment: %w", err)
+		}
+		l.vars.Set(key, value)
+		if l.config.AuditEnabled {
+			_ = l.factory.Auditor().Log(internal.ActionSet, key, "set", true)
 		}
 		// Record the key so Delete() knows to unset it from the process
 		// environment, and mark the loader as applied for IsApplied().
 		l.markAppliedLocked(key)
 		l.applied = true
+		return nil
+	}
+
+	l.vars.Set(key, value)
+	if l.config.AuditEnabled {
+		_ = l.factory.Auditor().Log(internal.ActionSet, key, "set", true)
 	}
 
 	return nil
@@ -634,6 +840,8 @@ func (l *Loader) Set(key, value string) error {
 //
 // Returns:
 //   - ErrClosed: if the loader is nil or has been closed
+//   - Wrapped os errors: if unsetting an applied variable from the process
+//     environment fails (the in-memory copy is already removed by then)
 func (l *Loader) Delete(key string) error {
 	if err := l.enterWrite(); err != nil {
 		return err
@@ -641,20 +849,27 @@ func (l *Loader) Delete(key string) error {
 	defer l.exitWrite()
 
 	l.vars.Delete(key)
-	_ = l.factory.Auditor().Log(internal.ActionDelete, key, "deleted", true)
+	if l.config.AuditEnabled {
+		_ = l.factory.Auditor().Log(internal.ActionDelete, key, "deleted", true)
+	}
 
 	// Remove from the process environment only if this loader put it there.
 	// Per-key tracking matters: unsetting on l.applied alone would remove
 	// foreign process variables (HOME, TERM, ...) the loader never owned.
 	if l.wasAppliedLocked(key) {
 		if err := l.fs.Unsetenv(key); err != nil {
+			// The in-memory delete above already happened and appliedKeys
+			// keeps the entry (state stays coherent), but the caller must
+			// see that a possibly sensitive value is still live in the
+			// process environment — swallowing this while Apply/Set fail
+			// loudly on their os counterparts was asymmetric.
 			_ = l.factory.Auditor().LogError(internal.ActionDelete, key, err.Error())
-		} else {
-			delete(l.appliedKeys, key)
+			return fmt.Errorf("failed to unset %s: %w", MaskKey(key), err)
 		}
+		delete(l.appliedKeys, key)
 	}
 
-	return nil
+	return l.auditCheckFailClosed()
 }
 
 // Close closes the loader and securely clears all stored values.
@@ -679,6 +894,17 @@ func (l *Loader) Close() error {
 	l.closed = true
 	l.closedFast.Store(true)
 
+	// Close parsers that hold resources, mirroring the registry's
+	// construction-failure path (createParsers closes already-created
+	// parsers when a sibling factory fails). Built-in parsers are not
+	// closable; custom parsers registered via RegisterParser may be, and
+	// skipping this leaked their resources for the loader's whole lifetime.
+	for _, p := range l.parsers {
+		if closer, ok := p.(io.Closer); ok {
+			_ = closer.Close() // best-effort, matches createParsers cleanup
+		}
+	}
+
 	// Only close the factory if we own it.
 	// This prevents double-closing when the factory is shared.
 	if l.ownsFactory && l.factory != nil {
@@ -690,14 +916,16 @@ func (l *Loader) Close() error {
 	return nil
 }
 
-// IsClosed returns true if the loader has been closed.
+// IsClosed returns true if the loader has been closed, and for a nil or
+// zero-value Loader (never constructed through New). Reads the atomic
+// closedFast mirror instead of taking l.mu, consistent with the lock-free
+// single-key reads (Lookup, GetSecure); both flags are set together under
+// the write lock in Close.
 func (l *Loader) IsClosed() bool {
-	if l == nil {
+	if l == nil || l.vars == nil {
 		return true
 	}
-	l.mu.RLock()
-	defer l.mu.RUnlock()
-	return l.closed
+	return l.closedFast.Load()
 }
 
 // ParseInto populates a struct from loaded environment variables.
@@ -708,13 +936,18 @@ func (l *Loader) IsClosed() bool {
 //   - ErrClosed: if the loader is nil or has been closed
 //   - MarshalError: if struct tag parsing or type conversion fails
 func (l *Loader) ParseInto(v any) error {
-	// Hold the read lock across the snapshot to prevent a TOCTOU race where
-	// another goroutine closes the loader between the state check and All().
+	// Hold the read lock only while taking the snapshot, to prevent a TOCTOU
+	// race where another goroutine closes the loader between the state check
+	// and ToMap(). The lock is released before UnmarshalInto because it runs
+	// user-provided UnmarshalText/UnmarshalEnv callbacks; a callback that
+	// re-enters a write path (Set, Delete, Close) would self-deadlock on
+	// l.mu, which is not reentrant.
 	if err := l.enterRead(); err != nil {
 		return err
 	}
-	defer l.exitRead()
-	return UnmarshalInto(l.vars.ToMap(), v)
+	m := l.vars.ToMap()
+	l.exitRead()
+	return UnmarshalInto(m, v)
 }
 
 // Validate validates the loaded environment against required keys.

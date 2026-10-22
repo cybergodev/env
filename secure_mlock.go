@@ -33,9 +33,11 @@ type memoryLockConfig struct {
 	// enabled controls whether memory locking is attempted
 	enabled atomic.Bool
 
-	// strict controls whether locking failures return errors
-	// If false (default), locking failures are silently ignored
-	// If true, NewSecureValue will return an error if locking fails
+	// strict controls whether locking failures are surfaced. If false
+	// (default), they are silently ignored. If true, a failed lock invokes
+	// the onStrictLockFailure hook (default: a stderr security warning) and
+	// NewSecureValueStrict returns the error; NewSecureValue itself has no
+	// error return and keeps the value usable either way.
 	strict atomic.Bool
 
 	// supported indicates if the platform supports memory locking
@@ -51,6 +53,11 @@ var memLockConfig = memoryLockConfig{
 // SetMemoryLockEnabled enables or disables memory locking globally.
 // This affects all new SecureValue objects created after the call.
 // Existing SecureValue objects are not affected.
+//
+// This is a process-global runtime knob rather than a Config setting: memory
+// locking applies to every SecureValue in the process, independent of any
+// Loader, so it deliberately has no place in Config. Set it once at program
+// startup.
 //
 // This function is safe to call from multiple goroutines simultaneously.
 //
@@ -75,6 +82,9 @@ func IsMemoryLockEnabled() bool {
 // By default, locking failures are silently ignored for compatibility.
 // Enable strict mode for high-security applications that require confirmation
 // that memory is actually locked.
+//
+// Like SetMemoryLockEnabled, this is a process-global runtime knob rather
+// than a Config setting (per-process, independent of any Loader).
 //
 // Example:
 //

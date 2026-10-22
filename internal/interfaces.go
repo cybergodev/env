@@ -1,4 +1,5 @@
-// Package internal provides internal interfaces for dependency injection.
+// Provides internal interfaces for dependency injection.
+
 package internal
 
 // KeyValidator validates environment variable keys.

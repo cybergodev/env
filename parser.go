@@ -5,7 +5,6 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"strings"
 	"sync"
 	"time"
 
@@ -22,7 +21,7 @@ import (
 // small enough to avoid excessive memory consumption. This size was chosen
 // based on typical .env file sizes (rarely exceeding 64KB in practice).
 var scannerBufferPool = sync.Pool{
-	New: func() interface{} {
+	New: func() any {
 		buf := make([]byte, 64*1024)
 		return &buf
 	},
@@ -41,13 +40,26 @@ func getScannerBuffer() *[]byte {
 }
 
 // putScannerBuffer returns a byte slice to the pool.
-func putScannerBuffer(buf *[]byte) {
+// used is the number of bytes the reader delivered into the buffer during
+// this parse; only that prefix is cleared. The scanner fills the buffer
+// sequentially (compacting within it when it needs room, or growing to a
+// fresh slice beyond it), so bytes past min(used, len) never held file
+// content and need not be zeroed — for a file smaller than the 64KB buffer
+// this clears kilobytes instead of the full buffer.
+//
+// SECURITY: every byte that ever held file content IS cleared. The pool
+// invariant is that a buffer is clean at rest: each user clears exactly the
+// region it dirtied, and a freshly made buffer starts zeroed.
+func putScannerBuffer(buf *[]byte, used int) {
 	if buf == nil || cap(*buf) > internal.MaxPooledScannerBufferSize {
 		// Don't pool very large buffers
 		return
 	}
 	// Clear sensitive data before returning to pool
-	clear(*buf)
+	if used > len(*buf) {
+		used = len(*buf)
+	}
+	clear((*buf)[:used])
 	scannerBufferPool.Put(buf)
 }
 
@@ -77,7 +89,7 @@ func newParserWithFactory(cfg Config, factory *ComponentFactory) (*parser, error
 }
 
 // configure sets up the parser with the given configuration and factory.
-// This is the shared initialization logic used by both newParserWithFactory and reset.
+// This is the shared initialization logic used by newParserWithFactory.
 func (p *parser) configure(cfg Config, factory *ComponentFactory) {
 	validator := factory.Validator()
 	auditor := factory.Auditor()
@@ -85,22 +97,19 @@ func (p *parser) configure(cfg Config, factory *ComponentFactory) {
 	lineParserCfg := internal.LineParserConfig{
 		AllowExportPrefix: cfg.AllowExportPrefix,
 		AllowYamlSyntax:   cfg.AllowYamlSyntax,
-		OverwriteExisting: cfg.OverwriteExisting,
-		MaxVariables:      cfg.MaxVariables,
 		ExpandVariables:   cfg.ExpandVariables,
 	}
 
-	// Create LineParser with interfaces instead of concrete types.
-	// Direct field access to internal interfaces (same package).
+	// Create the LineParser with the adapter view of the validator
+	// (factory.Validator(), not the raw internal field): NewLineParser wires a
+	// key validator that also implements value validation automatically, so
+	// the previous explicit SetValueValidator call only re-set the same
+	// object through a second path.
 	lp := internal.NewLineParser(lineParserCfg,
-		factory.validator,
+		validator,
 		factory.auditor,
 		factory.expander,
 	)
-	// Set value validator if the validator also implements LineValueValidator
-	if vv, ok := validator.(internal.LineValueValidator); ok {
-		lp.SetValueValidator(vv)
-	}
 
 	p.config = cfg
 	p.validator = validator
@@ -150,7 +159,11 @@ func (p *parser) Parse(r io.Reader, filename string) (map[string]string, error) 
 	// chunked) is below this, so the scanner never raises bufio.ErrTooLong
 	// before the SecureReader's own ErrLineTooLong/ErrFileTooLarge surface.
 	scannerBuf := getScannerBuffer()
-	defer putScannerBuffer(scannerBuf)
+	// Deferred as a closure so the byte count is read AFTER the scan loop:
+	// only the region the scanner actually dirtied gets cleared on pool
+	// return (see putScannerBuffer). Runs before ReleaseSecureReader (LIFO),
+	// so the counters are still live.
+	defer func() { putScannerBuffer(scannerBuf, int(secureRd.BytesDelivered())) }()
 	scanner.Buffer(*scannerBuf, internal.MaxPooledScannerBufferSize)
 
 	// Pre-allocate result map with optimal capacity
@@ -170,10 +183,21 @@ func (p *parser) Parse(r io.Reader, filename string) (map[string]string, error) 
 
 	lineNum := 0
 	var parseErr error
+	// Keys whose current value came from a single-quoted literal: expansion
+	// must skip them (bash '...' semantics) — see ParseLineBytesQuote.
+	var singleQuotedKeys map[string]struct{}
 
 	for scanner.Scan() {
 		lineNum++
 		line := scanner.Bytes()
+
+		// Strip a UTF-8 BOM from the first line: Windows editors (Notepad,
+		// PowerShell Out-File) prepend one by default, and the resulting
+		// "\uFEFF" + "KEY" previously failed key validation with a misleading
+		// non-ASCII error on a line that visibly reads KEY=value.
+		if lineNum == 1 && len(line) >= 3 && line[0] == 0xEF && line[1] == 0xBB && line[2] == 0xBF {
+			line = line[3:]
+		}
 
 		// Fast path: skip empty lines and comments using byte-level operations
 		// Combined trim loop for better cache locality
@@ -196,7 +220,7 @@ func (p *parser) Parse(r io.Reader, filename string) (map[string]string, error) 
 		}
 
 		// Parse the line using byte-slice version to minimize allocations
-		key, value, err := p.lineParser.ParseLineBytes(line)
+		key, value, singleQuoted, err := p.lineParser.ParseLineBytesQuote(line)
 		if err != nil {
 			parseErr = newParseError(filename, lineNum, key, err)
 			break
@@ -206,8 +230,11 @@ func (p *parser) Parse(r io.Reader, filename string) (map[string]string, error) 
 			continue
 		}
 
-		// Check max variables
-		if len(result) >= p.config.MaxVariables {
+		// Check max variables — counting DISTINCT keys, matching the
+		// structured parsers' semantics: a duplicate line the policy would
+		// skip anyway previously tripped the limit at the exact boundary
+		// and failed the whole file.
+		if _, exists := result[key]; !exists && len(result) >= p.config.MaxVariables {
 			_ = p.auditor.LogError(internal.ActionParse, "", "maximum variables exceeded")
 			parseErr = &ValidationError{
 				Field:   "variables",
@@ -217,13 +244,43 @@ func (p *parser) Parse(r io.Reader, filename string) (map[string]string, error) 
 			break
 		}
 
-		// Handle overwrites
-		if _, exists := result[key]; exists && !p.config.OverwriteExisting {
-			_ = p.auditor.Log(internal.ActionParse, key, "duplicate key skipped", false)
-			continue
+		// Handle duplicates per the configured DuplicateKeyPolicy. Inherit
+		// (the default) keeps the historical behavior: skip when
+		// OverwriteExisting is false, overwrite when true.
+		if _, exists := result[key]; exists {
+			if p.config.DuplicateKeyPolicy == DuplicateKeyError {
+				_ = p.auditor.LogError(internal.ActionParse, key, "duplicate key")
+				parseErr = newParseError(filename, lineNum, key, ErrDuplicateKey)
+				break
+			}
+			skip := false
+			switch p.config.DuplicateKeyPolicy {
+			case DuplicateKeyFirstWins:
+				skip = true
+			case DuplicateKeyLastWins:
+				// fall through to overwrite
+			default: // DuplicateKeyInherit
+				skip = !p.config.OverwriteExisting
+			}
+			if skip {
+				_ = p.auditor.Log(internal.ActionParse, key, "duplicate key skipped", false)
+				continue
+			}
 		}
 
 		result[key] = value
+
+		// Track quote provenance so expansion can exempt literal values.
+		// Overwriting a key with an unquoted/double-quoted value clears the
+		// exemption — the last write owns the value.
+		if singleQuoted {
+			if singleQuotedKeys == nil {
+				singleQuotedKeys = make(map[string]struct{})
+			}
+			singleQuotedKeys[key] = struct{}{}
+		} else if singleQuotedKeys != nil {
+			delete(singleQuotedKeys, key)
+		}
 	}
 
 	if err := scanner.Err(); err != nil {
@@ -243,11 +300,16 @@ func (p *parser) Parse(r io.Reader, filename string) (map[string]string, error) 
 		return nil, err
 	}
 
-	// Expand variables if enabled
+	// Expand variables if enabled. Single-quoted values are passed through
+	// literally — expanding them silently corrupted secrets like
+	// PASSWORD='my$ecret' (the $ecret reference resolved to empty).
 	if p.config.ExpandVariables {
-		expanded, err := p.lineParser.ExpandAll(result)
+		expanded, err := p.lineParser.ExpandAll(result, singleQuotedKeys)
 		if err != nil {
-			return nil, err
+			// Wrap for file context in multi-file loads — every other
+			// failure path in Parse reports the filename. ParseError.Unwrap
+			// preserves errors.Is/As on the underlying *ExpansionError.
+			return nil, newParseError(filename, 0, "", err)
 		}
 		result = expanded
 	}
@@ -256,37 +318,4 @@ func (p *parser) Parse(r io.Reader, filename string) (map[string]string, error) 
 		_ = p.auditor.LogWithDuration(internal.ActionParse, "", "parsed: "+filename, true, time.Since(startTime))
 	}
 	return result, nil
-}
-
-// parseString parses environment variables from a string.
-// This is an internal function used by UnmarshalMap.
-// Uses a shared ComponentFactory to avoid per-call allocation overhead.
-// NOTE: Always uses DefaultConfig — custom key patterns, validators, and limits
-// from user Config are NOT applied. For custom parsing, create a Loader with New().
-func parseString(s string) (map[string]string, error) {
-	cfg := DefaultConfig()
-	factory := getSharedParseFactory()
-
-	p, err := newParserWithFactory(cfg, factory)
-	if err != nil {
-		return nil, err
-	}
-
-	return p.Parse(strings.NewReader(s), "")
-}
-
-// sharedParseFactory caches a ComponentFactory for parseString to reuse.
-// The factory's auditor handler is internal.DefaultHandler() (Nop), which is stateless and safe to share.
-var (
-	sharedParseFactory     *ComponentFactory
-	sharedParseFactoryOnce sync.Once
-)
-
-// getSharedParseFactory returns a lazily-initialized shared ComponentFactory.
-func getSharedParseFactory() *ComponentFactory {
-	sharedParseFactoryOnce.Do(func() {
-		cfg := DefaultConfig()
-		sharedParseFactory = cfg.buildComponentFactory()
-	})
-	return sharedParseFactory
 }

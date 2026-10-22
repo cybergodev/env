@@ -6,6 +6,7 @@ package main
 import (
 	"fmt"
 	"log"
+	"sort"
 
 	"github.com/cybergodev/env"
 )
@@ -67,14 +68,17 @@ func demonstrateCustomConfig() {
 	if err != nil {
 		log.Fatalf("Failed to create loader: %v", err)
 	}
-	defer loader.Close()
+	defer func() { _ = loader.Close() }() // best-effort cleanup
 
 	// Validate checks that all RequiredKeys are present.
 	if err := loader.Validate(); err != nil {
 		log.Fatalf("Validation failed: %v", err)
 	}
 
-	fmt.Printf("  DB_ keys: %v\n", loader.Keys())
+	// Keys() does not guarantee an order — sort for stable display.
+	dbKeys := loader.Keys()
+	sort.Strings(dbKeys)
+	fmt.Printf("  DB_ keys: %v\n", dbKeys)
 }
 
 // demonstrateLifecycle shows the LoadFiles/Apply/Close lifecycle.
@@ -88,7 +92,7 @@ func demonstrateLifecycle() {
 	if err != nil {
 		log.Fatalf("Failed to create loader: %v", err)
 	}
-	defer loader.Close()
+	defer func() { _ = loader.Close() }() // best-effort cleanup
 
 	// LoadFiles loads incrementally; later files can override earlier ones.
 	if err := loader.LoadFiles("examples/data/config.env"); err != nil {

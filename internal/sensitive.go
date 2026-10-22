@@ -1,8 +1,8 @@
-// Package internal provides sensitive key detection and masking utilities.
+// Provides sensitive key detection and masking utilities.
+
 package internal
 
 import (
-	"fmt"
 	"sort"
 	"strings"
 )
@@ -13,6 +13,7 @@ import (
 var Patterns = []string{
 	// Authentication & Authorization
 	"PASSWORD",
+	"PASSWD", // distinct spelling: PASSWORD does not contain PASSWD
 	"SECRET",
 	"TOKEN",
 	"AUTH",
@@ -28,6 +29,7 @@ var Patterns = []string{
 	"SECRET_KEY",
 	"PRIVATE_KEY",
 	"PUBLIC_KEY", // May contain paired private key context
+	"KEYSTORE",
 
 	// Encryption & Security
 	"PRIVATE",
@@ -37,6 +39,9 @@ var Patterns = []string{
 	"SIGNING_KEY",
 	"SIGN_KEY",
 	"VERIFY_KEY",
+	"CERT", // covers CERTIFICATE and certificate-path keys
+	"SALT",
+	"NONCE",
 
 	// Financial & Personal (PII)
 	"SSN",
@@ -60,6 +65,11 @@ var Patterns = []string{
 	"CONN_STRING",
 	"DATABASE_URL",
 	"DB_PASSWORD",
+	"DSN",
+
+	// Password/PII spellings not covered by PASSWORD above (SEC-006).
+	"PWD",      // MYSQL_PWD, DB_PWD, PWD — distinct spelling: PASSWORD lacks PWD
+	"USERNAME", // PII identifier, alongside SSN / CREDIT_CARD below
 
 	// Cloud & Services
 	"AWS_SECRET",
@@ -68,64 +78,151 @@ var Patterns = []string{
 	"SERVICE_ACCOUNT",
 }
 
+// wordAnchoredPatterns names patterns that IsKey matches only at identifier
+// boundaries rather than as substrings (SEC-006). Short tokens like AUTH,
+// PAN and PWD over-match ordinary words as substrings — AUTHOR/AUTHORITY,
+// COMPANY/PANCAKE/EXPAND/JAPAN/SPANISH, MONKEY — turning benign keys into
+// false "sensitive" hits that degrade audit-log readability. They stay in
+// Patterns (AUTH, PAN, PWD) so SanitizeForLog keeps deriving their "key="
+// forms, where over-masking is the documented safe direction. USERNAME is
+// word-anchored too: it lives in Patterns for the "username=" sanitize form,
+// but as a full word it over-matches nothing, and anchoring it keeps IsKey
+// from flagging a bare "USERNAME" that is actually a benign identifier.
+var wordAnchoredPatterns = []string{"AUTH", "PAN", "PWD", "USERNAME"}
+
+// wordAnchoredSet is the membership view of wordAnchoredPatterns, used to skip
+// those patterns during IsKey's substring pass (they are re-checked at word
+// boundaries afterward).
+var wordAnchoredSet = func() map[string]bool {
+	m := make(map[string]bool, len(wordAnchoredPatterns))
+	for _, p := range wordAnchoredPatterns {
+		m[p] = true
+	}
+	return m
+}()
+
 // Patterns are already uppercase, so IsKey uses them directly for
 // case-insensitive matching without an additional ToUpper pass.
 
-// sanitizePatterns contains lowercase patterns for sanitizing logs.
-// These patterns are used to detect and mask sensitive key=value pairs.
-var sanitizePatterns = []string{
-	// Authentication
-	"password=",
-	"secret=",
-	"token=",
-	"auth=",
-	"credential=",
-	"passphrase=",
-	"session=",
-	"cookie=",
+// sanitizeEqualsPatterns holds the lowercase "key=" forms used to detect and
+// mask sensitive key=value pairs in logs and errors. It is DERIVED from
+// Patterns so the two lists cannot drift: the hand-maintained copy was
+// missing ENCRYPTION_KEY, SIGN_KEY, VERIFY_KEY, SOCIAL_SECURITY, CCV, PAN,
+// PRIVATE_ADDRESS, CONN_STRING, AZURE_KEY, GCP_KEY and SERVICE_ACCOUNT, so
+// "encryption_key=hunter2"-style pairs passed through SanitizeForLog
+// unmasked. Over-masking from the mechanical derivation (e.g. "pan=" inside
+// "japan=", "private=" on ordinary keys) follows the stated policy: masking
+// is best-effort and erring toward [MASKED] is the safe direction.
+var sanitizeEqualsPatterns = buildSanitizeEqualsPatterns()
 
-	// API & Keys
-	"api_key=",
-	"apikey=",
-	"access_key=",
-	"secret_key=",
-	"private_key=",
-	"public_key=",
+func buildSanitizeEqualsPatterns() []string {
+	out := make([]string, 0, len(Patterns)+2)
+	for _, p := range Patterns {
+		out = append(out, strings.ToLower(p)+"=")
+	}
+	// Deliberate extras beyond the key list: broader spellings the patterns
+	// do not contain and connection-string fields commonly appearing under
+	// otherwise non-sensitive key names.
+	return append(out, "authorization=", "pwd=")
+}
 
-	// Encryption
-	"encrypt_key=",
-	"decrypt_key=",
-	"signing_key=",
+// sanitizePatterns extends sanitizeEqualsPatterns for SanitizeForLog with a
+// colon-separated form of every entry (YAML and plain-text "password: ..."
+// pairs — the '=' form alone left structured dumps unmasked) and the HTTP
+// Authorization bearer scheme ("Bearer <token>"). Over-masking ordinary
+// colon pairs (e.g. a config "seed: 42") is accepted: masking is
+// best-effort and erring toward [MASKED] is the safe direction.
+var sanitizePatterns = buildSanitizePatterns()
 
-	// Financial (PII)
-	"ssn=",
-	"credit_card=",
-	"card_number=",
-	"cvv=",
-	"cvc=",
-
-	// Crypto
-	"mnemonic=",
-	"seed=",
-	"recovery=",
-	"wallet=",
-
-	// Database
-	"connection_string=",
-	"database_url=",
-	"db_password=",
+func buildSanitizePatterns() []string {
+	patterns := make([]string, 0, 2*len(sanitizeEqualsPatterns)+1)
+	patterns = append(patterns, sanitizeEqualsPatterns...)
+	for _, p := range sanitizeEqualsPatterns {
+		patterns = append(patterns, strings.TrimSuffix(p, "=")+":")
+	}
+	return append(patterns, "bearer ")
 }
 
 // IsKey determines if a key likely contains sensitive data.
 // Uses byte-level comparison to avoid allocations from strings.ToUpper.
+//
+// SECURITY (SEC-006): short patterns in wordAnchoredPatterns (AUTH, PAN, PWD,
+// USERNAME) are matched only at identifier boundaries, so ordinary words that
+// embed them (AUTHOR, COMPANY, MONKEY, …) are no longer misclassified as
+// sensitive; all other patterns still match as substrings.
 func IsKey(key string) bool {
 	if len(key) == 0 {
 		return false
 	}
 
-	// Check each pattern using zero-allocation case-insensitive matching
+	// Check each pattern using zero-allocation case-insensitive matching.
+	// Word-anchored patterns are skipped here and re-checked below at
+	// identifier boundaries.
 	for _, pattern := range Patterns {
-		if containsIgnoreCase(key, pattern) {
+		if !wordAnchoredSet[pattern] && containsIgnoreCase(key, pattern) {
+			return true
+		}
+	}
+
+	// Word-anchored patterns: match only when the pattern occupies an
+	// identifier boundary (preceded and followed by a non-identifier byte).
+	for _, pattern := range wordAnchoredPatterns {
+		if containsWordIgnoreCase(key, pattern) {
+			return true
+		}
+	}
+	return false
+}
+
+// isWordByte reports whether c continues an identifier run, so a pattern is
+// "word-anchored" when it is bounded on both sides by non-word bytes. '_' is
+// deliberately NOT a word byte: env-var naming uses '_' as a separator, so
+// DB_AUTH / MYSQL_PWD / PAN_NUMBER must still match (the pattern follows an
+// underscore), while AUTHOR / MONKEY must not (the pattern is followed by a
+// letter).
+func isWordByte(c byte) bool {
+	return (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9')
+}
+
+// containsWordIgnoreCase reports whether s contains pattern (case-insensitive,
+// ASCII only) at an identifier boundary: neither the byte before the match nor
+// the byte after it is an identifier byte. The boundary check makes AUTH match
+// "AUTH_TOKEN" and "DB_AUTH" but not "AUTHOR"/"AUTHORITY", and PWD match
+// "MYSQL_PWD" but not "PWD" inside an arbitrary run.
+func containsWordIgnoreCase(s, pattern string) bool {
+	patternLen := len(pattern)
+	sLen := len(s)
+	if patternLen > sLen || patternLen == 0 {
+		return false
+	}
+
+	for i := 0; i <= sLen-patternLen; i++ {
+		// Preceding byte must be an identifier boundary.
+		if i > 0 && isWordByte(s[i-1]) {
+			continue
+		}
+		// Following byte must be an identifier boundary.
+		end := i + patternLen
+		if end < sLen && isWordByte(s[end]) {
+			continue
+		}
+		// Case-insensitive ASCII comparison over the window.
+		match := true
+		for j := 0; j < patternLen; j++ {
+			c := s[i+j]
+			if c >= 0x80 {
+				match = false
+				break
+			}
+			if c >= 'a' && c <= 'z' {
+				c -= 32
+			}
+			if c != pattern[j] {
+				match = false
+				break
+			}
+		}
+		if match {
 			return true
 		}
 	}
@@ -208,14 +305,21 @@ const maxValueDisplayLen = 20
 
 // MaskValue masks a value based on its sensitivity.
 // This is a utility function for general value masking.
+// Non-sensitive values run through SanitizeForLog, mirroring MaskInString's
+// SEC-04 posture: truncation alone let "password=..." pairs pass unmasked.
+//
+// SECURITY (SEC-004): the sensitive branch previously rendered the exact
+// length ("[MASKED:23 chars]") — a password-length oracle in logs and errors.
+// It now renders the fixed "[MASKED]" form, matching SanitizeForLog, so the
+// mask reveals neither the value nor its length.
 func MaskValue(key, value string) string {
 	if IsKey(key) {
-		return fmt.Sprintf("[MASKED:%d chars]", len(value))
+		return "[MASKED]"
 	}
 	if len(value) <= maxValueDisplayLen {
-		return value
+		return SanitizeForLog(value)
 	}
-	return value[:maxValueDisplayLen-3] + "..."
+	return SanitizeForLog(value[:maxValueDisplayLen-3] + "...")
 }
 
 // MaskKey masks a key name for logging purposes.
@@ -239,6 +343,15 @@ func MaskInString(s string) string {
 
 // SanitizeForLog removes potentially sensitive information from a string.
 // It scans for patterns that might indicate sensitive data and masks them.
+//
+// Value boundaries (GEN-001: values containing spaces were previously cut
+// at the first space, leaving "password=my secret phrase" mostly unmasked):
+//   - a quoted value ("..." or '...') is masked through its closing quote,
+//     so interior spaces and separators stay covered;
+//   - an unquoted value is masked to the end of the line or to the start of
+//     the NEXT key=value / key: pair (an identifier at a word boundary
+//     followed by '=' or ':'), whichever comes first — separators inside
+//     the value itself ("password=a=b") keep masking.
 //
 // SECURITY: Pattern matching operates directly on the original bytes via
 // indexFoldASCII. It must NOT precompute strings.ToLower(s) and reuse those
@@ -271,13 +384,60 @@ func SanitizeForLog(s string) string {
 				break
 			}
 
-			// Find the value after the pattern
+			// Find the value after the pattern. Colon-separated (YAML)
+			// forms allow horizontal whitespace between the colon and the
+			// value; skip it so "password: hunter2" masks the same value
+			// "password=hunter2" would.
 			valueStart := idx + patternLen
+			if pattern[patternLen-1] == ':' {
+				for valueStart < len(s) && (s[valueStart] == ' ' || s[valueStart] == '\t') {
+					valueStart++
+				}
+			}
 			valueEnd := valueStart
-
-			// Find end of value (space, newline, tab, or end of string)
-			for valueEnd < len(s) && s[valueEnd] != ' ' && s[valueEnd] != '\n' && s[valueEnd] != '\t' {
+			if valueStart < len(s) && (s[valueStart] == '"' || s[valueStart] == '\'') {
+				// Quoted value: mask through the matching closing quote. A
+				// newline means the quote never closed — stop there and let
+				// the fallback region stand (values do not span lines).
+				quote := s[valueStart]
 				valueEnd++
+				for valueEnd < len(s) && s[valueEnd] != quote && s[valueEnd] != '\n' {
+					valueEnd++
+				}
+				if valueEnd < len(s) && s[valueEnd] == quote {
+					valueEnd++ // include the closing quote in the mask
+				}
+			} else {
+				// Unquoted value: mask to the end of the line or to the
+				// start of the next key=value / key: pair — an '=' or ':'
+				// whose preceding identifier begins after whitespace. An
+				// interior separator with no such boundary ("password=a=b")
+				// stays part of the masked value.
+				for valueEnd < len(s) {
+					c := s[valueEnd]
+					if c == '\n' {
+						break
+					}
+					if c == '=' || c == ':' {
+						k := valueEnd - 1
+						for k >= valueStart && isMaskWordByte(s[k]) {
+							k--
+						}
+						if k >= valueStart && (s[k] == ' ' || s[k] == '\t') {
+							// The next pair starts at the identifier, so the
+							// value ends before the whitespace gap in front
+							// of it — the key itself must stay visible.
+							valueEnd = k
+							break
+						}
+					}
+					valueEnd++
+				}
+				// The whitespace run before the next pair belongs to the
+				// gap, not the secret.
+				for valueEnd > valueStart && (s[valueEnd-1] == ' ' || s[valueEnd-1] == '\t') {
+					valueEnd--
+				}
 			}
 
 			if valueEnd > valueStart {
@@ -324,6 +484,15 @@ func SanitizeForLog(s string) string {
 	}
 
 	return removeControlChars(result.String())
+}
+
+// isMaskWordByte reports whether c can appear in an identifier that
+// SanitizeForLog treats as the key of a following key=value pair.
+func isMaskWordByte(c byte) bool {
+	return c >= 'a' && c <= 'z' ||
+		c >= 'A' && c <= 'Z' ||
+		c >= '0' && c <= '9' ||
+		c == '_' || c == '-' || c == '.'
 }
 
 // removeControlChars removes control characters except newline and tab.

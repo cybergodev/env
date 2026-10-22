@@ -48,7 +48,7 @@ func parseBool(s string) (bool, error) {
 	if len(s) == 0 {
 		return false, nil
 	}
-	if v, ok := lookupBoolASCII(s); ok {
+	if v, ok := internal.ParseBoolLoose(s); ok {
 		return v, nil
 	}
 	return false, &ValidationError{
@@ -56,49 +56,6 @@ func parseBool(s string) (bool, error) {
 		Value:   MaskSensitiveInString(s),
 		Message: "invalid boolean value",
 	}
-}
-
-// lookupBoolASCII performs case-insensitive boolean lookup without allocating.
-// Handles common boolean representations: true/false, yes/no, on/off, 1/0, enabled/disabled.
-func lookupBoolASCII(s string) (bool, bool) {
-	n := len(s)
-	switch n {
-	case 1:
-		if s[0] == '1' || s[0] == '0' {
-			return s[0] == '1', true
-		}
-	case 2:
-		if internal.EqualFoldASCII(s, "no") {
-			return false, true
-		}
-		if internal.EqualFoldASCII(s, "on") {
-			return true, true
-		}
-	case 3:
-		if internal.EqualFoldASCII(s, "yes") {
-			return true, true
-		}
-		if internal.EqualFoldASCII(s, "off") {
-			return false, true
-		}
-	case 4:
-		if internal.EqualFoldASCII(s, "true") {
-			return true, true
-		}
-	case 5:
-		if internal.EqualFoldASCII(s, "false") {
-			return false, true
-		}
-	case 7:
-		if internal.EqualFoldASCII(s, "enabled") {
-			return true, true
-		}
-	case 8:
-		if internal.EqualFoldASCII(s, "disabled") {
-			return false, true
-		}
-	}
-	return false, false
 }
 
 // parseDuration parses a duration string with additional validation.
@@ -282,15 +239,26 @@ func detectDataFormat(data string) FileFormat {
 			return FormatYAML
 		}
 
-		// YAML pattern: key: value (colon+space takes precedence over equals)
-		// Correctly handles YAML values containing "=" like: connection: host=db port=5432
-		if strings.Contains(line, ": ") {
+		// First-occurrence comparison of the two separator shapes: whichever
+		// appears EARLIER opens the assignment/mapping, so
+		// "GREETING=hello: world" classifies as .env (the '=' at index 8
+		// opens the assignment; the ": " inside the value is data) while
+		// "connection: host=db" classifies as YAML (the ": " opens the
+		// mapping; the '=' is inside the value).
+		colon := strings.Index(line, ": ")
+		eq := strings.IndexByte(line, '=')
+		switch {
+		case colon != -1 && (eq == -1 || colon < eq):
 			return FormatYAML
+		case eq != -1:
+			return FormatEnv
 		}
 
-		// .env pattern: contains = (only when no ": " pattern found)
-		if strings.Contains(line, "=") {
-			return FormatEnv
+		// A bare "key:" line with an empty value — the canonical start of a
+		// YAML block — contains neither separator; classify it as YAML
+		// instead of falling through to .env.
+		if isYAMLBareKeyLine(line) {
+			return FormatYAML
 		}
 
 		break
@@ -299,11 +267,42 @@ func detectDataFormat(data string) FileFormat {
 	return FormatEnv
 }
 
+// isYAMLBareKeyLine reports whether line is exactly a mapping key with an
+// empty value: [\w@\-.]+ ':' optional trailing whitespace.
+func isYAMLBareKeyLine(line string) bool {
+	i := 0
+	for i < len(line) && isBareKeyByte(line[i]) {
+		i++
+	}
+	if i == 0 || i >= len(line) || line[i] != ':' {
+		return false
+	}
+	for j := i + 1; j < len(line); j++ {
+		if line[j] != ' ' && line[j] != '\t' {
+			return false
+		}
+	}
+	return true
+}
+
+func isBareKeyByte(c byte) bool {
+	return c == '_' || c == '@' || c == '-' || c == '.' ||
+		(c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9')
+}
+
 // UnmarshalMap parses a formatted string into a map[string]string.
 // The format parameter is optional and defaults to FormatEnv.
 // Use FormatAuto for automatic format detection.
 //
 // Nested structures (JSON/YAML) are flattened with underscore delimiter.
+// Duplicate keys resolve per the DuplicateKeyInherit policy, and flat-key
+// collisions always error — see DuplicateKeyPolicy for details.
+//
+// SECURITY (SEC-002): every format now runs through the same DefaultConfig
+// pipeline as a single-file load, so the built-in forbidden-key policy
+// (PATH, LD_PRELOAD, NODE_OPTIONS, ...) and key validation apply uniformly.
+// This function takes no Config; use UnmarshalMapWithConfig to select a
+// DuplicateKeyPolicy, limits, validation, and expansion settings.
 //
 // Example:
 //
@@ -326,69 +325,93 @@ func UnmarshalMap(data string, format ...FileFormat) (map[string]string, error) 
 		f = detectDataFormat(data)
 	}
 
-	switch f {
-	case FormatJSON:
-		return unmarshalJSON(data)
-	case FormatYAML:
-		return unmarshalYAML(data)
-	default:
-		return parseString(data)
-	}
+	return UnmarshalMapWithConfig(DefaultConfig(), data, f)
 }
 
-// unmarshalJSON parses a JSON string into a map.
-func unmarshalJSON(data string) (map[string]string, error) {
-	if data == "" {
-		return make(map[string]string), nil
+// UnmarshalMapWithConfig parses a formatted string into a map[string]string
+// with the same semantics a Loader built from the same Config applies to a
+// single loaded file: LimitsConfig (file size, line/key/value length,
+// variable count), ParsingConfig (duplicate-key policy; variable expansion,
+// which applies to .env input only — JSON and YAML values are never
+// expanded), JSONConfig / YAMLConfig format options, ValidationConfig (key
+// and value rules, RequiredKeys), and ComponentConfig (custom validator /
+// expander / auditor; Prefix filters the parsed keys, with the same rule as
+// file loading) all take effect. The format parameter is optional and
+// defaults to FormatEnv; FormatAuto is detected from the data, like
+// UnmarshalMap.
+//
+// cfg follows the standard zero-value contract: a fully zero Config means
+// DefaultConfig(); a partially-set Config is rejected with ErrInvalidConfig
+// — always start from DefaultConfig().
+//
+// FileConfig (Filenames, FailOnMissingFile, OverwriteExisting, AutoApply)
+// has no one-shot counterpart and is ignored.
+//
+// UnmarshalMap is the no-config shortcut that runs this same DefaultConfig
+// pipeline for every format (SEC-002). Prefer this function when a custom
+// DuplicateKeyPolicy, limits, validation, or expansion settings are needed.
+//
+// Example:
+//
+//	cfg := env.DefaultConfig()
+//	cfg.ParsingConfig.DuplicateKeyPolicy = env.DuplicateKeyError
+//	m, err := env.UnmarshalMapWithConfig(cfg, yamlData, env.FormatYAML)
+func UnmarshalMapWithConfig(cfg Config, data string, format ...FileFormat) (map[string]string, error) {
+	f := FormatEnv
+	if len(format) > 0 {
+		f = format[0]
+	}
+	if f == FormatAuto {
+		f = detectDataFormat(data)
 	}
 
-	cfg := internal.JSONFlattenConfig{
-		KeyDelimiter:     "_",
-		ArrayIndexFormat: "underscore",
-		NullAsEmpty:      true,
-		NumberAsString:   true,
-		BoolAsString:     true,
-		MaxDepth:         defaultStructuredMaxDepth,
+	if cfg.IsZero() {
+		cfg = DefaultConfig()
+	}
+	if err := cfg.Validate(); err != nil {
+		return nil, fmt.Errorf("%w: %w", ErrInvalidConfig, err)
 	}
 
-	result, err := internal.FlattenJSON([]byte(data), cfg)
+	// Build components and parsers through the same path a Loader uses
+	// (New → buildComponentFactoryWithFS → createParsers), so parsing
+	// behavior is identical to loading one file through a Loader built
+	// from cfg.
+	factory := cfg.buildComponentFactoryWithFS(cfg.FileSystem)
+	defer func() { _ = factory.Close() }() // best-effort cleanup of the audit handler
+
+	parsers, err := createParsers(cfg, factory)
 	if err != nil {
 		return nil, err
 	}
 
-	return result, nil
-}
-
-// unmarshalYAML parses a YAML string into a map.
-func unmarshalYAML(data string) (map[string]string, error) {
-	if data == "" {
-		return make(map[string]string), nil
+	p, ok := parsers[f]
+	if !ok || p == nil {
+		// Mirror LoadFiles: unknown formats fall back to the .env parser.
+		p = parsers[FormatEnv]
+	}
+	if p == nil {
+		return nil, fmt.Errorf("no parser available for format %v", f)
 	}
 
-	cfg := internal.YAMLFlattenConfig{
-		KeyDelimiter:     "_",
-		ArrayIndexFormat: "underscore",
-		NullAsEmpty:      true,
-		NumberAsString:   true,
-		BoolAsString:     true,
-		MaxDepth:         defaultStructuredMaxDepth,
-	}
-
-	value, err := internal.ParseYAML([]byte(data), cfg.MaxDepth)
-	if err != nil {
-		return nil, err
-	}
-	// ParseYAML's contract requires the caller to return the node tree to
-	// the pool; FlattenYAML copies scalars into independent strings, so the
-	// result does not alias the tree (same pattern as the YAML file parser).
-	defer internal.ReleaseValue(value)
-
-	result, err := internal.FlattenYAML(value, cfg)
+	vars, err := p.Parse(strings.NewReader(data), "")
 	if err != nil {
 		return nil, err
 	}
 
-	return result, nil
+	// Apply the prefix filter with the same rule as file loading
+	// (loadFileLocked): uppercase prefix, case-insensitive match.
+	if cfg.Prefix != "" {
+		upperPrefix := internal.ToUpperASCII(cfg.Prefix)
+		filtered := make(map[string]string, len(vars))
+		for key, value := range vars {
+			if internal.HasUpperPrefix(key, upperPrefix) {
+				filtered[key] = value
+			}
+		}
+		vars = filtered
+	}
+
+	return vars, nil
 }
 
 // IsMarshalError checks if an error is a marshaling error.
@@ -418,6 +441,13 @@ type Unmarshaler interface {
 // Fields whose value marshals to an empty string — empty strings, nil
 // pointers, and empty slices — are omitted from the output. Scalar zero
 // values are kept ("0", "false"), since they do not marshal to "".
+//
+// Struct-kind fields implementing encoding.TextMarshaler (e.g. time.Time)
+// serialize via MarshalText as scalar leaves instead of field recursion.
+//
+// Cyclic values (a pointer field reaching back into the value graph) are
+// rejected with a *MarshalError: nesting depth is capped instead of
+// recursing without bound.
 func MarshalStruct(v any) (map[string]string, error) {
 	// Check for Marshaler interface
 	if m, ok := v.(Marshaler); ok {
@@ -459,9 +489,48 @@ func UnmarshalStruct(data string, v any, format ...FileFormat) error {
 	return UnmarshalInto(m, v)
 }
 
+// UnmarshalStructWithConfig parses a formatted string and populates the
+// struct under cfg — the config-driven counterpart of UnmarshalStruct.
+// Every parsing rule of UnmarshalMapWithConfig applies (limits,
+// duplicate-key policy, expansion, validation, custom components); see its
+// documentation for the fields that are honored and ignored. The format
+// parameter is optional and defaults to FormatEnv; FormatAuto is detected
+// from the data.
+//
+// Example:
+//
+//	cfg := env.DefaultConfig()
+//	cfg.ParsingConfig.DuplicateKeyPolicy = env.DuplicateKeyError
+//	var out Config
+//	if err := env.UnmarshalStructWithConfig(cfg, yamlData, &out, env.FormatYAML); err != nil {
+//	    log.Fatal(err)
+//	}
+func UnmarshalStructWithConfig(cfg Config, data string, v any, format ...FileFormat) error {
+	m, err := UnmarshalMapWithConfig(cfg, data, format...)
+	if err != nil {
+		return err
+	}
+	return UnmarshalInto(m, v)
+}
+
 // UnmarshalInto populates a struct from a map[string]string.
 // Struct fields can be tagged with `env:"KEY"` to specify the env variable name.
 // Optional `envDefault:"value"` sets a default if the key is not found.
+//
+// Slice fields are populated by splitting the value on commas. For STRING
+// slices, empty elements are preserved as empty entries ("a,,b" yields three
+// elements); for numeric and boolean slices an empty element is a conversion
+// error (there is no "zero-valued" spelling of "" for strconv). This differs
+// from GetSlice, which skips empty elements when parsing comma-separated
+// fallback values.
+//
+// Struct-kind fields implementing encoding.TextUnmarshaler (e.g. time.Time,
+// matched through the pointer method set) are populated via UnmarshalText;
+// invalid text is a *MarshalError.
+//
+// Cyclic structures are rejected with a *MarshalError: nesting depth is
+// capped, so a self-referential struct type returns an error instead of
+// recursing (and allocating) without bound.
 func UnmarshalInto(data map[string]string, v any) error {
 	if v == nil {
 		return &ValidationError{
@@ -476,7 +545,7 @@ func UnmarshalInto(data map[string]string, v any) error {
 	}
 
 	val := reflect.ValueOf(v)
-	if val.Kind() != reflect.Ptr || val.IsNil() {
+	if val.Kind() != reflect.Pointer || val.IsNil() {
 		return &ValidationError{
 			Field:   "value",
 			Message: "expected non-nil pointer",
@@ -502,15 +571,19 @@ func UnmarshalInto(data map[string]string, v any) error {
 // All parse failures are reported as *ValidationError for consistent error
 // handling by callers (the previous version returned a mix of raw strconv
 // errors and ValidationError depending on the type).
+//
+// Strings are returned UNTRIMMED: whether whitespace is significant is a
+// quoting decision only the caller can make (a quoted comma-separated
+// element preserves it, an unquoted one does not), and numeric parsing
+// below trims internally as before.
 func parseSliceElement[T sliceElement](value string) (T, error) {
 	var zero T
 
-	// Trim whitespace for consistent behavior across all types
 	trimmed := internal.TrimSpace(value)
 
 	switch any(zero).(type) {
 	case string:
-		return any(trimmed).(T), nil
+		return any(value).(T), nil
 	case int:
 		n, e := strconv.Atoi(trimmed)
 		if e != nil {
@@ -569,11 +642,17 @@ func parseCommaSeparated[T sliceElement](value string, defaultValue ...[]T) []T 
 		return nil
 	}
 
-	parts := strings.Split(value, ",")
+	parts, quoted := internal.SplitQuotedCommaParts(value)
 	result := make([]T, 0, len(parts))
 
-	for _, part := range parts {
-		part = strings.TrimSpace(part)
+	for i, part := range parts {
+		// Trim only unquoted elements, matching the struct-mapping path
+		// (setSliceValue): grouping quotes exist to preserve significant
+		// leading/trailing whitespace, so a blanket trim here made GetSlice
+		// disagree with UnmarshalStruct on the same Marshal output.
+		if !quoted[i] {
+			part = strings.TrimSpace(part)
+		}
 		if part == "" {
 			continue
 		}

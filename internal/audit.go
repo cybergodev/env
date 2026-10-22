@@ -1,4 +1,5 @@
-// Package internal provides audit logging functionality.
+// Provides audit logging functionality.
+
 package internal
 
 import (
@@ -49,8 +50,11 @@ type Event struct {
 	Reason    string    `json:"reason,omitempty"`
 	Success   bool      `json:"success"`
 	Masked    bool      `json:"masked,omitempty"`
-	Details   string    `json:"details,omitempty"`
-	Duration  int64     `json:"duration_ns,omitempty"`
+	// Details is reserved free-form context. No Auditor method populates it
+	// today; the field is kept because Event is publicly aliased as
+	// env.AuditEvent and removing it would break that API.
+	Details  string `json:"details,omitempty"`
+	Duration int64  `json:"duration_ns,omitempty"`
 }
 
 // Handler defines the interface for audit log handlers.
@@ -78,12 +82,23 @@ func (h *JSONHandler) Log(event Event) error {
 	if err != nil {
 		return fmt.Errorf("failed to marshal audit event: %w", err)
 	}
-	_, err = h.writer.Write(append(data, '\n'))
-	return err
+	if _, err := h.writer.Write(append(data, '\n')); err != nil {
+		return fmt.Errorf("failed to write audit event: %w", err)
+	}
+	return nil
 }
 
 // Close implements Handler.
+//
+// The mutex is held across the close so Close serializes against a concurrent
+// Log. The Auditor's RWMutex already serializes handler.Log against
+// handler.Close, so the lock is redundant when the handler is used through an
+// Auditor — but a JSONHandler used directly (outside an Auditor) by multiple
+// goroutines previously raced here: Close closed the writer without taking
+// h.mu. Holding the lock makes the handler independently Close-safe.
 func (h *JSONHandler) Close() error {
+	h.mu.Lock()
+	defer h.mu.Unlock()
 	if closer, ok := h.writer.(io.Closer); ok {
 		return closer.Close()
 	}
@@ -117,7 +132,7 @@ func (h *LogHandler) Log(event Event) error {
 			event.Action, event.Success, event.Reason)
 	}
 	if event.File != "" {
-		msg += fmt.Sprintf(" file=%s", event.File)
+		msg += fmt.Sprintf(" file=%q", event.File)
 	}
 	if event.Duration > 0 {
 		if event.Duration < 1e6 {
@@ -143,7 +158,11 @@ func (h *LogHandler) Close() error {
 // the caller hasn't finished receiving.
 //
 // Blocking Behavior: This handler blocks if the channel buffer is full.
-// Use a buffered channel if non-blocking behavior is required.
+// Use a buffered channel if non-blocking behavior is required. A blocked
+// send is not just this event's problem: the Auditor holds its lock across
+// handler.Log, so one stuck send freezes every other Log* call AND
+// Auditor.Close() — and Close runs from Loader cleanup, hanging process
+// shutdown. Drain the channel for as long as the auditor is open.
 //
 // Example:
 //
@@ -165,13 +184,22 @@ type ChannelHandler struct {
 // NewChannelHandler creates a new ChannelHandler that sends events to the
 // provided channel. The caller retains ownership of the channel and must
 // close it when finished to signal EOF to receivers.
+//
+// ch must not be nil; Log on a handler constructed with a nil channel
+// returns an error for every event (a send on a nil channel would otherwise
+// block forever).
 func NewChannelHandler(ch chan<- Event) *ChannelHandler {
 	return &ChannelHandler{ch: ch}
 }
 
 // Log sends an audit event to the channel.
 // This method blocks if the channel is full.
+// A nil channel returns an error instead of blocking forever (a send on a
+// nil channel never completes).
 func (h *ChannelHandler) Log(event Event) error {
+	if h.ch == nil {
+		return fmt.Errorf("audit channel is nil; event dropped")
+	}
 	h.ch <- event
 	return nil
 }
@@ -210,6 +238,7 @@ type CloseableChannelHandler struct {
 	done      chan struct{} // closed in Close() to unblock Log() without panic
 	closeMu   sync.Mutex
 	closeOnce sync.Once // ensures done/ch are closed exactly once
+	dropped   atomic.Int64
 }
 
 // NewCloseableChannelHandler creates a new CloseableChannelHandler with a
@@ -247,6 +276,7 @@ func (h *CloseableChannelHandler) Log(event Event) error {
 
 	select {
 	case <-h.done:
+		h.dropped.Add(1)
 		return fmt.Errorf("handler is closed")
 	default:
 	}
@@ -257,6 +287,7 @@ func (h *CloseableChannelHandler) Log(event Event) error {
 		case h.ch <- event:
 			return nil
 		case <-h.done:
+			h.dropped.Add(1)
 			return fmt.Errorf("handler is closed")
 		}
 	}
@@ -266,8 +297,17 @@ func (h *CloseableChannelHandler) Log(event Event) error {
 	case h.ch <- event:
 		return nil
 	default:
+		h.dropped.Add(1)
 		return fmt.Errorf("audit channel full, event dropped")
 	}
+}
+
+// DroppedEvents returns how many events this handler discarded — a full
+// buffer with no consumer, or sends attempted after Close (GEN-001: drops
+// were previously observable only through the returned error, which
+// best-effort callers discard). The counter never resets.
+func (h *CloseableChannelHandler) DroppedEvents() int64 {
+	return h.dropped.Load()
 }
 
 // Close implements Handler.
@@ -331,6 +371,19 @@ type Auditor struct {
 	isSensitive IsSensitiveFunc
 	enabled     atomic.Bool
 	mu          sync.RWMutex
+	// closed names the Close() state so SetEnabled(true) cannot resurrect a
+	// closed auditor (its handler's resources may already be released).
+	closed bool
+	// failClosed arms GEN-001 fail-closed semantics: handler failures then
+	// latch the first error for TakeFailure instead of being silently
+	// discarded by the caller.
+	failClosed atomic.Bool
+	failureMu  sync.Mutex
+	failureErr error
+	// failures counts audit events that never reached their handler
+	// (handler error, panic, or full channel) regardless of fail-closed
+	// mode, so operators can detect a broken audit pipeline.
+	failures atomic.Int64
 }
 
 // auditEventPool provides a pool of reusable Event structs.
@@ -394,10 +447,20 @@ func NewAuditor(handler Handler, isSensitive IsSensitiveFunc, masker MaskerFunc,
 func (a *Auditor) logEvent(event *Event, key string) error {
 	event.Timestamp = time.Now()
 	// Compute the sensitive flag from the original key before masking.
-	event.Masked = key != "" && a.isSensitive(key)
+	event.Masked = key != "" && a.safeIsSensitive(key)
 	event.Key = a.maskKey(key)
 	err := safeHandlerLog(a.handler, *event)
 	putAuditEvent(event)
+	if err != nil {
+		a.failures.Add(1)
+		if a.failClosed.Load() {
+			a.failureMu.Lock()
+			if a.failureErr == nil {
+				a.failureErr = err
+			}
+			a.failureMu.Unlock()
+		}
+	}
 	return err
 }
 
@@ -496,10 +559,16 @@ func (a *Auditor) LogError(action Action, key, errMsg string) error {
 	return a.Log(action, key, errMsg, false)
 }
 
-// SetEnabled enables or disables audit logging.
+// SetEnabled enables or disables audit logging. Re-enabling a CLOSED
+// auditor is a no-op: the underlying handler's resources (e.g. an open
+// file) may already be released, and resuming writes to them was a
+// use-after-close hazard (GEN-001).
 func (a *Auditor) SetEnabled(enabled bool) {
 	a.mu.Lock()
 	defer a.mu.Unlock()
+	if a.closed && enabled {
+		return
+	}
 	a.enabled.Store(enabled)
 }
 
@@ -512,14 +581,49 @@ func (a *Auditor) IsEnabled() bool {
 
 // Close closes the underlying handler and disables further logging.
 // Subsequent Log* calls become no-ops instead of writing to a handler
-// whose resources (e.g. an underlying file) may already be released.
-// SetEnabled(true) can re-enable logging on a closed auditor if the
-// handler remains usable.
+// whose resources (e.g. an underlying file) may already be released, and
+// SetEnabled(true) can no longer re-enable the closed auditor.
+//
+// Close takes the same mutex logEvent holds across handler.Log, so a
+// handler stuck inside Log — a ChannelHandler blocked on a full channel
+// with no consumer — also freezes Close(): Loader cleanup then blocks and
+// process shutdown hangs. Keep channel consumers draining (or bound sends)
+// for as long as the auditor is open.
 func (a *Auditor) Close() error {
 	a.mu.Lock()
 	defer a.mu.Unlock()
 	a.enabled.Store(false)
+	a.closed = true
 	return safeHandlerClose(a.handler)
+}
+
+// SetFailClosed arms or disarms fail-closed auditing. When armed, the
+// first failed Log* call (handler error, handler panic, or dropped
+// channel event) latches its error; TakeFailure then reports it so
+// compliance-critical callers can fail the operation whose audit trail
+// was lost. Disarming does not clear an already-latched failure.
+func (a *Auditor) SetFailClosed(on bool) {
+	a.failClosed.Store(on)
+}
+
+// TakeFailure returns and clears the latched audit failure. It returns nil
+// when no failure was latched (or fail-closed mode was never armed). The
+// root Loader calls this at the end of its top-level operations when
+// Config.AuditFailClosed is set.
+func (a *Auditor) TakeFailure() error {
+	a.failureMu.Lock()
+	defer a.failureMu.Unlock()
+	err := a.failureErr
+	a.failureErr = nil
+	return err
+}
+
+// Failures returns how many audit events never reached their handler
+// (handler error, panic, or full channel) since the auditor was created,
+// regardless of fail-closed mode. A non-zero value on a healthy system
+// indicates a broken or overloaded audit pipeline.
+func (a *Auditor) Failures() int64 {
+	return a.failures.Load()
 }
 
 // maskKey masks a key for audit logging.
@@ -527,10 +631,35 @@ func (a *Auditor) maskKey(key string) string {
 	if key == "" {
 		return ""
 	}
-	if a.isSensitive(key) {
-		return a.masker(key, key)
+	if a.safeIsSensitive(key) {
+		return a.safeMaskSensitive(key, key)
 	}
 	return key
+}
+
+// safeIsSensitive applies the isSensitive callback with panic protection,
+// mirroring safeHandlerLog/safeHandlerClose: the callback is user-supplied
+// (wired from Config) and a panicking one fails SAFE — the key is treated
+// as sensitive and gets masked.
+func (a *Auditor) safeIsSensitive(key string) (sensitive bool) {
+	defer func() {
+		if r := recover(); r != nil {
+			sensitive = true
+		}
+	}()
+	return a.isSensitive(key)
+}
+
+// safeMaskSensitive applies the masker callback with panic protection; a
+// panicking custom masker falls back to hiding the value entirely rather
+// than leaking it.
+func (a *Auditor) safeMaskSensitive(key, value string) (masked string) {
+	defer func() {
+		if r := recover(); r != nil {
+			masked = "[MASKED]"
+		}
+	}()
+	return a.masker(key, value)
 }
 
 // DefaultHandler returns the default audit handler (writes to stderr).

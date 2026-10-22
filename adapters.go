@@ -11,9 +11,9 @@
 //
 // The remaining adapters handle cases where the public interface has more
 // methods than the minimal internal interface:
-//   - auditorAdapter: internal.Auditor → FullAuditLogger
-//   - validatorInterfaceWrapper: minimal validator → Validator (with ValidateRequired)
-//   - auditorInterfaceWrapper: minimal auditor → FullAuditLogger
+//   - validatorInterfaceWrapper: minimal KeyValidator → Validator (with ValidateRequired)
+//   - auditorInterfaceWrapper: minimal AuditLogger → FullAuditLogger
+
 package env
 
 import (
@@ -21,8 +21,6 @@ import (
 	"fmt"
 	"io"
 	"time"
-
-	"github.com/cybergodev/env/internal"
 )
 
 // ErrValidateRequiredUnsupported is returned when a custom validator
@@ -37,51 +35,10 @@ var ErrValidateRequiredUnsupported = errors.New(
 // Internal → Public Adapters (for extended interfaces)
 // ============================================================================
 
-// auditorAdapter adapts internal.Auditor to the public FullAuditLogger interface.
-// This adapter is used when the built-in internal.Auditor needs to be exposed
-// to users via the public API (e.g., Loader.Auditor()).
-type auditorAdapter struct {
-	auditor *internal.Auditor
-}
-
-// Compile-time check that auditorAdapter implements FullAuditLogger.
-var _ FullAuditLogger = (*auditorAdapter)(nil)
-
-// newAuditorAdapter creates a new FullAuditLogger from an internal.Auditor.
-func newAuditorAdapter(a *internal.Auditor) FullAuditLogger {
-	if a == nil {
-		return nil
-	}
-	return &auditorAdapter{auditor: a}
-}
-
-// Log implements AuditLogger.
-func (a *auditorAdapter) Log(action AuditAction, key, reason string, success bool) error {
-	return a.auditor.Log(internal.Action(action), key, reason, success)
-}
-
-// LogError implements AuditLogger.
-func (a *auditorAdapter) LogError(action AuditAction, key, errMsg string) error {
-	return a.auditor.LogError(internal.Action(action), key, errMsg)
-}
-
-// LogWithFile implements AuditLogger.
-func (a *auditorAdapter) LogWithFile(action AuditAction, key, file, reason string, success bool) error {
-	return a.auditor.LogWithFile(internal.Action(action), key, file, reason, success)
-}
-
-// LogWithDuration implements AuditLogger.
-func (a *auditorAdapter) LogWithDuration(action AuditAction, key, reason string, success bool, duration time.Duration) error {
-	return a.auditor.LogWithDuration(internal.Action(action), key, reason, success, duration)
-}
-
-// Close implements AuditLogger.
-func (a *auditorAdapter) Close() error {
-	if a == nil || a.auditor == nil {
-		return nil
-	}
-	return a.auditor.Close()
-}
+// Note: the built-in *internal.Auditor needs no adapter — with
+// AuditAction = internal.Action, it satisfies the public FullAuditLogger
+// interface directly (Log, LogError, LogWithFile, LogWithDuration, Close),
+// so buildAuditorAdapter returns it unwrapped.
 
 // validatorInterfaceWrapper adapts a minimal KeyValidator to the full Validator interface.
 // This adapter is used when a custom validator only implements KeyValidator

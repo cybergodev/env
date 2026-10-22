@@ -147,20 +147,149 @@ func TestSecureReaderResetLineOnNewline(t *testing.T) {
 }
 
 func TestSecureReaderErrorPersisted(t *testing.T) {
-	content := strings.Repeat("a", 200)
-	reader := NewSecureReader(strings.NewReader(content), 100, 1024)
+	t.Run("ErrFileTooLarge persisted", func(t *testing.T) {
+		content := strings.Repeat("a", 200)
+		reader := NewSecureReader(strings.NewReader(content), 100, 1024)
 
-	buf := make([]byte, 100)
-	// First read should trigger error
-	_, _ = reader.Read(buf) // state-shaping; the assertion below covers the persisted error
+		buf := make([]byte, 100)
+		// First read should trigger error
+		_, _ = reader.Read(buf) // state-shaping; the assertion below covers the persisted error
 
-	// Second read should return same error
-	buf2 := make([]byte, 100)
-	_, err := reader.Read(buf2)
+		// Second read should return same error
+		buf2 := make([]byte, 100)
+		_, err := reader.Read(buf2)
 
-	if err != ErrFileTooLarge {
-		t.Errorf("expected persistent error ErrFileTooLarge, got %v", err)
+		if err != ErrFileTooLarge {
+			t.Errorf("expected persistent error ErrFileTooLarge, got %v", err)
+		}
+	})
+
+	t.Run("ErrLineTooLong persisted", func(t *testing.T) {
+		content := strings.Repeat("a", 200) // one long line, no newline
+		reader := NewSecureReader(strings.NewReader(content), 1024, 10)
+
+		buf := make([]byte, 100)
+		if _, err := reader.Read(buf); err != ErrLineTooLong {
+			t.Fatalf("first Read error = %v, want ErrLineTooLong", err)
+		}
+		// r.err is sticky: the terminal error must survive subsequent reads.
+		if _, err := reader.Read(buf); err != ErrLineTooLong {
+			t.Errorf("subsequent Read error = %v, want persisted ErrLineTooLong", err)
+		}
+	})
+}
+
+// TestSecureReader_BytesDelivered covers the BytesDelivered accessor: after
+// every chunked Read it must equal the bytes actually delivered so far, and
+// at EOF it must equal the full content length.
+func TestSecureReader_BytesDelivered(t *testing.T) {
+	content := "one\ntwo\nthree\n"
+	reader := NewSecureReader(strings.NewReader(content), 1024, 1024)
+
+	var delivered int64
+	buf := make([]byte, 4) // smaller than the content to force multiple reads
+	for {
+		n, err := reader.Read(buf)
+		delivered += int64(n)
+		if got := reader.BytesDelivered(); got != delivered {
+			t.Fatalf("BytesDelivered() = %d after %d delivered bytes, want equal", got, delivered)
+		}
+		if err == io.EOF {
+			break
+		}
+		if err != nil {
+			t.Fatalf("Read() error = %v", err)
+		}
 	}
+	if delivered != int64(len(content)) {
+		t.Errorf("delivered %d bytes at EOF, want %d", delivered, len(content))
+	}
+}
+
+// TestSecureReader_ZeroLineLimit pins the maxLineLen==0 contract ("no line
+// limit", see the Read comment in secure.go): a single very long line passes
+// untouched, while the same input under a small limit is rejected.
+func TestSecureReader_ZeroLineLimit(t *testing.T) {
+	content := strings.Repeat("a", 4096) // one long line, no newline
+	buf := make([]byte, len(content))
+
+	unlimited := NewSecureReader(strings.NewReader(content), 8192, 0)
+	n, err := unlimited.Read(buf)
+	if err != nil {
+		t.Errorf("Read with maxLineLen 0 error = %v, want nil (no line limit)", err)
+	}
+	if n != len(content) {
+		t.Errorf("Read with maxLineLen 0 = %d bytes, want %d", n, len(content))
+	}
+
+	limited := NewSecureReader(strings.NewReader(content), 8192, 64)
+	if _, err := limited.Read(buf); err != ErrLineTooLong {
+		t.Errorf("Read with maxLineLen 64 error = %v, want ErrLineTooLong", err)
+	}
+}
+
+// TestSecureReader_NonPositiveMaxSize pins the behavior for maxSize <= 0: the
+// pre-read guard (totalRead >= maxSize) fires before any underlying I/O, so
+// the very first Read returns ErrFileTooLarge.
+func TestSecureReader_NonPositiveMaxSize(t *testing.T) {
+	for _, maxSize := range []int64{0, -1} {
+		reader := NewSecureReader(strings.NewReader("content"), maxSize, 64)
+		n, err := reader.Read(make([]byte, 8))
+		if err != ErrFileTooLarge {
+			t.Errorf("maxSize %d: Read error = %v, want ErrFileTooLarge", maxSize, err)
+		}
+		if n != 0 {
+			t.Errorf("maxSize %d: Read n = %d, want 0", maxSize, n)
+		}
+	}
+}
+
+// TestSecureReader_EmptyBuffer pins Read with a zero-length destination:
+// nothing is read (n == 0), no error, no panic.
+func TestSecureReader_EmptyBuffer(t *testing.T) {
+	reader := NewSecureReader(strings.NewReader("content"), 1024, 10)
+	n, err := reader.Read(nil)
+	if n != 0 {
+		t.Errorf("Read(nil) n = %d, want 0", n)
+	}
+	if err != nil {
+		t.Errorf("Read(nil) error = %v, want nil", err)
+	}
+}
+
+// TestSecureReader_CRLFLineCounting pins how the line scan treats CR: only
+// '\n' resets the counter (Read scans with bytes.IndexByte for '\n'), so a CR
+// counts toward the current line's length — a CRLF line whose visible
+// characters exactly hit maxLineLen trips the limit, and a bare CR never
+// splits a line.
+func TestSecureReader_CRLFLineCounting(t *testing.T) {
+	t.Run("CRLF within limit passes", func(t *testing.T) {
+		content := "012345678\r\n" // 9 visible chars; CR is the 10th byte before \n
+		reader := NewSecureReader(strings.NewReader(content), 1024, 10)
+		n, err := reader.Read(make([]byte, len(content)))
+		if err != nil {
+			t.Errorf("Read error = %v, want nil", err)
+		}
+		if n != len(content) {
+			t.Errorf("Read n = %d, want %d", n, len(content))
+		}
+	})
+
+	t.Run("CRLF at exact visible limit trips limit", func(t *testing.T) {
+		content := "0123456789\r\n" // 10 visible chars + CR = 11 bytes before \n
+		reader := NewSecureReader(strings.NewReader(content), 1024, 10)
+		if _, err := reader.Read(make([]byte, len(content))); err != ErrLineTooLong {
+			t.Errorf("Read error = %v, want ErrLineTooLong (CR counts toward line length)", err)
+		}
+	})
+
+	t.Run("bare CR is not a terminator", func(t *testing.T) {
+		content := "01234\r56789\n" // two 5-char halves only if CR terminated lines
+		reader := NewSecureReader(strings.NewReader(content), 1024, 10)
+		if _, err := reader.Read(make([]byte, len(content))); err != ErrLineTooLong {
+			t.Errorf("Read error = %v, want ErrLineTooLong (only \\n resets the counter)", err)
+		}
+	})
 }
 
 // ============================================================================

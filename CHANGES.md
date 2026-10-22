@@ -4,6 +4,62 @@ All notable changes to the cybergodev/env library will be documented in this fil
 
 ---
 
+## v1.3.0 - Security Hardening, Duplicate-Key Policy & YAML Correctness (2026-10-22)
+
+### Added
+- `env.Overload()` — godotenv-convention initializer: later files win shared keys and file values replace process-environment variables
+- `UnmarshalMapWithConfig` / `UnmarshalStructWithConfig` — one-shot parsing with full `Config` semantics (limits, duplicate policy, validation, prefix)
+- `ParsingConfig.DuplicateKeyPolicy` (`Inherit`/`FirstWins`/`LastWins`/`Error`) — per-document duplicate-key handling for `.env`/YAML; duplicate-bearing JSON always errors, clean documents load unchanged
+- `ComponentConfig.AuditFailClosed` + `ErrAuditFailed` — opt-in fail-closed auditing: `LoadFiles`/`Apply`/`Set` fail when an audit event is lost
+- `Auditor.SetFailClosed`/`TakeFailure`/`Failures` and `CloseableChannelHandler.DroppedEvents` — lost-audit-event observability
+- YAML block scalars (`|`/`>` with chomp and explicit-indent indicators) — multi-line values such as certificates and keys load verbatim
+- YAML flow collections (`[a, b]`, `{x: 1}`) flatten into indexed/prefixed keys instead of being stored as raw text
+- `${VAR:=default}` assigns the expanded default POSIX-style when the variable is unset everywhere
+- Permanent fuzz targets for all three parsers (`FuzzParseEnv`/`FuzzParseJSON`/`FuzzParseYAML`)
+- CI pipeline: vet + race tests on an Ubuntu/Windows matrix, golangci-lint with gosec, coverage gate ≥ 90%
+- Examples 12 (extensibility) and 13 (customization) — the 13-example suite now demonstrates the full public API
+
+### Fixed
+- Cyclic and self-referential struct types no longer crash `ParseInto`/`UnmarshalStruct`/`MarshalStruct` with fatal OOM — recursion is depth-capped and returns `*MarshalError`
+- `time.Time` and other `TextMarshaler`/`TextUnmarshaler` struct fields round-trip through struct mapping (previously silent no-ops in both directions)
+- Dotted top-level keys (`apnews.com`) resolve through `Lookup`/`GetString`/`GetSecure`/`GetSliceFrom` — the literal key is probed before dot-notation candidates
+- YAML values embedding `": "` inside inline JSON (cookie-style nested objects) no longer corrupt the whole file
+- `ParseInto` no longer self-deadlocks when a user `UnmarshalText`/`UnmarshalEnv` callback re-enters `Set`/`Delete`/`Close`
+- `GetSliceFrom`'s default no longer shadows data stored under uppercase or dot-notation candidate keys
+- False "cycle detected" failures eliminated — single-colon `${VAR:x}` references, literal single-quoted keys, and unused default text no longer close phantom cycles
+- `.env` quoted values accept trailing `# comments`; unknown double-quoted escapes keep their backslash (`C:\Users\foo` no longer loses `\`)
+- UTF-8 BOM stripped at every read entry point (Windows editors and `Out-File` output load cleanly)
+- Windows path hardening: reserved device names (`CON`, `NUL.txt`) rejected in every component, NTFS alternate data streams (`file.env:stream`) rejected, backslash-rooted paths (`\etc\passwd`) rejected on all platforms
+- Filenames containing interior `..` (`my..file.env`) load — traversal detection is now per-component
+- YAML indentation is column-based — odd-width indents (a 1-space child) nest correctly instead of silently re-parenting keys
+- `Set` with `AutoApply` stores the value only after `Setenv` succeeds (failed sets stay retryable); `Delete` reports `Unsetenv` failures instead of swallowing them
+- `Loader.Close` closes custom parsers implementing `io.Closer` (previously leaked for the loader's lifetime)
+- A zero-value `Loader` behaves like a closed loader instead of panicking; a panicking `ParserFactory` callback becomes a creation error instead of a crash
+- `[]string` elements containing commas, quotes, or significant whitespace round-trip through `Marshal`/`ParseInto`
+- `float32` struct fields format and parse at their own bit width (`0.1` no longer prints float64 digits)
+- Duplicate `.env` lines no longer trip `MaxVariables` — the limit counts distinct keys
+- `Config.IsZero` covers every field — partially-set configs are no longer silently replaced by `DefaultConfig` (pinned by a reflection test)
+- `AuditEnabled=false` now also gates `Set`/`Delete` audit events, matching the documented contract
+
+### Changed
+- Default limits raised for realistic configs: `MaxKeyLength` 64→128, `MaxVariables` 500→1000, `MaxFileSize` 2MB→8MB, `MaxLineLength`/`MaxValueLength` 1024/4096→8192, structured nesting depth 10→16 (hard caps unchanged)
+- `Set` accepts the structured key space — dotted keys like `service.host-name` set like their YAML/JSON counterparts (custom `KeyPattern` still governs; `PATH`/`LD_PRELOAD` stay forbidden)
+- Variable expansion applies to `.env` values only — JSON and YAML documents never expand (now stated consistently across godoc and README)
+- `Marshal` round-trip fidelity: `null`/`~` and `$`-bearing values are quoted/escaped, and JSON marshaling preserves non-canonical number strings (`007`, `1e3`) verbatim
+- One loose boolean grammar across typed getters and struct mapping — `DEBUG=yes` parses in both
+- Audit hardening: `SetEnabled` after `Close` is a no-op, `JSONHandler.Close` is independently race-safe, and handler write failures surface with context
+- `docs/SECURITY.md` discloses the `SecureValue` protection scope — unlocked string copies, lock/zero windows, dump exposure, and masking side channels
+- Configuration style contract documented: `Config` is the single configuration channel, with zero-value vs partially-set semantics and the process-global knobs enumerated
+- Test suite deduplicated and table-driven; combined coverage 95.9% → 97.9%
+
+### Performance
+- Intern front cache (lock-free direct-mapped slots) plus token-queue and value-node pooling: nested YAML parse -62% B/op, -25% allocs/op
+- Scoped scanner-buffer clearing (only the region that held file content): `Parser_SmallFile` -22.7% time
+- Single-allocation uppercase flat-key joins: `YAMLParser_Nested` -15.5% and `JSONParser_Nested` -16.1% allocs/op
+- secureMap shards 8→32 (`Loader_ConcurrentGet` -42%), word-at-a-time value validation, and a registry fast path for parser construction
+
+---
+
 ## v1.2.3 - Security Hardening, Correctness & Performance (2026-09-07)
 
 ### Breaking

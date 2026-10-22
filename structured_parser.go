@@ -1,6 +1,7 @@
 package env
 
 import (
+	"bytes"
 	"errors"
 	"fmt"
 	"io"
@@ -9,6 +10,10 @@ import (
 
 	"github.com/cybergodev/env/internal"
 )
+
+// utf8BOM is the UTF-8 byte-order mark stripped from structured documents
+// before parsing (see structuredParseResult).
+var utf8BOM = []byte{0xEF, 0xBB, 0xBF}
 
 // readerBufferPool provides reusable read buffers for structured parsers.
 // io.ReadAll starts at 512 bytes and doubles, which costs ~a dozen growth
@@ -63,6 +68,10 @@ func readAllInto(buf []byte, r io.Reader) ([]byte, error) {
 			}
 			grown := make([]byte, len(buf), newCap)
 			copy(grown, buf)
+			// SECURITY (SEC-008): the old array holds raw, unmasked file
+			// content (possibly secrets); clear it before it is discarded so a
+			// plaintext copy does not linger in memory until GC.
+			clear(buf)
 			buf = grown
 		}
 		n, err := r.Read(buf[len(buf):cap(buf)])
@@ -83,6 +92,27 @@ type structuredParserConfig struct {
 	auditor   FullAuditLogger
 }
 
+// newStructuredParserConfig assembles the shared structured-parser wiring
+// from a Config and factory — previously copy-pasted in both format
+// constructor wrappers.
+func newStructuredParserConfig(cfg Config, factory *ComponentFactory) structuredParserConfig {
+	return structuredParserConfig{
+		config:    cfg,
+		validator: factory.Validator(),
+		auditor:   factory.Auditor(),
+	}
+}
+
+// normalizeStructuredDepth applies the shared depth fallback for the
+// JSONMaxDepth/YAMLMaxDepth fields (<= 0 means the structured default) —
+// previously duplicated in both format constructors.
+func normalizeStructuredDepth(depth int) int {
+	if depth <= 0 {
+		return defaultStructuredMaxDepth
+	}
+	return depth
+}
+
 // structuredParseResult wraps common SecureReader + validation logic for JSON and YAML parsers.
 // flattenFn receives raw bytes and returns the flattened key-value map.
 func (c *structuredParserConfig) structuredParseResult(
@@ -97,6 +127,11 @@ func (c *structuredParserConfig) structuredParseResult(
 	}
 
 	secureRd := internal.NewSecureReader(r, c.config.MaxFileSize, c.config.MaxLineLength)
+	// Return the pooled reader on every path, matching the .env parser
+	// (parser.go). Without this, each JSON/YAML parse dropped one pooled
+	// SecureReader struct instead of recycling it, and NewSecureReader's
+	// "must be returned to the pool" contract was silently violated.
+	defer internal.ReleaseSecureReader(secureRd)
 	bufPtr := getReaderBuffer()
 	data, err := readAllInto((*bufPtr)[:0], secureRd)
 	// Track the (possibly grown, possibly partially-filled) slice back through
@@ -109,15 +144,28 @@ func (c *structuredParserConfig) structuredParseResult(
 	defer putReaderBuffer(bufPtr)
 	if err != nil {
 		if errors.Is(err, internal.ErrFileTooLarge) || errors.Is(err, internal.ErrLineTooLong) {
-			_ = c.auditor.LogError(internal.ActionParse, "", "file exceeds size limit")
+			_ = c.auditor.LogError(internal.ActionParse, "", err.Error())
 			return nil, &FileError{Path: filename, Op: "size_check", Err: err}
 		}
+		// Generic read failures were previously invisible to the audit
+		// trail entirely (the .env parser logs its equivalents).
+		_ = c.auditor.LogError(internal.ActionParse, "", "read failed: "+MaskSensitiveInString(err.Error()))
 		return nil, err
 	}
 
+	// Strip a leading UTF-8 BOM (EF BB BF): Windows editors prepend one by
+	// default; json.Unmarshal rejects a BOM-prefixed document outright and
+	// the YAML lexer would fold the bytes into the first key. Quoted values
+	// elsewhere in the document are unaffected — only the byte-order mark
+	// at offset 0 is removed.
+	data = bytes.TrimPrefix(data, utf8BOM)
+
 	result, err := flattenFn(data)
 	if err != nil {
-		_ = c.auditor.LogError(internal.ActionParse, "", "invalid "+formatName)
+		// Carry the cause (masked): an operator relying on the audit stream
+		// previously saw a bare "invalid JSON"/"invalid YAML" with no hint
+		// whether it was syntax, a flat-key collision, or depth.
+		_ = c.auditor.LogError(internal.ActionParse, "", "invalid "+formatName+": "+MaskSensitiveInString(err.Error()))
 		return nil, err
 	}
 
@@ -186,6 +234,16 @@ func (c *structuredParserConfig) validateResult(result map[string]string, format
 		}
 		if c.config.ValidateValues {
 			if err := c.validator.ValidateValue(val); err != nil {
+				_ = c.auditor.LogError(internal.ActionParse, key, err.Error())
+				return err
+			}
+		} else if bv, ok := c.validator.(basicValueValidator); ok {
+			// Fail-closed baseline: value checks run on structured loads even
+			// with ValidateValues disabled, at parity with the .env parse
+			// path (which validates unconditionally). For the built-in
+			// validator the baseline equals the full check; UTF-8 follows the
+			// ValidateUTF8 flag alone.
+			if err := bv.ValidateValueBasic(val); err != nil {
 				_ = c.auditor.LogError(internal.ActionParse, key, err.Error())
 				return err
 			}

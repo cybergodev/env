@@ -1,7 +1,6 @@
 package env
 
 import (
-	"bytes"
 	"fmt"
 	"os"
 	"strings"
@@ -19,7 +18,7 @@ func generateEnvContent(numVars int) string {
 	var sb strings.Builder
 	sb.Grow(numVars * 50)
 	for i := 0; i < numVars; i++ {
-		sb.WriteString(fmt.Sprintf("VAR_%d=\"value_%d_with_some_longer_content_%d\"\n", i, i, i))
+		_, _ = fmt.Fprintf(&sb, "VAR_%d=\"value_%d_with_some_longer_content_%d\"\n", i, i, i) // builder writes cannot fail
 	}
 	return sb.String()
 }
@@ -31,152 +30,105 @@ func generateEnvContentWithExpansion(numVars int) string {
 	sb.WriteString("BASE_URL=\"https://api.example.com\"\n")
 	sb.WriteString("API_KEY=\"secret-key-12345\"\n")
 	for i := 0; i < numVars; i++ {
-		if i%3 == 0 {
-			sb.WriteString(fmt.Sprintf("VAR_%d=\"${BASE_URL}/endpoint/%d\"\n", i, i))
-		} else if i%3 == 1 {
-			sb.WriteString(fmt.Sprintf("VAR_%d=\"$API_KEY-token-%d\"\n", i, i))
-		} else {
-			sb.WriteString(fmt.Sprintf("VAR_%d=\"simple_value_%d\"\n", i, i))
+		switch i % 3 { // builder writes cannot fail
+		case 0:
+			_, _ = fmt.Fprintf(&sb, "VAR_%d=\"${BASE_URL}/endpoint/%d\"\n", i, i)
+		case 1:
+			_, _ = fmt.Fprintf(&sb, "VAR_%d=\"$API_KEY-token-%d\"\n", i, i)
+		default:
+			_, _ = fmt.Fprintf(&sb, "VAR_%d=\"simple_value_%d\"\n", i, i)
 		}
 	}
 	return sb.String()
+}
+
+// benchParse builds a loader from cfg and runs one parser.Parse pass over
+// content per iteration. The former per-size benchmark functions each
+// duplicated this body with only the fixture and config differing.
+func benchParse(b *testing.B, format FileFormat, filename, content string, cfg Config) {
+	loader, err := New(cfg)
+	if err != nil {
+		b.Fatal(err)
+	}
+	defer func() { _ = loader.Close() }() // best-effort cleanup
+
+	parser := loader.parsers[format]
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		if _, err := parser.Parse(strings.NewReader(content), filename); err != nil {
+			b.Fatal(err)
+		}
+	}
 }
 
 // ============================================================================
 // Parser Benchmarks
 // ============================================================================
 
-func BenchmarkParser_SmallFile(b *testing.B) {
-	content := generateEnvContent(10)
-	cfg := DefaultConfig()
-	loader, err := New(cfg)
-	if err != nil {
-		b.Fatal(err)
-	}
-	defer loader.Close()
-
-	b.ResetTimer()
-	for i := 0; i < b.N; i++ {
-		r := strings.NewReader(content)
-		parser := loader.parsers[FormatEnv]
-		_, err := parser.Parse(r, "benchmark.env")
-		if err != nil {
-			b.Fatal(err)
-		}
-	}
-}
-
-func BenchmarkParser_MediumFile(b *testing.B) {
-	content := generateEnvContent(100)
-	cfg := DefaultConfig()
-	loader, err := New(cfg)
-	if err != nil {
-		b.Fatal(err)
-	}
-	defer loader.Close()
-
-	b.ResetTimer()
-	for i := 0; i < b.N; i++ {
-		r := strings.NewReader(content)
-		parser := loader.parsers[FormatEnv]
-		_, err := parser.Parse(r, "benchmark.env")
-		if err != nil {
-			b.Fatal(err)
-		}
-	}
-}
-
-func BenchmarkParser_LargeFile(b *testing.B) {
-	content := generateEnvContent(500)
-	cfg := DefaultConfig()
-	cfg.MaxVariables = 1000 // Increase limit for large file test
-	loader, err := New(cfg)
-	if err != nil {
-		b.Fatal(err)
-	}
-	defer loader.Close()
-
-	b.ResetTimer()
-	for i := 0; i < b.N; i++ {
-		r := strings.NewReader(content)
-		parser := loader.parsers[FormatEnv]
-		_, err := parser.Parse(r, "benchmark.env")
-		if err != nil {
-			b.Fatal(err)
-		}
-	}
-}
-
-func BenchmarkParser_WithExpansion(b *testing.B) {
-	content := generateEnvContentWithExpansion(100)
-	cfg := DefaultConfig()
-	cfg.ExpandVariables = true
-	cfg.MaxVariables = 200 // Increase limit for expansion test
-	loader, err := New(cfg)
-	if err != nil {
-		b.Fatal(err)
-	}
-	defer loader.Close()
-
-	b.ResetTimer()
-	for i := 0; i < b.N; i++ {
-		r := strings.NewReader(content)
-		parser := loader.parsers[FormatEnv]
-		_, err := parser.Parse(r, "benchmark.env")
-		if err != nil {
-			b.Fatal(err)
-		}
-	}
+// BenchmarkParser measures .env parsing across file sizes and with variable
+// expansion enabled (the former SmallFile/MediumFile/LargeFile/WithExpansion
+// functions as sub-benchmarks).
+func BenchmarkParser(b *testing.B) {
+	b.Run("vars=10", func(b *testing.B) {
+		benchParse(b, FormatEnv, "benchmark.env", generateEnvContent(10), DefaultConfig())
+	})
+	b.Run("vars=100", func(b *testing.B) {
+		benchParse(b, FormatEnv, "benchmark.env", generateEnvContent(100), DefaultConfig())
+	})
+	b.Run("vars=500", func(b *testing.B) {
+		cfg := DefaultConfig()
+		cfg.MaxVariables = 1000
+		benchParse(b, FormatEnv, "benchmark.env", generateEnvContent(500), cfg)
+	})
+	b.Run("expansion", func(b *testing.B) {
+		cfg := DefaultConfig()
+		cfg.ExpandVariables = true
+		cfg.MaxVariables = 200
+		benchParse(b, FormatEnv, "benchmark.env", generateEnvContentWithExpansion(100), cfg)
+	})
 }
 
 // ============================================================================
 // Loader Benchmarks
 // ============================================================================
 
-func BenchmarkLoader_LoadFiles_Small(b *testing.B) {
-	content := generateEnvContent(10)
-	cfg := DefaultConfig()
-
-	const benchFile = "bench_loader_small.env"
-	if err := os.WriteFile(benchFile, []byte(content), 0600); err != nil {
-		b.Fatal(err)
+// BenchmarkLoader_LoadFiles measures the full New+LoadFiles+Close cycle from
+// a file on disk (the former Small/Medium functions as sub-benchmarks).
+func BenchmarkLoader_LoadFiles(b *testing.B) {
+	sizes := []struct {
+		name     string
+		numVars  int
+		maxVars  int // 0: keep the DefaultConfig value
+		benchTag string
+	}{
+		{"small", 10, 0, "small"},
+		{"medium", 100, 200, "medium"},
 	}
-	defer os.Remove(benchFile)
+	for _, sz := range sizes {
+		b.Run(sz.name, func(b *testing.B) {
+			cfg := DefaultConfig()
+			if sz.maxVars > 0 {
+				cfg.MaxVariables = sz.maxVars
+			}
 
-	b.ResetTimer()
-	for i := 0; i < b.N; i++ {
-		loader, err := New(cfg)
-		if err != nil {
-			b.Fatal(err)
-		}
-		if err := loader.LoadFiles(benchFile); err != nil {
-			b.Fatal(err)
-		}
-		loader.Close()
-	}
-}
+			benchFile := "bench_loader_" + sz.benchTag + ".env"
+			if err := os.WriteFile(benchFile, []byte(generateEnvContent(sz.numVars)), 0600); err != nil {
+				b.Fatal(err)
+			}
+			defer func() { _ = os.Remove(benchFile) }() // best-effort cleanup
 
-func BenchmarkLoader_LoadFiles_Medium(b *testing.B) {
-	content := generateEnvContent(100)
-	cfg := DefaultConfig()
-	cfg.MaxVariables = 200
-
-	const benchFile = "bench_loader_medium.env"
-	if err := os.WriteFile(benchFile, []byte(content), 0600); err != nil {
-		b.Fatal(err)
-	}
-	defer os.Remove(benchFile)
-
-	b.ResetTimer()
-	for i := 0; i < b.N; i++ {
-		loader, err := New(cfg)
-		if err != nil {
-			b.Fatal(err)
-		}
-		if err := loader.LoadFiles(benchFile); err != nil {
-			b.Fatal(err)
-		}
-		loader.Close()
+			b.ResetTimer()
+			for i := 0; i < b.N; i++ {
+				loader, err := New(cfg)
+				if err != nil {
+					b.Fatal(err)
+				}
+				if err := loader.LoadFiles(benchFile); err != nil {
+					b.Fatal(err)
+				}
+				_ = loader.Close() // best-effort cleanup
+			}
+		})
 	}
 }
 
@@ -186,7 +138,7 @@ func BenchmarkLoader_Get(b *testing.B) {
 	if err != nil {
 		b.Fatal(err)
 	}
-	defer loader.Close()
+	defer func() { _ = loader.Close() }() // best-effort cleanup
 
 	// Pre-populate with 100 variables and pre-compute keys
 	keys := make([]string, 100)
@@ -209,7 +161,7 @@ func BenchmarkLoader_Lookup(b *testing.B) {
 	if err != nil {
 		b.Fatal(err)
 	}
-	defer loader.Close()
+	defer func() { _ = loader.Close() }() // best-effort cleanup
 
 	// Pre-populate with 100 variables and pre-compute keys
 	keys := make([]string, 100)
@@ -233,7 +185,7 @@ func BenchmarkLoader_Set(b *testing.B) {
 	if err != nil {
 		b.Fatal(err)
 	}
-	defer loader.Close()
+	defer func() { _ = loader.Close() }() // best-effort cleanup
 
 	// Pre-populate and pre-compute keys
 	keys := make([]string, 100)
@@ -256,63 +208,35 @@ func BenchmarkLoader_Set(b *testing.B) {
 // LineParser Benchmarks
 // ============================================================================
 
-func BenchmarkLineParser_SimpleLine(b *testing.B) {
-	line := []byte("KEY=value")
-	cfg := internal.LineParserConfig{
-		AllowExportPrefix: false,
-		AllowYamlSyntax:   false,
-		OverwriteExisting: true,
-		MaxVariables:      1000,
-		ExpandVariables:   false,
+// BenchmarkLineParser measures single-line parsing across input shapes (the
+// former SimpleLine/QuotedValue/WithExport functions as sub-benchmarks).
+func BenchmarkLineParser(b *testing.B) {
+	lines := []struct {
+		name              string
+		line              string
+		allowExportPrefix bool
+	}{
+		{"simple", "KEY=value", false},
+		{"quoted", `KEY="value with spaces and \"escapes\""`, false},
+		{"export", "export KEY=value", true},
 	}
-	validator := internal.NewValidator(internal.ValidatorConfig{})
-	auditor := internal.NewAuditor(internal.NewNopHandler(), nil, nil, false)
-	expander := internal.NewExpander(internal.ExpanderConfig{})
-	lp := internal.NewLineParser(cfg, validator, auditor, expander)
+	for _, tt := range lines {
+		b.Run(tt.name, func(b *testing.B) {
+			cfg := internal.LineParserConfig{
+				AllowExportPrefix: tt.allowExportPrefix,
+				AllowYamlSyntax:   false,
+			}
+			validator := internal.NewValidator(internal.ValidatorConfig{})
+			auditor := internal.NewAuditor(internal.NewNopHandler(), nil, nil, false)
+			expander := internal.NewExpander(internal.ExpanderConfig{})
+			lp := internal.NewLineParser(cfg, validator, auditor, expander)
 
-	b.ResetTimer()
-	for i := 0; i < b.N; i++ {
-		_, _, _ = lp.ParseLineBytes(line) // benchmark measures the call; result unused
-	}
-}
-
-func BenchmarkLineParser_QuotedValue(b *testing.B) {
-	line := []byte(`KEY="value with spaces and \"escapes\""`)
-	cfg := internal.LineParserConfig{
-		AllowExportPrefix: false,
-		AllowYamlSyntax:   false,
-		OverwriteExisting: true,
-		MaxVariables:      1000,
-		ExpandVariables:   false,
-	}
-	validator := internal.NewValidator(internal.ValidatorConfig{})
-	auditor := internal.NewAuditor(internal.NewNopHandler(), nil, nil, false)
-	expander := internal.NewExpander(internal.ExpanderConfig{})
-	lp := internal.NewLineParser(cfg, validator, auditor, expander)
-
-	b.ResetTimer()
-	for i := 0; i < b.N; i++ {
-		_, _, _ = lp.ParseLineBytes(line) // benchmark measures the call; result unused
-	}
-}
-
-func BenchmarkLineParser_WithExport(b *testing.B) {
-	line := []byte("export KEY=value")
-	cfg := internal.LineParserConfig{
-		AllowExportPrefix: true,
-		AllowYamlSyntax:   false,
-		OverwriteExisting: true,
-		MaxVariables:      1000,
-		ExpandVariables:   false,
-	}
-	validator := internal.NewValidator(internal.ValidatorConfig{})
-	auditor := internal.NewAuditor(internal.NewNopHandler(), nil, nil, false)
-	expander := internal.NewExpander(internal.ExpanderConfig{})
-	lp := internal.NewLineParser(cfg, validator, auditor, expander)
-
-	b.ResetTimer()
-	for i := 0; i < b.N; i++ {
-		_, _, _ = lp.ParseLineBytes(line) // benchmark measures the call; result unused
+			line := []byte(tt.line)
+			b.ResetTimer()
+			for i := 0; i < b.N; i++ {
+				_, _, _ = lp.ParseLineBytes(line) // benchmark measures the call; result unused
+			}
+		})
 	}
 }
 
@@ -502,27 +426,12 @@ func BenchmarkInternKeyBytes_New(b *testing.B) {
 	}
 }
 
-// BenchmarkInternKeyBytes_CachedFromStrings measures the cached interning path
-// for keys built as strings (then converted) — contrast with
-// BenchmarkInternKeyBytes_Cached below, which interns pre-built byte slices.
-func BenchmarkInternKeyBytes_CachedFromStrings(b *testing.B) {
-	// Clear cache and pre-populate
-	internal.ClearInternCache()
-	for i := 0; i < 100; i++ {
-		internal.InternKeyBytes([]byte(fmt.Sprintf("KEY_%d", i)))
-	}
-
-	b.ResetTimer()
-	for i := 0; i < b.N; i++ {
-		key := fmt.Sprintf("KEY_%d", i%100)
-		internal.InternKeyBytes([]byte(key))
-	}
-}
-
 // BenchmarkInternKeyBytes_Cached measures the byte-slice interning path used by
 // the parser (keys arrive as []byte from the scanner buffer). On a cache hit it
 // allocates nothing, unlike interning a freshly-built string, which allocates
-// a temporary string on every call.
+// a temporary string on every call. (The former CachedFromStrings variant was
+// removed: its hot loop rebuilt the key with fmt.Sprintf, so it measured the
+// caller's string construction rather than the interning cache.)
 func BenchmarkInternKeyBytes_Cached(b *testing.B) {
 	internal.ClearInternCache()
 	keys := make([][]byte, 100)
@@ -577,38 +486,25 @@ func BenchmarkBuilderPool(b *testing.B) {
 // Bytes vs String Benchmarks
 // ============================================================================
 
-func BenchmarkParseDoubleQuoted_NoEscape(b *testing.B) {
-	input := []byte(`"simple value"`)
-
-	b.ResetTimer()
-	for i := 0; i < b.N; i++ {
-		_, _ = internal.ParseDoubleQuotedBytes(input) // benchmark measures the call; result unused
+// BenchmarkParseDoubleQuoted measures double-quoted value parsing with and
+// without escapes (the former NoEscape/WithEscape functions as
+// sub-benchmarks).
+func BenchmarkParseDoubleQuoted(b *testing.B) {
+	inputs := []struct {
+		name  string
+		input string
+	}{
+		{"no-escape", `"simple value"`},
+		{"with-escape", `"value with \"escapes\" and \n newlines"`},
 	}
-}
-
-func BenchmarkParseDoubleQuoted_WithEscape(b *testing.B) {
-	input := []byte(`"value with \"escapes\" and \n newlines"`)
-
-	b.ResetTimer()
-	for i := 0; i < b.N; i++ {
-		_, _ = internal.ParseDoubleQuotedBytes(input) // benchmark measures the call; result unused
-	}
-}
-
-// ============================================================================
-// Scanner Buffer Benchmarks
-// ============================================================================
-
-func BenchmarkScannerBuffer(b *testing.B) {
-	content := generateEnvContent(100)
-	reader := bytes.NewReader([]byte(content))
-
-	b.ResetTimer()
-	for i := 0; i < b.N; i++ {
-		_, _ = reader.Seek(0, 0)
-		buf := make([]byte, 64*1024)
-		scanner := bytes.NewReader(buf)
-		_, _ = scanner.ReadAt(buf, 0)
+	for _, tt := range inputs {
+		b.Run(tt.name, func(b *testing.B) {
+			input := []byte(tt.input)
+			b.ResetTimer()
+			for i := 0; i < b.N; i++ {
+				_, _ = internal.ParseDoubleQuotedBytes(input) // benchmark measures the call; result unused
+			}
+		})
 	}
 }
 
@@ -622,7 +518,7 @@ func BenchmarkLoader_ConcurrentGet(b *testing.B) {
 	if err != nil {
 		b.Fatal(err)
 	}
-	defer loader.Close()
+	defer func() { _ = loader.Close() }() // best-effort cleanup
 
 	// Pre-populate with 100 variables and pre-compute keys
 	keys := make([]string, 100)
@@ -644,120 +540,6 @@ func BenchmarkLoader_ConcurrentGet(b *testing.B) {
 	})
 }
 
-// ============================================================================
-// JSON Parser Benchmarks
-// ============================================================================
-
-func generateJSONContent(numVars int) string {
-	var sb strings.Builder
-	sb.Grow(numVars * 50)
-	sb.WriteString("{")
-	for i := 0; i < numVars; i++ {
-		if i > 0 {
-			sb.WriteString(",")
-		}
-		sb.WriteString(fmt.Sprintf("\"var_%d\":\"value_%d_with_some_content\"", i, i))
-	}
-	sb.WriteString("}")
-	return sb.String()
-}
-
-func BenchmarkJSONParser_Small(b *testing.B) {
-	content := generateJSONContent(10)
-	cfg := DefaultConfig()
-	loader, err := New(cfg)
-	if err != nil {
-		b.Fatal(err)
-	}
-	defer loader.Close()
-
-	b.ResetTimer()
-	for i := 0; i < b.N; i++ {
-		r := strings.NewReader(content)
-		parser := loader.parsers[FormatJSON]
-		_, err := parser.Parse(r, "benchmark.json")
-		if err != nil {
-			b.Fatal(err)
-		}
-	}
-}
-
-func BenchmarkJSONParser_Medium(b *testing.B) {
-	content := generateJSONContent(100)
-	cfg := DefaultConfig()
-	cfg.MaxVariables = 200
-	cfg.MaxLineLength = 16384 // Single-line JSON exceeds default 1024
-	loader, err := New(cfg)
-	if err != nil {
-		b.Fatal(err)
-	}
-	defer loader.Close()
-
-	b.ResetTimer()
-	for i := 0; i < b.N; i++ {
-		r := strings.NewReader(content)
-		parser := loader.parsers[FormatJSON]
-		_, err := parser.Parse(r, "benchmark.json")
-		if err != nil {
-			b.Fatal(err)
-		}
-	}
-}
-
-// ============================================================================
-// YAML Parser Benchmarks
-// ============================================================================
-
-func generateYAMLContent(numVars int) string {
-	var sb strings.Builder
-	sb.Grow(numVars * 50)
-	for i := 0; i < numVars; i++ {
-		sb.WriteString(fmt.Sprintf("var_%d: value_%d_with_some_content\n", i, i))
-	}
-	return sb.String()
-}
-
-func BenchmarkYAMLParser_Small(b *testing.B) {
-	content := generateYAMLContent(10)
-	cfg := DefaultConfig()
-	loader, err := New(cfg)
-	if err != nil {
-		b.Fatal(err)
-	}
-	defer loader.Close()
-
-	b.ResetTimer()
-	for i := 0; i < b.N; i++ {
-		r := strings.NewReader(content)
-		parser := loader.parsers[FormatYAML]
-		_, err := parser.Parse(r, "benchmark.yaml")
-		if err != nil {
-			b.Fatal(err)
-		}
-	}
-}
-
-func BenchmarkYAMLParser_Medium(b *testing.B) {
-	content := generateYAMLContent(100)
-	cfg := DefaultConfig()
-	cfg.MaxVariables = 200
-	loader, err := New(cfg)
-	if err != nil {
-		b.Fatal(err)
-	}
-	defer loader.Close()
-
-	b.ResetTimer()
-	for i := 0; i < b.N; i++ {
-		r := strings.NewReader(content)
-		parser := loader.parsers[FormatYAML]
-		_, err := parser.Parse(r, "benchmark.yaml")
-		if err != nil {
-			b.Fatal(err)
-		}
-	}
-}
-
 func BenchmarkLoader_ConcurrentSet(b *testing.B) {
 	cfg := DefaultConfig()
 	cfg.OverwriteExisting = true
@@ -765,7 +547,7 @@ func BenchmarkLoader_ConcurrentSet(b *testing.B) {
 	if err != nil {
 		b.Fatal(err)
 	}
-	defer loader.Close()
+	defer func() { _ = loader.Close() }() // best-effort cleanup
 
 	// Pre-compute keys to avoid fmt.Sprintf in hot path
 	keys := make([]string, 100)
@@ -784,40 +566,103 @@ func BenchmarkLoader_ConcurrentSet(b *testing.B) {
 }
 
 // ============================================================================
-// Targeted Optimization Benchmarks
+// Structured Parser Benchmarks
 // ============================================================================
 
-// BenchmarkExpander_SingleVariable_Leaf benchmarks the fast path for single
-// variable expansion where the resolved value has no further $ references.
-func BenchmarkExpander_SingleVariable_Leaf(b *testing.B) {
-	input := "$VAR"
-	expander := internal.NewExpander(internal.ExpanderConfig{
-		MaxDepth: 5,
-		Lookup:   func(key string) (string, bool) { return "simple_value", true },
-		Mode:     internal.ModeEnv,
-	})
-
-	b.ResetTimer()
-	for i := 0; i < b.N; i++ {
-		_, _ = expander.Expand(input) // benchmark measures the call; result unused
+func generateJSONContent(numVars int) string {
+	var sb strings.Builder
+	sb.Grow(numVars * 50)
+	sb.WriteString("{")
+	for i := 0; i < numVars; i++ {
+		if i > 0 {
+			sb.WriteString(",")
+		}
+		_, _ = fmt.Fprintf(&sb, "\"var_%d\":\"value_%d_with_some_content\"", i, i) // builder writes cannot fail
 	}
+	sb.WriteString("}")
+	return sb.String()
 }
 
-// BenchmarkExpander_BracedVariable_Leaf benchmarks the fast path for braced
-// variable expansion with a leaf value.
-func BenchmarkExpander_BracedVariable_Leaf(b *testing.B) {
-	input := "${VAR}"
-	expander := internal.NewExpander(internal.ExpanderConfig{
-		MaxDepth: 5,
-		Lookup:   func(key string) (string, bool) { return "simple_value", true },
-		Mode:     internal.ModeEnv,
-	})
-
-	b.ResetTimer()
-	for i := 0; i < b.N; i++ {
-		_, _ = expander.Expand(input) // benchmark measures the call; result unused
+// generateYAMLContent creates a flat YAML document with numVars variables.
+func generateYAMLContent(numVars int) string {
+	var sb strings.Builder
+	sb.Grow(numVars * 50)
+	for i := 0; i < numVars; i++ {
+		_, _ = fmt.Fprintf(&sb, "var_%d: value_%d_with_some_content\n", i, i) // builder writes cannot fail
 	}
+	return sb.String()
 }
+
+// generateNestedYAMLContent creates a nested YAML document: numGroups groups
+// of three keyed settings each (~3*numGroups flattened leaves). Unlike the
+// flat fixtures above, every leaf key is built with a non-empty prefix, which
+// exercises the nested key-construction path in the flatteners.
+func generateNestedYAMLContent(numGroups int) string {
+	var sb strings.Builder
+	sb.Grow(numGroups * 70)
+	for g := 0; g < numGroups; g++ {
+		_, _ = fmt.Fprintf(&sb, "group_%d:\n  host: host_%d.example.com\n  port: %d\n  enabled: true\n", g, g, 8000+g) // builder writes cannot fail
+	}
+	return sb.String()
+}
+
+// generateNestedJSONContent creates a nested JSON document matching the YAML
+// fixture's shape (~3*numGroups flattened leaves with prefixed key builds).
+func generateNestedJSONContent(numGroups int) string {
+	var sb strings.Builder
+	sb.Grow(numGroups * 90)
+	sb.WriteString("{")
+	for g := 0; g < numGroups; g++ {
+		if g > 0 {
+			sb.WriteString(",")
+		}
+		_, _ = fmt.Fprintf(&sb, `"group_%d":{"host":"host_%d.example.com","port":%d,"enabled":true}`, g, g, 8000+g) // builder writes cannot fail
+	}
+	sb.WriteString("}")
+	return sb.String()
+}
+
+// BenchmarkJSONParser measures JSON parsing across flat sizes and a nested
+// document (the former Small/Medium/Nested functions as sub-benchmarks).
+func BenchmarkJSONParser(b *testing.B) {
+	b.Run("flat-10", func(b *testing.B) {
+		benchParse(b, FormatJSON, "benchmark.json", generateJSONContent(10), DefaultConfig())
+	})
+	b.Run("flat-100", func(b *testing.B) {
+		cfg := DefaultConfig()
+		cfg.MaxVariables = 200
+		cfg.MaxLineLength = 16384 // Single-line JSON exceeds the 8192 default
+		benchParse(b, FormatJSON, "benchmark.json", generateJSONContent(100), cfg)
+	})
+	b.Run("nested-99", func(b *testing.B) {
+		cfg := DefaultConfig()
+		cfg.MaxVariables = 200
+		cfg.MaxLineLength = 16384 // Single-line JSON exceeds the 8192 default
+		benchParse(b, FormatJSON, "benchmark.json", generateNestedJSONContent(33), cfg)
+	})
+}
+
+// BenchmarkYAMLParser measures YAML parsing across flat sizes and a nested
+// document (the former Small/Medium/Nested functions as sub-benchmarks).
+func BenchmarkYAMLParser(b *testing.B) {
+	b.Run("flat-10", func(b *testing.B) {
+		benchParse(b, FormatYAML, "benchmark.yaml", generateYAMLContent(10), DefaultConfig())
+	})
+	b.Run("flat-100", func(b *testing.B) {
+		cfg := DefaultConfig()
+		cfg.MaxVariables = 200
+		benchParse(b, FormatYAML, "benchmark.yaml", generateYAMLContent(100), cfg)
+	})
+	b.Run("nested-99", func(b *testing.B) {
+		cfg := DefaultConfig()
+		cfg.MaxVariables = 200
+		benchParse(b, FormatYAML, "benchmark.yaml", generateNestedYAMLContent(33), cfg)
+	})
+}
+
+// ============================================================================
+// Targeted Optimization Benchmarks
+// ============================================================================
 
 // BenchmarkHasUpperPrefix benchmarks the case-insensitive prefix check.
 func BenchmarkHasUpperPrefix(b *testing.B) {

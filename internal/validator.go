@@ -1,7 +1,9 @@
-// Package internal provides input validation for environment variable keys and values.
+// Provides input validation for environment variable keys and values.
+
 package internal
 
 import (
+	"encoding/binary"
 	"fmt"
 	"regexp"
 	"strings"
@@ -131,14 +133,56 @@ func (v *Validator) ValidateKey(key string) error {
 			return v.newValidationError("key", key, "pattern", "key does not match required pattern")
 		}
 	} else {
-		for i := 0; i < len(key); i++ {
-			if key[i] >= 0x80 {
-				return v.newValidationError("key", key, "ascii_only", "key contains non-ASCII characters")
-			}
+		if err := v.validateCustomKeyShape(key); err != nil {
+			return err
 		}
-		if v.keyPattern != nil && !v.keyPattern.MatchString(key) {
+	}
+
+	return v.ValidateKeyPolicy(key)
+}
+
+// validateCustomKeyShape checks a key against a user-supplied KeyPattern,
+// including the non-ASCII homograph scan that a custom pattern may not
+// itself reject. Shared by ValidateKey and ValidateSetKey.
+func (v *Validator) validateCustomKeyShape(key string) error {
+	for i := 0; i < len(key); i++ {
+		if key[i] >= 0x80 {
+			return v.newValidationError("key", key, "ascii_only", "key contains non-ASCII characters")
+		}
+	}
+	if v.keyPattern != nil && !v.keyPattern.MatchString(key) {
+		return v.newValidationError("key", key, "pattern", "key does not match required pattern")
+	}
+	return nil
+}
+
+// ValidateSetKey validates a programmatically-set key (Loader.Set).
+//
+// The store legitimately holds keys containing dots and hyphens loaded from
+// structured files (governed by IsValidJSONKey); Set accepts that same key
+// space so programmatic values can mirror file data — with the default
+// configuration the .env pattern (which rejects dots) no longer makes Set
+// stricter than file loads. A user-supplied KeyPattern expresses a stricter
+// intent and keeps governing programmatic keys unchanged. The
+// allowed/forbidden key policy is enforced exactly like ValidateKey.
+func (v *Validator) ValidateSetKey(key string) error {
+	if len(key) == 0 {
+		return v.newValidationError("key", key, "non_empty", "key cannot be empty")
+	}
+	if len(key) > v.maxKeyLength {
+		return v.newValidationError("key", key, "max_length", "key exceeds maximum length")
+	}
+
+	if v.useDefaultKeyCheck {
+		// Structured-format key shape: letters, digits, '_', '@', '-', '.'
+		// (the default .env pattern is a strict subset of it). The character
+		// class rejects non-ASCII bytes, covering the homograph scan, and
+		// array-index-like/bracket keys stay excluded.
+		if !IsValidJSONKey(key) {
 			return v.newValidationError("key", key, "pattern", "key does not match required pattern")
 		}
+	} else if err := v.validateCustomKeyShape(key); err != nil {
+		return err
 	}
 
 	return v.ValidateKeyPolicy(key)
@@ -170,6 +214,21 @@ func (v *Validator) ValidateKeyPolicy(key string) error {
 	}
 
 	return nil
+}
+
+// ValidateValueBasic enforces the always-on value baseline for write paths
+// whose ValidateValues switch is off (Set, JSON/YAML loads), keeping them at
+// exact parity with the .env line parser — which runs ValidateValue
+// unconditionally. Every check the built-in validator can perform is part of
+// that baseline: maximum value length, control-character rejection, and
+// UTF-8 validation when the validator was configured with ValidateUTF8 (the
+// UTF-8 check follows its own flag alone, on every path, exactly as the .env
+// parser has always honored it). It therefore delegates to ValidateValue, so
+// the two cannot drift apart; ValidateValues remains effective only for
+// custom validators without this capability, which skip value validation
+// entirely when the switch is off.
+func (v *Validator) ValidateValueBasic(value string) error {
+	return v.ValidateValue(value)
 }
 
 // ValidateValue validates an environment variable value.
@@ -218,12 +277,44 @@ var badCharTable = [256]byte{
 // Each byte is classified in O(1) via badCharTable; the first disallowed byte
 // yields a descriptive error.
 //
-// The previous 8-byte-at-a-time (SIMD-style) unrolling plus an unsafe
-// string-to-bytes helper were removed for readability. Per the project
-// guidelines, readability wins over micro-optimization unless profiling
-// identifies a regression, and the simple loop is obviously correct.
+// An earlier 8-byte-at-a-time unrolling was removed for readability, then
+// reinstated (in the guarded form below) after CPU profiles of the parse and
+// Set hot paths showed this scan as the largest single flat consumer
+// (~10% of .env parse time). The word-at-a-time prefilter only decides
+// whether a chunk is provably clean; any chunk it flags is re-checked by the
+// simple byte loop, so the disallowed set and the error reporting live in
+// exactly one place (badCharTable / badCharError) and correctness does not
+// depend on the bit tricks.
 func validateValueChars(value string) error {
-	for i := 0; i < len(value); i++ {
+	// Word-at-a-time prefilter, 8 bytes per iteration. A chunk is provably
+	// clean when no lane holds a byte < 0x20 and no lane holds 0x7F (DEL);
+	// every other byte — including all of 0x80..0xFF — is allowed.
+	//
+	//   hasLess: (w - 0x20..) &^ w & 0x80..  — per-lane borrow-out detection
+	//     ("has byte less than n" from Bit Twiddling Hacks). Inter-lane
+	//     borrows can only add flags (false positives), never clear a
+	//     genuine one, so flagged chunks fall through to the exact loop.
+	//   hasDel:  zero-byte detector applied to w ^ 0x7F.., which turns DEL
+	//     bytes into zero bytes.
+	//
+	// The []byte conversion does not allocate: LittleEndian.Uint64 is
+	// inlinable and the converted slice does not escape.
+	i := 0
+	for ; i+8 <= len(value); i += 8 {
+		w := binary.LittleEndian.Uint64([]byte(value[i : i+8]))
+		const hi = 0x8080808080808080
+		hasLess := (w - 0x2020202020202020) &^ w & hi
+		del := w ^ 0x7F7F7F7F7F7F7F7F
+		hasDel := (del - 0x0101010101010101) &^ del & hi
+		if hasLess|hasDel != 0 {
+			for j := i; j < i+8; j++ {
+				if badCharTable[value[j]] != 0 {
+					return badCharError(value[j], j)
+				}
+			}
+		}
+	}
+	for ; i < len(value); i++ {
 		if badCharTable[value[i]] != 0 {
 			return badCharError(value[i], i)
 		}
@@ -283,25 +374,11 @@ func (v *Validator) ValidateRequired(keys map[string]bool) error {
 }
 
 // IsSensitive returns true if the key appears to be sensitive.
+// Test probe: production paths call the injected IsSensitive func (or the
+// auditor's copy) directly; this accessor exists so tests can verify the
+// injected predicate without reaching into struct fields.
 func (v *Validator) IsSensitive(key string) bool {
 	return v.isSensitive(key)
-}
-
-// ShouldMask returns true if the key's value should be masked in logs.
-func (v *Validator) ShouldMask(key string) bool {
-	return v.IsSensitive(key)
-}
-
-// MaskValue masks a value for logging purposes.
-func (v *Validator) MaskValue(key, value string) string {
-	if !v.ShouldMask(key) {
-		if len(value) <= maxValueDisplayLen {
-			return value
-		}
-		return value[:maxValueDisplayLen-3] + "..."
-	}
-	// For sensitive values, show only length
-	return fmt.Sprintf("[MASKED:%d chars]", len(value))
 }
 
 // newValidationError creates a new ValidationError.

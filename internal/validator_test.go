@@ -93,118 +93,42 @@ func TestNewValidator(t *testing.T) {
 	})
 }
 
+// TestNewValidator_ZeroConfigFailsClosed pins the fail-closed behavior of a
+// zero-value ValidatorConfig: MaxKeyLength and MaxValueLength are both 0, so
+// ValidateKey/ValidateValue reject every NON-EMPTY input on the length check
+// alone. Callers must derive configs from the documented defaults rather
+// than passing a zero config.
+func TestNewValidator_ZeroConfigFailsClosed(t *testing.T) {
+	v := NewValidator(ValidatorConfig{})
+
+	if err := v.ValidateKey("KEY"); err == nil {
+		t.Error("ValidateKey(non-empty) with zero config = nil, want max_length error (fail-closed)")
+	}
+	if err := v.ValidateValue("value"); err == nil {
+		t.Error("ValidateValue(non-empty) with zero config = nil, want max_length error (fail-closed)")
+	}
+	// The empty value is the one input a zero config still accepts: length 0
+	// passes the check and there are no control characters to reject.
+	if err := v.ValidateValue(""); err != nil {
+		t.Errorf("ValidateValue(\"\") with zero config = %v, want nil", err)
+	}
+}
+
 // ============================================================================
 // ValidateKey Tests
 // ============================================================================
 
+// TestValidator_ValidateKey covers the .env key contract in one table: shape
+// (default scan and custom patterns), length boundaries, allowed/forbidden
+// key policy, and the Unicode homograph defense — keys containing non-ASCII
+// bytes are rejected under both the default scan and a custom pattern
+// (SECURITY: prevents ℌOST-style spoofs of restricted keys; custom patterns
+// keep the dedicated ASCII scan because a user pattern may permit non-ASCII).
 func TestValidator_ValidateKey(t *testing.T) {
-	v := NewValidator(ValidatorConfig{
-		MaxKeyLength: 64,
-	})
-
-	tests := []struct {
-		name    string
-		key     string
-		wantErr bool
-	}{
-		{"valid key", "MY_KEY", false},
-		{"valid key with numbers", "KEY123", false},
-		{"underscore start invalid", "_PRIVATE_KEY", true}, // First char must be letter
-		{"empty key", "", true},
-		{"starts with number", "123_KEY", true},
-		{"contains hyphen", "MY-KEY", true},
-		{"contains space", "MY KEY", true},
-		{"contains dot", "MY.KEY", true},
-		{"lowercase allowed", "my_key", false}, // lowercase is allowed, just converted
-		{"single letter", "K", false},
-		{"single underscore invalid", "_", true},
-		{"underscore in middle", "MY_KEY_NAME", false},
-	}
-
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			err := v.ValidateKey(tt.key)
-			if (err != nil) != tt.wantErr {
-				t.Errorf("ValidateKey(%q) error = %v, wantErr %v", tt.key, err, tt.wantErr)
-			}
-		})
-	}
-}
-
-// TestValidator_ValidateKey_Policy covers the allowed-keys / forbidden-keys
-// policy and the max-key-length rule in one table.
-func TestValidator_ValidateKey_Policy(t *testing.T) {
-	tests := []struct {
-		name    string
-		cfg     ValidatorConfig
-		key     string
-		wantErr bool
-	}{
-		{
-			name:    "allowed key accepted",
-			cfg:     ValidatorConfig{AllowedKeys: []string{"ALLOWED_KEY"}, MaxKeyLength: 64},
-			key:     "ALLOWED_KEY",
-			wantErr: false,
-		},
-		{
-			name:    "non-allowed key rejected",
-			cfg:     ValidatorConfig{AllowedKeys: []string{"ALLOWED_KEY"}, MaxKeyLength: 64},
-			key:     "NOT_ALLOWED",
-			wantErr: true,
-		},
-		{
-			name:    "forbidden key rejected",
-			cfg:     ValidatorConfig{ForbiddenKeys: []string{"PATH"}, MaxKeyLength: 64},
-			key:     "PATH",
-			wantErr: true,
-		},
-		{
-			name:    "normal key unaffected by forbidden list",
-			cfg:     ValidatorConfig{ForbiddenKeys: []string{"PATH"}, MaxKeyLength: 64},
-			key:     "MY_KEY",
-			wantErr: false,
-		},
-		{
-			name:    "within length limit",
-			cfg:     ValidatorConfig{MaxKeyLength: 10},
-			key:     "SHORT",
-			wantErr: false,
-		},
-		{
-			// Boundary: exactly at the limit is still valid.
-			name:    "exactly at length limit",
-			cfg:     ValidatorConfig{MaxKeyLength: 10},
-			key:     "ABCDEFGHIJ",
-			wantErr: false,
-		},
-		{
-			// Boundary: one over the limit fails.
-			name:    "one over length limit",
-			cfg:     ValidatorConfig{MaxKeyLength: 10},
-			key:     "ABCDEFGHIJK",
-			wantErr: true,
-		},
-	}
-
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			v := NewValidator(tt.cfg)
-			err := v.ValidateKey(tt.key)
-			if (err != nil) != tt.wantErr {
-				t.Fatalf("ValidateKey(%q) error = %v, wantErr %v", tt.key, err, tt.wantErr)
-			}
-		})
-	}
-}
-
-// TestValidator_ValidateKey_NonASCIIRule verifies the Unicode homograph
-// defense: keys containing non-ASCII bytes are rejected under both the
-// default scan and a custom pattern (SECURITY: prevents ℌOST-style spoofs of
-// restricted keys).
-func TestValidator_ValidateKey_NonASCIIRule(t *testing.T) {
 	const homograph = "ℌOST" // U+210C SCRIPT CAPITAL H, looks like HOST
 	permissivePattern := regexp.MustCompile(`.*`)
 	strictPattern := regexp.MustCompile(`^[A-Z_]+$`)
+	defaultCfg := ValidatorConfig{MaxKeyLength: 64}
 
 	tests := []struct {
 		name    string
@@ -212,28 +136,35 @@ func TestValidator_ValidateKey_NonASCIIRule(t *testing.T) {
 		key     string
 		wantErr bool
 	}{
-		{name: "default check rejects homograph", cfg: ValidatorConfig{MaxKeyLength: 64}, key: homograph, wantErr: true},
-		{name: "default check accepts ASCII key", cfg: ValidatorConfig{MaxKeyLength: 64}, key: "HOST", wantErr: false},
-		{
-			// Custom patterns keep the dedicated ASCII scan because a
-			// user-supplied pattern may permit non-ASCII characters.
-			name:    "custom pattern rejects homograph",
-			cfg:     ValidatorConfig{KeyPattern: permissivePattern, MaxKeyLength: 64},
-			key:     homograph,
-			wantErr: true,
-		},
-		{
-			name:    "custom pattern rejects non-matching key",
-			cfg:     ValidatorConfig{KeyPattern: strictPattern, MaxKeyLength: 64},
-			key:     "INVALID-KEY",
-			wantErr: true,
-		},
-		{
-			name:    "custom pattern accepts matching key",
-			cfg:     ValidatorConfig{KeyPattern: strictPattern, MaxKeyLength: 64},
-			key:     "GOOD_KEY",
-			wantErr: false,
-		},
+		// Shape under the default scan.
+		{name: "valid key", cfg: defaultCfg, key: "MY_KEY", wantErr: false},
+		{name: "valid key with numbers", cfg: defaultCfg, key: "KEY123", wantErr: false},
+		{name: "underscore start invalid", cfg: defaultCfg, key: "_PRIVATE_KEY", wantErr: true}, // First char must be letter
+		{name: "empty key", cfg: defaultCfg, key: "", wantErr: true},
+		{name: "starts with number", cfg: defaultCfg, key: "123_KEY", wantErr: true},
+		{name: "contains hyphen", cfg: defaultCfg, key: "MY-KEY", wantErr: true},
+		{name: "contains space", cfg: defaultCfg, key: "MY KEY", wantErr: true},
+		{name: "contains dot", cfg: defaultCfg, key: "MY.KEY", wantErr: true},
+		{name: "lowercase allowed", cfg: defaultCfg, key: "my_key", wantErr: false}, // lowercase is allowed, just converted
+		{name: "single letter", cfg: defaultCfg, key: "K", wantErr: false},
+		{name: "single underscore invalid", cfg: defaultCfg, key: "_", wantErr: true},
+		{name: "underscore in middle", cfg: defaultCfg, key: "MY_KEY_NAME", wantErr: false},
+		// Allowed/forbidden policy.
+		{name: "allowed key accepted", cfg: ValidatorConfig{AllowedKeys: []string{"ALLOWED_KEY"}, MaxKeyLength: 64}, key: "ALLOWED_KEY", wantErr: false},
+		{name: "non-allowed key rejected", cfg: ValidatorConfig{AllowedKeys: []string{"ALLOWED_KEY"}, MaxKeyLength: 64}, key: "NOT_ALLOWED", wantErr: true},
+		{name: "forbidden key rejected", cfg: ValidatorConfig{ForbiddenKeys: []string{"PATH"}, MaxKeyLength: 64}, key: "PATH", wantErr: true},
+		{name: "normal key unaffected by forbidden list", cfg: ValidatorConfig{ForbiddenKeys: []string{"PATH"}, MaxKeyLength: 64}, key: "MY_KEY", wantErr: false},
+		// Length boundaries.
+		{name: "within length limit", cfg: ValidatorConfig{MaxKeyLength: 10}, key: "SHORT", wantErr: false},
+		// Boundary: exactly at the limit is still valid; one over fails.
+		{name: "exactly at length limit", cfg: ValidatorConfig{MaxKeyLength: 10}, key: "ABCDEFGHIJ", wantErr: false},
+		{name: "one over length limit", cfg: ValidatorConfig{MaxKeyLength: 10}, key: "ABCDEFGHIJK", wantErr: true},
+		// Non-ASCII homograph defense (default scan and custom patterns).
+		{name: "default check rejects homograph", cfg: defaultCfg, key: homograph, wantErr: true},
+		{name: "default check accepts ASCII key", cfg: defaultCfg, key: "HOST", wantErr: false},
+		{name: "custom pattern rejects homograph", cfg: ValidatorConfig{KeyPattern: permissivePattern, MaxKeyLength: 64}, key: homograph, wantErr: true},
+		{name: "custom pattern rejects non-matching key", cfg: ValidatorConfig{KeyPattern: strictPattern, MaxKeyLength: 64}, key: "INVALID-KEY", wantErr: true},
+		{name: "custom pattern accepts matching key", cfg: ValidatorConfig{KeyPattern: strictPattern, MaxKeyLength: 64}, key: "GOOD_KEY", wantErr: false},
 	}
 
 	for _, tt := range tests {
@@ -251,35 +182,6 @@ func TestValidator_ValidateKey_NonASCIIRule(t *testing.T) {
 // ValidateValue Tests
 // ============================================================================
 
-func TestValidator_ValidateValue(t *testing.T) {
-	v := NewValidator(ValidatorConfig{
-		MaxValueLength: 1024,
-	})
-
-	tests := []struct {
-		name    string
-		value   string
-		wantErr bool
-	}{
-		{"normal value", "hello world", false},
-		{"with newline", "line1\nline2", false},
-		{"with tab", "col1\tcol2", false},
-		{"with carriage return", "line1\rline2", false},
-		{"null byte", "value\x00value", true},
-		{"control char", "value\x01value", true},
-		{"DEL char", "value\x7Fvalue", true},
-	}
-
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			err := v.ValidateValue(tt.value)
-			if (err != nil) != tt.wantErr {
-				t.Errorf("ValidateValue() error = %v, wantErr %v", err, tt.wantErr)
-			}
-		})
-	}
-}
-
 func TestValidator_ValidateValue_MaxLength(t *testing.T) {
 	v := NewValidator(ValidatorConfig{
 		MaxValueLength: 10,
@@ -288,6 +190,14 @@ func TestValidator_ValidateValue_MaxLength(t *testing.T) {
 	t.Run("within limit", func(t *testing.T) {
 		if err := v.ValidateValue("short"); err != nil {
 			t.Errorf("ValidateValue(short) error = %v", err)
+		}
+	})
+
+	t.Run("exactly at limit", func(t *testing.T) {
+		// Boundary: a value whose length equals MaxValueLength passes —
+		// only strictly longer values fail the check.
+		if err := v.ValidateValue(strings.Repeat("a", 10)); err != nil {
+			t.Errorf("ValidateValue(exactly MaxValueLength) error = %v, want nil", err)
 		}
 	})
 
@@ -332,15 +242,41 @@ func TestValidator_ValidateRequired(t *testing.T) {
 
 		err := v.ValidateRequired(keys)
 		if err == nil {
-			t.Error("ValidateRequired() should fail with missing keys")
+			t.Fatal("ValidateRequired() should fail with missing keys")
 		}
 
 		var valErr *ValidationError
-		if !AsError(err, &valErr) {
-			t.Errorf("error type = %T, want ValidationError", err)
+		if !errors.As(err, &valErr) {
+			t.Fatalf("error type = %T, want ValidationError", err)
 		}
 		if valErr.Rule != "required" {
 			t.Errorf("error rule = %q, want 'required'", valErr.Rule)
+		}
+	})
+
+	t.Run("nil keys map reports all required missing", func(t *testing.T) {
+		// Boundary: a nil map reads as "nothing present", so every required
+		// key is reported missing (nil-map lookups return the zero value).
+		v := NewValidator(ValidatorConfig{
+			RequiredKeys: []string{"KEY1", "KEY2"},
+		})
+
+		err := v.ValidateRequired(nil)
+		if err == nil {
+			t.Fatal("ValidateRequired(nil) should fail when required keys are configured")
+		}
+
+		var valErr *ValidationError
+		if !errors.As(err, &valErr) {
+			t.Fatalf("error type = %T, want ValidationError", err)
+		}
+		if valErr.Rule != "required" {
+			t.Errorf("error rule = %q, want 'required'", valErr.Rule)
+		}
+		for _, key := range []string{"KEY1", "KEY2"} {
+			if !strings.Contains(err.Error(), key) {
+				t.Errorf("error %q should list missing key %s", err, key)
+			}
 		}
 	})
 }
@@ -395,122 +331,14 @@ func TestValidator_IsSensitive(t *testing.T) {
 }
 
 // ============================================================================
-// ShouldMask Tests
-// ============================================================================
-
-func TestValidator_ShouldMask(t *testing.T) {
-	v := NewValidator(ValidatorConfig{
-		IsSensitive: func(key string) bool {
-			return strings.Contains(strings.ToUpper(key), "SECRET")
-		},
-	})
-
-	t.Run("sensitive key should mask", func(t *testing.T) {
-		if !v.ShouldMask("MY_SECRET") {
-			t.Error("ShouldMask should return true for sensitive key")
-		}
-	})
-
-	t.Run("non-sensitive key should not mask", func(t *testing.T) {
-		if v.ShouldMask("MY_KEY") {
-			t.Error("ShouldMask should return false for non-sensitive key")
-		}
-	})
-}
-
-// ============================================================================
-// MaskValue Tests
-// ============================================================================
-
-func TestValidator_MaskValue(t *testing.T) {
-	v := NewValidator(ValidatorConfig{
-		IsSensitive: func(key string) bool {
-			return strings.Contains(strings.ToUpper(key), "SECRET")
-		},
-	})
-
-	t.Run("sensitive value masked", func(t *testing.T) {
-		result := v.MaskValue("MY_SECRET", "super_secret_password_12345")
-		if !strings.Contains(result, "[MASKED:") {
-			t.Errorf("MaskValue(sensitive) = %q, should contain [MASKED:", result)
-		}
-	})
-
-	t.Run("short non-sensitive value shown", func(t *testing.T) {
-		result := v.MaskValue("MY_KEY", "short")
-		if result != "short" {
-			t.Errorf("MaskValue(short non-sensitive) = %q, want 'short'", result)
-		}
-	})
-
-	t.Run("long non-sensitive value truncated", func(t *testing.T) {
-		longValue := "this_is_a_very_long_value_that_exceeds_20_chars"
-		result := v.MaskValue("MY_KEY", longValue)
-		if !strings.HasSuffix(result, "...") {
-			t.Errorf("MaskValue(long non-sensitive) = %q, should end with ...", result)
-		}
-	})
-}
-
-// ============================================================================
-// Default Functions Tests
-// ============================================================================
-
-func TestDefaultIsSensitive(t *testing.T) {
-	// Default function always returns false
-	if defaultIsSensitive("PASSWORD") {
-		t.Error("defaultIsSensitive should always return false")
-	}
-	if defaultIsSensitive("SECRET") {
-		t.Error("defaultIsSensitive should always return false")
-	}
-}
-
-func TestDefaultMaskKey(t *testing.T) {
-	tests := []struct {
-		input    string
-		expected string
-	}{
-		{"AB", "***"},        // len <= 3
-		{"ABC", "***"},       // len <= 3
-		{"ABCD", "AB***"},    // len > 3
-		{"API_KEY", "AP***"}, // len > 3
-	}
-
-	for _, tt := range tests {
-		t.Run(tt.input, func(t *testing.T) {
-			result := DefaultMaskKey(tt.input)
-			if result != tt.expected {
-				t.Errorf("DefaultMaskKey(%q) = %q, want %q", tt.input, result, tt.expected)
-			}
-		})
-	}
-}
-
-func TestDefaultMaskSensitive(t *testing.T) {
-	t.Run("short value", func(t *testing.T) {
-		result := defaultMaskSensitive("short")
-		if result != "short" {
-			t.Errorf("defaultMaskSensitive(short) = %q, want 'short'", result)
-		}
-	})
-
-	t.Run("long value truncated", func(t *testing.T) {
-		longValue := strings.Repeat("a", 60)
-		result := defaultMaskSensitive(longValue)
-		if !strings.HasSuffix(result, "...") {
-			t.Errorf("defaultMaskSensitive(long) should end with ..., got %q", result)
-		}
-		if len(result) > 53 { // 50 + "..."
-			t.Errorf("defaultMaskSensitive(long) length = %d, should be <= 53", len(result))
-		}
-	})
-}
-
-// ============================================================================
 // validateValueChars Tests
 // ============================================================================
 
+// TestValidateValueChars pins validateValueChars' byte-table semantics,
+// including the word-at-a-time prefilter boundaries: chunk edges at 8/16
+// bytes, borrow-generator byte patterns in the hasLess/hasDel lanes, and
+// high (>= 0x80) byte values, which the prefilter may flag but the exact
+// byte loop must clear.
 func TestValidateValueChars(t *testing.T) {
 	tests := []struct {
 		name    string
@@ -528,6 +356,34 @@ func TestValidateValueChars(t *testing.T) {
 		{"DEL char", "hello\x7Fworld", true},
 		{"unicode", "hello 世界", false},
 		{"all allowed controls", "\t\n\r", false},
+		// Word-at-a-time prefilter boundaries (8-byte chunks).
+		{"len7", "abcdefg", false},
+		{"len8", "abcdefgh", false},
+		{"len9", "abcdefghi", false},
+		{"len15", "abcdefghijklmno", false},
+		{"len16", "abcdefghijklmnop", false},
+		{"tab-nl-cr allowed", "a\tb\nc\rd", false},
+		{"allowed block of 8 tabs", "\t\t\t\t\t\t\t\t", false},
+		{"mixed allowed 8", "\t\n\r\t\n\r\t\n", false},
+		{"NUL at 0", "\x00abcdefg", true},
+		{"NUL at 7", "abcdefg\x00", true},
+		{"NUL at 8 (2nd chunk)", "abcdefgh\x00", true},
+		{"NUL at 15", "abcdefghijklmnu\x00", true},
+		{"DEL at 0", "\x7fabcdef", true},
+		{"DEL at 7", "abcdefg\x7f", true},
+		{"DEL at 8", "abcdefgh\x7f", true},
+		{"0x01 at 6", "abcdef\x01g", true},
+		{"0x1f at 13", "abcdefghijklm\x1fno", true},
+		{"0x0b (VT) mid", "abcde\x0bfghijkl", true},
+		{"high bytes allowed", "\x80\x9f\xa0\xff\x85\xfe\x80\x90", false},
+		{"high bytes + NUL", "\x80\x9f\xa0\xff\x00\xfe\x80\x90", true},
+		{"high bytes + DEL", "\x80\x9f\xa0\xff\x7f\xfe\x80\x90", true},
+		{"borrow-generator then NUL", "\xff\xff\xff\xff\xff\xff\xff\x00", true},
+		{"0x9f block then NUL", "\x9f\x9f\x9f\x9f\x9f\x9f\x9f\x00", true},
+		{"0xA0 block (spurious flag)", "\xa0\xa0\xa0\xa0\xa0\xa0\xa0\xa0", false},
+		{"0x7f-lane xor pattern", "aaa\x7faaaa", true},
+		{"last byte only tail", "abcdefgh" + "ijklmnop" + "q", false},
+		{"NUL exactly at tail pos", "abcdefghijklmnopqrstuv\x00", true},
 	}
 
 	for _, tt := range tests {
@@ -540,24 +396,73 @@ func TestValidateValueChars(t *testing.T) {
 	}
 }
 
-// AsError is a helper to check error types
-func AsError(err error, target interface{}) bool {
-	if err == nil {
-		return false
+// TestValidator_ValidateSetKey pins the programmatic-key contract in one
+// table: with the default configuration Set accepts the structured-format key
+// space (IsValidJSONKey — a superset of the .env pattern that adds dots,
+// hyphens and at-signs), a custom KeyPattern governs instead of the default
+// scan, and shape, length, ASCII and policy rules still reject everything
+// invalid.
+func TestValidator_ValidateSetKey(t *testing.T) {
+	tests := []struct {
+		name   string
+		cfg    ValidatorConfig
+		accept []string
+		reject []string
+	}{
+		{
+			name: "default config accepts the structured-format key space",
+			cfg:  ValidatorConfig{MaxKeyLength: 64, MaxValueLength: 128},
+			accept: []string{
+				"HOST",              // plain .env-shaped key
+				"DB_PORT",           // underscore
+				"APNEWS.COM",        // dotted (YAML/JSON file-shaped)
+				"service.host-name", // dots + hyphen, lowercase (uppercased by Set callers as needed)
+				"user@example",      // at-sign
+				"v2",                // leading digit with letters: not index-like
+			},
+			reject: []string{
+				"",                      // empty
+				"BAD KEY",               // space
+				"A=B",                   // equals sign
+				"A[0]",                  // brackets (array-index ambiguity)
+				"123",                   // short pure-numeric (array-index-like)
+				"12345",                 // long pure-numeric: also index-like (ResolvePath resolves segments up to maxSafeIndex)
+				"999999999",             // nine-digit pure-numeric, same class
+				"höst",                  // non-ASCII (homograph)
+				strings.Repeat("K", 65), // exceeds MaxKeyLength
+			},
+		},
+		{
+			name:   "custom pattern governs",
+			cfg:    ValidatorConfig{KeyPattern: regexp.MustCompile(`^[A-Z_]+$`), MaxKeyLength: 64},
+			accept: []string{"GOOD_KEY"},
+			reject: []string{"A.B"}, // dotted key fails the custom pattern
+		},
+		{
+			// The default forbidden-key list is merged in by the component
+			// factory; a bare NewValidator only knows what it is given.
+			name:   "policy enforced case-insensitively",
+			cfg:    ValidatorConfig{MaxKeyLength: 64, ForbiddenKeys: []string{"PATH", "LD_PRELOAD"}},
+			accept: []string{"APNEWS.COM"}, // policy permits dotted keys
+			reject: []string{"PATH", "ld_preload"},
+		},
 	}
-	switch t := target.(type) {
-	case **ValidationError:
-		if ve, ok := err.(*ValidationError); ok {
-			*t = ve
-			return true
-		}
-	case **SecurityError:
-		if se, ok := err.(*SecurityError); ok {
-			*t = se
-			return true
-		}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			v := NewValidator(tt.cfg)
+			for _, key := range tt.accept {
+				if err := v.ValidateSetKey(key); err != nil {
+					t.Errorf("ValidateSetKey(%q) error = %v, want nil", key, err)
+				}
+			}
+			for _, key := range tt.reject {
+				if err := v.ValidateSetKey(key); err == nil {
+					t.Errorf("ValidateSetKey(%q) = nil, want error", key)
+				}
+			}
+		})
 	}
-	return false
 }
 
 // TestValidator_ValidateKeyPolicy verifies the policy-only check used by the
@@ -599,5 +504,45 @@ func TestValidator_ValidateKeyPolicy(t *testing.T) {
 	// Full ValidateKey still applies pattern + policy.
 	if err := v.ValidateKey("PATH"); err == nil {
 		t.Error("ValidateKey(PATH) should be rejected")
+	}
+}
+
+// ============================================================================
+// ValidateValueBasic Tests
+// ============================================================================
+
+// TestValidator_ValidateValueBasic pins the fail-closed baseline used by the
+// Set and structured-load paths when ValidateValues is disabled (D-002/M-1):
+// for the built-in validator it equals the full check — length and control
+// characters always, and the UTF-8 check when the validator is configured
+// with ValidateUTF8 (the flag governs it alone, on every path).
+func TestValidator_ValidateValueBasic(t *testing.T) {
+	v := NewValidator(ValidatorConfig{MaxValueLength: 8})
+
+	if err := v.ValidateValueBasic("short"); err != nil {
+		t.Errorf("ValidateValueBasic(short) = %v, want nil", err)
+	}
+	if err := v.ValidateValueBasic("bad\x00value"); err == nil {
+		t.Error("ValidateValueBasic should reject NUL bytes")
+	}
+	if err := v.ValidateValueBasic("\x01ctrl"); err == nil {
+		t.Error("ValidateValueBasic should reject control characters")
+	}
+	if err := v.ValidateValueBasic("too long value"); err == nil {
+		t.Error("ValidateValueBasic should reject values over MaxValueLength")
+	}
+	if err := v.ValidateValueBasic("\xffbad"); err != nil {
+		t.Errorf("ValidateValueBasic(invalid UTF-8) = %v, want nil (validator not configured for UTF-8)", err)
+	}
+
+	// With ValidateUTF8 configured, the baseline honors it — keeping the
+	// switch-off write paths at parity with the .env parse path, where the
+	// UTF-8 check follows its own flag alone.
+	utf8v := NewValidator(ValidatorConfig{MaxValueLength: 8, ValidateUTF8: true})
+	if err := utf8v.ValidateValueBasic("\xffbad"); err == nil {
+		t.Error("ValidateValueBasic should reject invalid UTF-8 when configured with ValidateUTF8")
+	}
+	if err := utf8v.ValidateValueBasic("ok"); err != nil {
+		t.Errorf("ValidateValueBasic(valid UTF-8) = %v, want nil", err)
 	}
 }

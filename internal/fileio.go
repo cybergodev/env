@@ -1,4 +1,5 @@
-// Package internal provides file I/O utilities.
+// Provides file I/O utilities.
+
 package internal
 
 import (
@@ -64,6 +65,16 @@ func needsEscapeEstimate(value string) bool {
 	return false
 }
 
+// coercesOnYamlReload reports whether the bare (unquoted) scalar text would
+// not survive a reload under AllowYamlSyntax: TryParseYamlValueBytes collapses
+// "null" and "~" to the EMPTY STRING (everything else — true/false and
+// number-like text included — passes through unchanged), so exactly those two
+// spellings must be quoted. Mirrors the intent of escapeYAMLValue's guard on
+// the YAML writer side, narrowed to the .env reload path's real losses.
+func coercesOnYamlReload(value string) bool {
+	return value == "~" || EqualFoldASCII(value, "null")
+}
+
 // escapeValueToBuilder writes an escaped value directly to a strings.Builder.
 // This avoids intermediate string allocations by combining the quoting check
 // and escape counting into a single pass.
@@ -87,6 +98,25 @@ func escapeValueToBuilder(buf *strings.Builder, value string) {
 			// Backslash doesn't trigger quoting, but needs escape if quoting
 			escapeCount++
 		}
+	}
+
+	// Values that TryParseYamlValueBytes collapses to the empty string on a
+	// reload ("null" and "~") are quoted — quoting is always re-parseable,
+	// mirroring escapeYAMLValue's guard, so a Marshal→Load round trip
+	// survives AllowYamlSyntax configurations (DevelopmentConfig ships it
+	// enabled).
+	if !needsQuoting && coercesOnYamlReload(value) {
+		needsQuoting = true
+	}
+
+	// SECURITY (SEC-009, CWE-150/74): a value that contains a '$' reference
+	// ($VAR or ${VAR}) would be re-expanded by the loader on a Marshal→Load
+	// round trip (ExpandVariables defaults on), silently rewriting the value.
+	// Such values are quoted so the escaping below can emit the dollar as a
+	// literal — the .env double-quoted grammar carries "\$" through to a
+	// literal dollar after expansion (see parseDoubleQuotedBytes).
+	if strings.IndexByte(value, '$') != -1 {
+		needsQuoting = true
 	}
 
 	if !needsQuoting {
@@ -117,6 +147,12 @@ func escapeValueToBuilder(buf *strings.Builder, value string) {
 			buf.WriteString("\\\"")
 		case '\\':
 			buf.WriteString("\\\\")
+		// SECURITY (SEC-009): an escaped dollar ("\$") is preserved by the
+		// double-quoted parser as "$$" for the later expansion pass, which
+		// folds it back to one literal dollar — the exact round-trip the
+		// quoting above exists to guarantee.
+		case '$':
+			buf.WriteString(`\$`)
 		default:
 			buf.WriteByte(c)
 		}
@@ -186,6 +222,21 @@ func validateYAMLKeyForMarshal(key string) error {
 	return nil
 }
 
+// validateJSONKeyForMarshal reports whether key can round-trip through JSON
+// output. JSON can encode any key, but the library's own loader rejects
+// flattened keys failing IsValidJSONKey (see the structured parsers), so
+// emitting such a key would produce output the same library refuses to
+// load — the inconsistency SEC-06 removed from the .env and YAML paths.
+func validateJSONKeyForMarshal(key string) error {
+	if key == "" {
+		return &MarshalError{Field: "key", Message: "key cannot be empty"}
+	}
+	if !IsValidJSONKey(key) {
+		return &MarshalError{Field: "key", Message: "key cannot be represented in JSON output: fails the loader key pattern (letters, digits, '_', '@', '-', '.')"}
+	}
+	return nil
+}
+
 // MarshalFormat represents the output format for marshaling.
 type MarshalFormat int
 
@@ -227,6 +278,14 @@ func marshalToJSON(m map[string]string, sorted bool) ([]byte, error) {
 		return []byte("{}"), nil
 	}
 
+	// SECURITY (SEC-06): reject keys that cannot survive a re-parse before
+	// emitting anything, mirroring the .env and YAML writers.
+	for k := range m {
+		if err := validateJSONKeyForMarshal(k); err != nil {
+			return nil, err
+		}
+	}
+
 	// Build nested structure from flat map
 	result := make(map[string]interface{})
 
@@ -254,7 +313,14 @@ func marshalToJSON(m map[string]string, sorted bool) ([]byte, error) {
 	return data, nil
 }
 
-// setNestedValue sets a value in a nested map structure based on underscore-separated keys.
+// setNestedValue sets a value in a nested map structure based on
+// underscore-separated keys. Sorted input (the public Marshal paths always
+// sort) processes a scalar prefix key before the longer keys that would nest
+// under it, so conflicts resolve to the flat fallback deterministically. For
+// unsorted input the function is hardened in BOTH conflict directions: a
+// scalar arriving where a nested map already sits (and a longer key nesting
+// through an existing scalar) stores the incoming entry under its full flat
+// key at the top level instead of overwriting the other entry's data.
 func setNestedValue(m map[string]interface{}, key, value string) {
 	parts := strings.Split(key, "_")
 	current := m
@@ -267,17 +333,32 @@ func setNestedValue(m map[string]interface{}, key, value string) {
 		if next, ok := current[part].(map[string]interface{}); ok {
 			current = next
 		} else {
-			// If it's not a map, we can't nest further, use full key
+			// A scalar already occupies this path component — keep it and
+			// store the incoming entry under its full flat key.
 			m[key] = inferJSONType(value)
 			return
 		}
 	}
 
 	lastKey := parts[len(parts)-1]
+	if _, isMap := current[lastKey].(map[string]interface{}); isMap {
+		// A nested map (from a longer sibling key processed earlier) already
+		// sits here — keep its subtree and store the incoming entry under
+		// its full flat key at the top level.
+		m[key] = inferJSONType(value)
+		return
+	}
 	current[lastKey] = inferJSONType(value)
 }
 
-// inferJSONType attempts to infer the appropriate JSON type from a string value.
+// inferJSONType converts a string to a typed JSON value only when the
+// conversion round-trips: the canonical re-rendering must equal the input
+// string, so a Marshal→load cycle returns the original value ("7"→7,
+// "0.1"→0.1). Non-canonical spellings ("007", "1.50", "1e3", "+5", "-0")
+// stay strings, mirroring escapeYAMLValue, which quotes number-like YAML
+// scalars for the same reason. "true"/"false" re-render identically and stay
+// typed. "null" is NOT converted: JSON null reloads as "" (NullAsEmpty), so
+// typing it would silently rewrite the value.
 func inferJSONType(value string) interface{} {
 	// Empty string
 	if value == "" {
@@ -292,19 +373,23 @@ func inferJSONType(value string) interface{} {
 		return false
 	}
 
-	// Null
-	if value == "null" {
-		return nil
-	}
-
-	// Integer
-	if i, err := strconv.ParseInt(value, 10, 64); err == nil {
+	// Integer — only the canonical spelling
+	if i, err := strconv.ParseInt(value, 10, 64); err == nil && strconv.FormatInt(i, 10) == value {
 		return i
 	}
 
-	// Float
+	// Float — only the canonical spelling, checked against the LOADER's
+	// rendering: whole numbers reload via FormatInt (see flattenValue), so
+	// "-0" must stay a string even though FormatFloat renders it verbatim
+	// (it would reload as "0").
 	if f, err := strconv.ParseFloat(value, 64); err == nil {
-		return f
+		if f == float64(int64(f)) {
+			if strconv.FormatInt(int64(f), 10) == value {
+				return f
+			}
+		} else if strconv.FormatFloat(f, 'f', -1, 64) == value {
+			return f
+		}
 	}
 
 	// String (default)

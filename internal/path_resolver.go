@@ -1,4 +1,5 @@
-// Package internal provides path resolution utilities for dot-notation key access.
+// Provides path resolution utilities for dot-notation key access.
+
 package internal
 
 import (
@@ -15,7 +16,7 @@ import (
 //
 // For simple keys (no dots):
 //   - Returns both the original key and uppercase version
-//   - "HOST" -> ["HOST", "HOST"] (same key)
+//   - "HOST" -> ["HOST"] (already uppercase; single candidate)
 //   - "host" -> ["host", "HOST"] (try original first, then uppercase)
 //
 // Note: For simple keys, callers should use direct Get() with the key and its

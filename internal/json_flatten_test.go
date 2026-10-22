@@ -27,6 +27,15 @@ func defaultJSONCfg() JSONFlattenConfig {
 func TestFlattenJSON(t *testing.T) {
 	longKey := strings.Repeat("K", 70)
 
+	depth2 := defaultJSONCfg()
+	depth2.MaxDepth = 2
+	dupError := defaultJSONCfg()
+	dupError.DuplicateKey = DuplicateKeyError
+	dupFirst := defaultJSONCfg()
+	dupFirst.DuplicateKey = DuplicateKeyFirstWins
+	dupLast := defaultJSONCfg()
+	dupLast.DuplicateKey = DuplicateKeyLastWins
+
 	tests := []struct {
 		name        string
 		input       string
@@ -44,6 +53,43 @@ func TestFlattenJSON(t *testing.T) {
 			wantLen: 0,
 		},
 		{
+			// The root pre-scan rejects the whole document before any
+			// decoding; distinct from the container-loop propagation case.
+			name:        "root depth pre-scan rejects deep document",
+			input:       `{"a":{"b":{"c":1}}}`,
+			cfg:         depth2,
+			wantErr:     true,
+			wantJSONErr: true,
+		},
+		{
+			name:        "flat-key collision rejects document",
+			input:       `{"a_b": 1, "a": {"b": 2}}`,
+			cfg:         defaultJSONCfg(),
+			wantErr:     true,
+			wantJSONErr: true,
+		},
+		{
+			name:        "duplicate-key error policy pre-scan rejects",
+			input:       `{"KEY": 1, "KEY": 2}`,
+			cfg:         dupError,
+			wantErr:     true,
+			wantJSONErr: true,
+		},
+		{
+			name:        "first-wins policy rejects JSON duplicates explicitly",
+			input:       `{"KEY": 1, "KEY": 2}`,
+			cfg:         dupFirst,
+			wantErr:     true,
+			wantJSONErr: true,
+		},
+		{
+			name:    "last-wins policy accepts JSON duplicates",
+			input:   `{"KEY": 1, "KEY": 2}`,
+			cfg:     dupLast,
+			want:    map[string]string{"KEY": "2"},
+			wantLen: 1,
+		},
+		{
 			name:    "root null yields empty map",
 			input:   `null`,
 			cfg:     defaultJSONCfg(),
@@ -52,6 +98,20 @@ func TestFlattenJSON(t *testing.T) {
 		{
 			name:    "root scalar yields empty map",
 			input:   `"hello"`,
+			cfg:     defaultJSONCfg(),
+			wantLen: 0,
+		},
+		{
+			// Root scalars contribute no keys (the prefix guard in
+			// flattenDecoded): bool and number mirror the string case above.
+			name:    "root bool yields empty map",
+			input:   `true`,
+			cfg:     defaultJSONCfg(),
+			wantLen: 0,
+		},
+		{
+			name:    "root number yields empty map",
+			input:   `42`,
 			cfg:     defaultJSONCfg(),
 			wantLen: 0,
 		},
@@ -159,16 +219,6 @@ func TestFlattenJSON(t *testing.T) {
 			want:  map[string]string{"ENABLED": "false"},
 		},
 		{
-			name:  "bool rendered when BoolAsString is off",
-			input: `{"flag": true}`,
-			cfg: func() JSONFlattenConfig {
-				cfg := defaultJSONCfg()
-				cfg.BoolAsString = false
-				return cfg
-			}(),
-			want: map[string]string{"FLAG": "true"},
-		},
-		{
 			name:  "integer",
 			input: `{"count": 42}`,
 			cfg:   defaultJSONCfg(),
@@ -193,24 +243,47 @@ func TestFlattenJSON(t *testing.T) {
 			want:  map[string]string{"TEMP": "-10"},
 		},
 		{
+			// 1e21 actually distinguishes the two renderings (flatten_keys.go
+			// float64 arm): NumberAsString off renders via %v, which keeps
+			// the exponent ("1e+21"). An integer like 42 renders identically
+			// either way and would pin nothing.
 			name:  "number rendered when NumberAsString is off",
-			input: `{"count": 42}`,
+			input: `{"count": 1e21}`,
 			cfg: func() JSONFlattenConfig {
 				cfg := defaultJSONCfg()
 				cfg.NumberAsString = false
 				return cfg
 			}(),
-			want: map[string]string{"COUNT": "42"},
+			want: map[string]string{"COUNT": "1e+21"},
 		},
 		{
-			name:    "empty object produces no entries",
-			input:   `{"empty": {}}`,
-			cfg:     defaultJSONCfg(),
-			wantLen: 0,
+			// Companion: with NumberAsString on, the same input goes through
+			// FormatFloat('f', -1) — 1e21 overflows int64, so the whole-number
+			// FormatInt shortcut does not apply and the value expands.
+			name:  "large exponent rendered expanded when NumberAsString is on",
+			input: `{"count": 1e21}`,
+			cfg:   defaultJSONCfg(),
+			want:  map[string]string{"COUNT": "1000000000000000000000"},
 		},
 		{
-			name:    "empty array produces no entries",
-			input:   `{"empty": []}`,
+			// Unified empty-container semantics (M-4): a key present in the
+			// document exists in the store as "" — mirroring null handling
+			// and the YAML block form, instead of vanishing.
+			name:  "empty object produces empty string",
+			input: `{"empty": {}}`,
+			cfg:   defaultJSONCfg(),
+			want:  map[string]string{"EMPTY": ""},
+		},
+		{
+			name:  "empty array produces empty string",
+			input: `{"empty": []}`,
+			cfg:   defaultJSONCfg(),
+			want:  map[string]string{"EMPTY": ""},
+		},
+		{
+			// An empty ROOT document stays keyless (the prefix guard).
+			name:    "empty root object produces no entries",
+			input:   `{}`,
 			cfg:     defaultJSONCfg(),
 			wantLen: 0,
 		},
@@ -222,22 +295,52 @@ func TestFlattenJSON(t *testing.T) {
 			wantJSONErr: true,
 		},
 		{
-			name: "max depth exceeded returns error",
-			input: `{
-				"a": {
-					"b": {
-						"c": {
-							"d": "deep"
-						}
-					}
-				}
-			}`,
+			// Boundary: depth == MaxDepth is accepted; only strictly deeper
+			// documents fail. (The over-limit side is pinned by
+			// TestFlattenJSON_DepthErrorPropagation, including the *JSONError
+			// type and container-loop propagation.)
+			name:  "max depth exact boundary succeeds",
+			input: `{"a":{"b":1}}`,
 			cfg: func() JSONFlattenConfig {
 				cfg := defaultJSONCfg()
-				cfg.MaxDepth = 2
+				cfg.MaxDepth = 3
 				return cfg
 			}(),
-			wantErr: true,
+			want: map[string]string{"A_B": "1"},
+		},
+		{
+			// Boundary: writeUpperASCII passes non-ASCII bytes through
+			// unchanged (byte-level fold) and the delimiter joins the path
+			// segments without altering them.
+			name:  "unicode keys pass through with delimiter join",
+			input: `{"数据库":{"主机":"x"}}`,
+			cfg:   defaultJSONCfg(),
+			want:  map[string]string{"数据库_主机": "x"},
+		},
+		{
+			// Boundary: an unrecognized ArrayIndexFormat string is not an
+			// error — buildFlatArrayIndex falls back to the underscore form
+			// for anything that is not "bracket".
+			name:  "unknown array index format falls back to underscore",
+			input: `{"items": ["a"]}`,
+			cfg: func() JSONFlattenConfig {
+				cfg := defaultJSONCfg()
+				cfg.ArrayIndexFormat = "roman"
+				return cfg
+			}(),
+			want: map[string]string{"ITEMS_0": "a"},
+		},
+		{
+			// Boundary: an empty KeyDelimiter concatenates path segments
+			// with no separator (buildFlatKey writes the delimiter verbatim).
+			name:  "empty key delimiter concatenates without separator",
+			input: `{"a":{"b":"x"}}`,
+			cfg: func() JSONFlattenConfig {
+				cfg := defaultJSONCfg()
+				cfg.KeyDelimiter = ""
+				return cfg
+			}(),
+			want: map[string]string{"AB": "x"},
 		},
 		{
 			name: "complex structure",
@@ -355,8 +458,8 @@ func TestFlattenJSON(t *testing.T) {
 // ============================================================================
 
 func TestBuildKey_JSON(t *testing.T) {
-	cfg := JSONFlattenConfig{KeyDelimiter: "_"}
-
+	// Key construction is shared with the YAML flattener (flatten_keys.go);
+	// these cases pin the JSON-side layout through the shared builders.
 	tests := []struct {
 		prefix   string
 		key      string
@@ -370,9 +473,9 @@ func TestBuildKey_JSON(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.prefix+"_"+tt.key, func(t *testing.T) {
-			result := buildKey(tt.prefix, tt.key, cfg)
+			result := buildFlatKey(tt.prefix, tt.key, "_")
 			if result != tt.expected {
-				t.Errorf("buildKey(%q, %q) = %q, want %q", tt.prefix, tt.key, result, tt.expected)
+				t.Errorf("buildFlatKey(%q, %q) = %q, want %q", tt.prefix, tt.key, result, tt.expected)
 			}
 		})
 	}
@@ -408,9 +511,9 @@ func TestBuildArrayIndex_JSON(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			result := buildArrayIndex(tt.prefix, tt.index, tt.cfg)
+			result := buildFlatArrayIndex(tt.prefix, tt.index, tt.cfg.KeyDelimiter, tt.cfg.ArrayIndexFormat)
 			if result != tt.expected {
-				t.Errorf("buildArrayIndex(%q, %d) = %q, want %q", tt.prefix, tt.index, result, tt.expected)
+				t.Errorf("buildFlatArrayIndex(%q, %d) = %q, want %q", tt.prefix, tt.index, result, tt.expected)
 			}
 		})
 	}
@@ -448,58 +551,66 @@ func TestFlattenJSON_DepthErrorPropagation(t *testing.T) {
 	}
 }
 
-// TestFlattenJSON_RootBoolAndNumber pins the root-scalar contract for bool
-// and number inputs: like root strings and null, they contribute no keys
-// and no error.
-func TestFlattenJSON_RootBoolAndNumber(t *testing.T) {
-	for _, input := range []string{"true", "42"} {
-		result, err := FlattenJSON([]byte(input), defaultJSONCfg())
+// TestFlattenJSON_NilInput pins the len==0 branch (json_flatten.go): nil
+// input is not an error — it yields an empty map, like an empty byte slice.
+func TestFlattenJSON_NilInput(t *testing.T) {
+	result, err := FlattenJSON(nil, defaultJSONCfg())
+	if err != nil {
+		t.Fatalf("FlattenJSON(nil) error = %v, want nil", err)
+	}
+	if len(result) != 0 {
+		t.Errorf("FlattenJSON(nil) = %v, want empty map", result)
+	}
+}
+
+// TestFlattenJSON_WhitespaceOnly pins the GEN-001 consistency fix: a JSON
+// document containing only whitespace flattens to an empty map like an empty
+// file does, instead of surfacing a JSON syntax error (the .env and YAML
+// paths already treated whitespace-only input as empty).
+func TestFlattenJSON_WhitespaceOnly(t *testing.T) {
+	for _, in := range []string{"", "\n", " \t\r\n", "   "} {
+		result, err := FlattenJSON([]byte(in), defaultJSONCfg())
 		if err != nil {
-			t.Errorf("FlattenJSON(%s) error = %v, want nil", input, err)
+			t.Fatalf("FlattenJSON(%q) error = %v, want nil", in, err)
 		}
 		if len(result) != 0 {
-			t.Errorf("FlattenJSON(%s) = %v, want empty map", input, result)
+			t.Errorf("FlattenJSON(%q) = %v, want empty map", in, result)
 		}
 	}
 }
 
-// TestScanJSONLimits_MalformedAndStrings covers the pre-scanner's
-// tolerance branches: negative nesting clamps to zero, and string bodies
-// (including escaped quotes) are skipped so brackets inside JSON strings
-// never count toward the depth or the node count.
-func TestScanJSONLimits_MalformedAndStrings(t *testing.T) {
+// TestScanJSONLimits covers the pre-scanner in one table: the tolerance
+// branches (negative nesting clamps to zero; string bodies, including
+// escaped quotes, are skipped so brackets inside JSON strings never count)
+// and the node cap, exercised independently of the global HardMaxJSONNodes
+// constant via per-row caps. maxDepth is 5 for every row.
+func TestScanJSONLimits(t *testing.T) {
 	tests := []struct {
-		name  string
-		input string
-		want  bool
+		name      string
+		input     string
+		maxNodes  int
+		wantDepth bool
+		wantNodes bool
 	}{
-		{"unbalanced close clamps to zero", `{"a":1}]`, false},
-		{"bracket inside string ignored", `{"k": "a[b"}`, false},
-		{"escaped quote does not end string", `{"a\":\"b": 1}`, false},
-		{"deep real nesting detected", `[[[[[[1]]]]]]`, true},
+		{"unbalanced close clamps to zero", `{"a":1}]`, HardMaxJSONNodes, false, false},
+		{"bracket inside string ignored", `{"k": "a[b"}`, HardMaxJSONNodes, false, false},
+		{"escaped quote does not end string", `{"a\":\"b": 1}`, HardMaxJSONNodes, false, false},
+		{"deep real nesting detected", `[[[[[[1]]]]]]`, HardMaxJSONNodes, true, false},
+		// `[1,2,3]` = 1 opening bracket + 2 commas = 3 nodes.
+		{"node cap exceeded", `[1,2,3]`, 2, false, true},
+		{"node cap exactly at limit ok", `[1,2,3]`, 3, false, false},
+		{"string contents must not count toward the node cap", `"[,,"`, 2, false, false},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			if got, _ := scanJSONLimits([]byte(tt.input), 0, 5, HardMaxJSONNodes); got != tt.want {
-				t.Errorf("scanJSONLimits(%s) depth = %v, want %v", tt.input, got, tt.want)
+			gotDepth, gotNodes := scanJSONLimits([]byte(tt.input), 0, 5, tt.maxNodes)
+			if gotDepth != tt.wantDepth {
+				t.Errorf("scanJSONLimits(%s) depth = %v, want %v", tt.input, gotDepth, tt.wantDepth)
+			}
+			if gotNodes != tt.wantNodes {
+				t.Errorf("scanJSONLimits(%s) nodes = %v, want %v", tt.input, gotNodes, tt.wantNodes)
 			}
 		})
-	}
-}
-
-// TestScanJSONLimits_NodeCount verifies the node cap path independently of
-// the global HardMaxJSONNodes constant.
-func TestScanJSONLimits_NodeCount(t *testing.T) {
-	// `[1,2,3]` = 1 opening bracket + 2 commas = 3 nodes.
-	if _, nodes := scanJSONLimits([]byte(`[1,2,3]`), 0, 10, 2); !nodes {
-		t.Error("nodes=true want exceeded for 3 nodes against cap 2")
-	}
-	if _, nodes := scanJSONLimits([]byte(`[1,2,3]`), 0, 10, 3); nodes {
-		t.Error("nodes=false want ok for 3 nodes against cap 3")
-	}
-	// Brackets and commas inside strings do not count.
-	if _, nodes := scanJSONLimits([]byte(`"[,,"`), 0, 10, 2); nodes {
-		t.Error("string contents must not count toward the node cap")
 	}
 }
 

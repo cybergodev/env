@@ -1,4 +1,5 @@
-// Package internal provides key lookup utilities for plain map[string]string.
+// Provides key lookup utilities for plain map[string]string.
+
 package internal
 
 import "strings"
@@ -9,25 +10,32 @@ type LookupFunc func(key string) (string, bool)
 
 // ResolveKey resolves a key using the standard resolution strategy:
 //  1. Exact match
-//  2. Uppercase fallback (for simple keys without dots)
+//  2. Uppercase fallback
 //  3. Dot-notation resolution via ResolvePath (e.g., "database.host" -> "DATABASE_HOST")
 //  4. Comma-separated indexed access fallback (e.g., "list.0" -> first element of "list")
+//
+// Steps 1-2 run for every key, dotted or not: stored keys may themselves
+// contain dots (a YAML/JSON top-level key like "apnews.com" is flattened
+// verbatim to "APNEWS.COM"), and the dot-notation candidates in step 3
+// only ever contain the underscore-joined form — without the literal match
+// such keys would be unreachable.
 //
 // Returns the stored value as-is (no trimming). Values are trimmed during parsing,
 // so this is consistent with All()/ToMap().
 // Returns (value, true) if found, ("", false) otherwise.
 func ResolveKey(key string, lookup LookupFunc) (string, bool) {
-	// Fast path: simple keys (no dots) — avoid ResolvePath allocation
-	if strings.IndexByte(key, '.') == -1 {
-		if value, ok := lookup(key); ok {
+	if value, ok := lookup(key); ok {
+		return value, true
+	}
+	upper := ToUpperASCII(key)
+	if upper != key {
+		if value, ok := lookup(upper); ok {
 			return value, true
 		}
-		upper := ToUpperASCII(key)
-		if upper != key {
-			if value, ok := lookup(upper); ok {
-				return value, true
-			}
-		}
+	}
+
+	// Fast path: simple keys (no dots) have no further resolution strategy
+	if strings.IndexByte(key, '.') == -1 {
 		return "", false
 	}
 
@@ -52,6 +60,36 @@ func ResolveKey(key string, lookup LookupFunc) (string, bool) {
 	}
 
 	return "", false
+}
+
+// ResolveBaseKeys returns the storage-key candidates for key in lookup
+// resolution order: the literal key, its uppercase form, then the
+// dot-notation candidates from ResolvePath (underscore- and bracket-joined).
+// Duplicates are removed preserving first occurrence.
+//
+// GetSliceFrom uses this to probe indexed keys (KEY_0, KEY_1, ...) and the
+// comma-separated fallback against the same base-key order that
+// Lookup/ResolveKey use for scalar values, so keys that literally contain
+// dots (a YAML "apnews.com" array flattens to APNEWS.COM_0, APNEWS.COM_1)
+// resolve exactly like nested paths (database.hosts -> DATABASE_HOST_0).
+func ResolveBaseKeys(key string) []string {
+	candidates := make([]string, 0, 4)
+	add := func(k string) {
+		for _, existing := range candidates {
+			if existing == k {
+				return
+			}
+		}
+		candidates = append(candidates, k)
+	}
+	add(key)
+	if upper := ToUpperASCII(key); upper != key {
+		add(upper)
+	}
+	for _, c := range ResolvePath(key) {
+		add(c)
+	}
+	return candidates
 }
 
 // SplitAndTrimAt returns the element at the given index from a comma-separated string.
@@ -96,22 +134,23 @@ func LookupInMap(data map[string]string, key string) (string, bool) {
 // rather than the value itself.
 //
 // Resolution strategy:
-//  1. Exact match
-//  2. Uppercase fallback (for simple keys without dots)
+//  1. Exact match (including literal keys containing dots, e.g. "APNEWS.COM")
+//  2. Uppercase fallback
 //  3. Dot-notation resolution via ResolvePath
 //
 // Note: Does NOT include the comma-separated indexed access fallback,
 // since that strategy produces virtual values, not real storage keys.
 func ResolveKeyName(key string, exists func(string) bool) (string, bool) {
-	// Fast path: simple keys (no dots) — avoid ResolvePath allocation
+	if exists(key) {
+		return key, true
+	}
+	upper := ToUpperASCII(key)
+	if upper != key && exists(upper) {
+		return upper, true
+	}
+
+	// Fast path: simple keys (no dots) have no further resolution strategy
 	if strings.IndexByte(key, '.') == -1 {
-		if exists(key) {
-			return key, true
-		}
-		upper := ToUpperASCII(key)
-		if upper != key && exists(upper) {
-			return upper, true
-		}
 		return "", false
 	}
 

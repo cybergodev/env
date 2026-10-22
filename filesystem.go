@@ -8,6 +8,14 @@ import (
 // FileSystem defines the interface for file system operations.
 // This interface allows for dependency injection, making code more testable
 // by enabling mock implementations.
+//
+// Only a subset of this interface is exercised by the library itself: Open,
+// LookupEnv, Setenv, and Unsetenv (file size/stat checks go through File.Stat
+// on the handle returned by Open). The remaining methods (OpenFile, Stat,
+// MkdirAll, Remove, Rename, Getenv) exist for callers that wrap env.FileSystem
+// in their own code; the library never calls them. A minimal in-memory mock
+// for the library's needs only has to implement the four core methods plus
+// Open returning a File.
 type FileSystem interface {
 	// Open opens a file for reading.
 	Open(name string) (File, error)
@@ -28,6 +36,8 @@ type FileSystem interface {
 	Rename(oldpath, newpath string) error
 
 	// Getenv retrieves the value of the environment variable named by the key.
+	// Not used by the library itself (LookupEnv covers all internal reads);
+	// part of the interface for callers that wrap env.FileSystem.
 	Getenv(key string) string
 
 	// Setenv sets the value of the environment variable named by the key.
@@ -106,4 +116,12 @@ func (OSFileSystem) LookupEnv(key string) (string, bool) {
 }
 
 // DefaultFileSystem is the default file system implementation using the real OS.
+//
+// It is a process-global runtime knob rather than a Config setting — it backs
+// every Loader that does not set ComponentConfig.FileSystem (the per-instance
+// override). Assign it at program init; see the concurrency contract below.
+//
+// Concurrency contract: New and the component factory read this variable
+// without locking, so it must be assigned at program init, before concurrent
+// use of this package — mutating it concurrently with New/Load is a data race.
 var DefaultFileSystem FileSystem = OSFileSystem{}

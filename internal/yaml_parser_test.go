@@ -1,660 +1,243 @@
 package internal
 
 import (
+	"errors"
+	"sort"
+	"strings"
 	"testing"
 )
 
 // ============================================================================
 // YAML Parser Tests
 // ============================================================================
-
-func TestYAMLParser_SimpleMap(t *testing.T) {
-	input := "key: value"
-	lexer := newYAMLLexer([]byte(input))
-	tokens, err := lexer.tokenizeInto(nil)
-	if err != nil {
-		t.Fatalf("Tokenize() error = %v", err)
-	}
-
-	parser := NewYAMLParser(tokens, 10)
-	result, err := parser.Parse()
-	if err != nil {
-		t.Fatalf("Parse() error = %v", err)
-	}
-
-	if result.Type != ValueTypeMap {
-		t.Errorf("result type = %v, want ValueTypeMap", result.Type)
-	}
-
-	if len(result.Map) != 1 {
-		t.Errorf("result map length = %d, want 1", len(result.Map))
-		return
-	}
-
-	if result.Map["key"].Scalar != "value" {
-		t.Errorf("result[\"key\"] = %q, want %q", result.Map["key"].Scalar, "value")
-	}
-}
-
-func TestYAMLParser_NestedMap(t *testing.T) {
-	input := `database:
-  host: localhost
-  port: 5432`
-	lexer := newYAMLLexer([]byte(input))
-	tokens, err := lexer.tokenizeInto(nil)
-	if err != nil {
-		t.Fatalf("Tokenize() error = %v", err)
-	}
-
-	parser := NewYAMLParser(tokens, 10)
-	result, err := parser.Parse()
-	if err != nil {
-		t.Fatalf("Parse() error = %v", err)
-	}
-
-	db, ok := result.Map["database"]
-	if !ok {
-		t.Fatal("expected 'database' key")
-	}
-
-	if db.Type != ValueTypeMap {
-		t.Errorf("database type = %v, want ValueTypeMap", db.Type)
-	}
-
-	if db.Map["host"].Scalar != "localhost" {
-		t.Errorf("database.host = %q, want %q", db.Map["host"].Scalar, "localhost")
-	}
-
-	if db.Map["port"].Scalar != "5432" {
-		t.Errorf("database.port = %q, want %q", db.Map["port"].Scalar, "5432")
-	}
-}
-
-func TestYAMLParser_Array(t *testing.T) {
-	input := `items:
-  - one
-  - two
-  - three`
-	lexer := newYAMLLexer([]byte(input))
-	tokens, err := lexer.tokenizeInto(nil)
-	if err != nil {
-		t.Fatalf("Tokenize() error = %v", err)
-	}
-
-	parser := NewYAMLParser(tokens, 10)
-	result, err := parser.Parse()
-	if err != nil {
-		t.Fatalf("Parse() error = %v", err)
-	}
-
-	items, ok := result.Map["items"]
-	if !ok {
-		t.Fatal("expected 'items' key")
-	}
-
-	if items.Type != ValueTypeArray {
-		t.Errorf("items type = %v, want ValueTypeArray", items.Type)
-	}
-
-	if len(items.Array) != 3 {
-		t.Errorf("items length = %d, want 3", len(items.Array))
-		return
-	}
-
-	expected := []string{"one", "two", "three"}
-	for i, exp := range expected {
-		if items.Array[i].Scalar != exp {
-			t.Errorf("items[%d] = %q, want %q", i, items.Array[i].Scalar, exp)
-		}
-	}
-}
-
-func TestYAMLParser_ArrayOfMaps(t *testing.T) {
-	input := `servers:
-  - host: server1
-    port: 8080
-  - host: server2
-    port: 9090`
-	lexer := newYAMLLexer([]byte(input))
-	tokens, err := lexer.tokenizeInto(nil)
-	if err != nil {
-		t.Fatalf("Tokenize() error = %v", err)
-	}
-
-	parser := NewYAMLParser(tokens, 10)
-	result, err := parser.Parse()
-	if err != nil {
-		t.Fatalf("Parse() error = %v", err)
-	}
-
-	servers, ok := result.Map["servers"]
-	if !ok {
-		t.Fatal("expected 'servers' key")
-	}
-
-	if servers.Type != ValueTypeArray {
-		t.Errorf("servers type = %v, want ValueTypeArray", servers.Type)
-	}
-
-	if len(servers.Array) != 2 {
-		t.Errorf("servers length = %d, want 2", len(servers.Array))
-		return
-	}
-
-	// Check first server
-	if servers.Array[0].Map["host"].Scalar != "server1" {
-		t.Errorf("servers[0].host = %q, want %q", servers.Array[0].Map["host"].Scalar, "server1")
-	}
-
-	// Check second server
-	if servers.Array[1].Map["host"].Scalar != "server2" {
-		t.Errorf("servers[1].host = %q, want %q", servers.Array[1].Map["host"].Scalar, "server2")
-	}
-}
-
-func TestYAMLParser_EmptyValue(t *testing.T) {
-	input := `key:`
-	lexer := newYAMLLexer([]byte(input))
-	tokens, err := lexer.tokenizeInto(nil)
-	if err != nil {
-		t.Fatalf("Tokenize() error = %v", err)
-	}
-
-	parser := NewYAMLParser(tokens, 10)
-	result, err := parser.Parse()
-	if err != nil {
-		t.Fatalf("Parse() error = %v", err)
-	}
-
-	if result.Map["key"].Scalar != "" {
-		t.Errorf("empty key value = %q, want empty", result.Map["key"].Scalar)
-	}
-}
-
-func TestYAMLParser_EmptyDocument(t *testing.T) {
-	lexer := newYAMLLexer([]byte(""))
-	tokens, err := lexer.tokenizeInto(nil)
-	if err != nil {
-		t.Fatalf("Tokenize() error = %v", err)
-	}
-
-	parser := NewYAMLParser(tokens, 10)
-	result, err := parser.Parse()
-	if err != nil {
-		t.Fatalf("Parse() error = %v", err)
-	}
-
-	if result.Type != ValueTypeMap {
-		t.Errorf("result type = %v, want ValueTypeMap", result.Type)
-	}
-
-	if len(result.Map) != 0 {
-		t.Errorf("result map length = %d, want 0", len(result.Map))
-	}
-}
-
-func TestYAMLParser_MaxDepth(t *testing.T) {
-	// Create deeply nested input
-	input := `a:
-  b:
-    c:
-      d:
-        e: value`
-	lexer := newYAMLLexer([]byte(input))
-	tokens, err := lexer.tokenizeInto(nil)
-	if err != nil {
-		t.Fatalf("Tokenize() error = %v", err)
-	}
-
-	// Test with low max depth
-	parser := NewYAMLParser(tokens, 2)
-	_, err = parser.Parse()
-	if err == nil {
-		t.Error("expected max depth error")
-	}
-}
-
-func TestYAMLParser_DocumentStart(t *testing.T) {
-	input := `---
-key: value`
-	lexer := newYAMLLexer([]byte(input))
-	tokens, err := lexer.tokenizeInto(nil)
-	if err != nil {
-		t.Fatalf("Tokenize() error = %v", err)
-	}
-
-	parser := NewYAMLParser(tokens, 10)
-	result, err := parser.Parse()
-	if err != nil {
-		t.Fatalf("Parse() error = %v", err)
-	}
-
-	if result.Map["key"].Scalar != "value" {
-		t.Errorf("key = %q, want %q", result.Map["key"].Scalar, "value")
-	}
-}
-
-func TestYAMLParser_Comments(t *testing.T) {
-	input := `# comment at start
-key: value # inline comment
-# comment at end`
-	lexer := newYAMLLexer([]byte(input))
-	tokens, err := lexer.tokenizeInto(nil)
-	if err != nil {
-		t.Fatalf("Tokenize() error = %v", err)
-	}
-
-	parser := NewYAMLParser(tokens, 10)
-	result, err := parser.Parse()
-	if err != nil {
-		t.Fatalf("Parse() error = %v", err)
-	}
-
-	if len(result.Map) != 1 {
-		t.Errorf("result map length = %d, want 1", len(result.Map))
-	}
-
-	if result.Map["key"].Scalar != "value" {
-		t.Errorf("key = %q, want %q", result.Map["key"].Scalar, "value")
-	}
-}
-
-func TestYAMLParser_QuotedValues(t *testing.T) {
-	tests := []struct {
-		name     string
-		input    string
-		expected string
-	}{
-		{
-			name:     "double quoted",
-			input:    `key: "value with spaces"`,
-			expected: "value with spaces",
-		},
-		{
-			name:     "single quoted",
-			input:    `key: 'value with spaces'`,
-			expected: "value with spaces",
-		},
-		{
-			name:     "with newline",
-			input:    `key: "line1\nline2"`,
-			expected: "line1\nline2",
-		},
-	}
-
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			lexer := newYAMLLexer([]byte(tt.input))
-			tokens, err := lexer.tokenizeInto(nil)
-			if err != nil {
-				t.Fatalf("Tokenize() error = %v", err)
-			}
-
-			parser := NewYAMLParser(tokens, 10)
-			result, err := parser.Parse()
-			if err != nil {
-				t.Fatalf("Parse() error = %v", err)
-			}
-
-			if result.Map["key"].Scalar != tt.expected {
-				t.Errorf("value = %q, want %q", result.Map["key"].Scalar, tt.expected)
-			}
-		})
-	}
-}
-
-func TestYAMLParser_MultipleKeys(t *testing.T) {
-	input := `key1: value1
-key2: value2
-key3: value3`
-	lexer := newYAMLLexer([]byte(input))
-	tokens, err := lexer.tokenizeInto(nil)
-	if err != nil {
-		t.Fatalf("Tokenize() error = %v", err)
-	}
-
-	parser := NewYAMLParser(tokens, 10)
-	result, err := parser.Parse()
-	if err != nil {
-		t.Fatalf("Parse() error = %v", err)
-	}
-
-	if len(result.Map) != 3 {
-		t.Errorf("result map length = %d, want 3", len(result.Map))
-	}
-
-	expected := map[string]string{
-		"key1": "value1",
-		"key2": "value2",
-		"key3": "value3",
-	}
-
-	for key, exp := range expected {
-		if result.Map[key].Scalar != exp {
-			t.Errorf("result[%q] = %q, want %q", key, result.Map[key].Scalar, exp)
-		}
-	}
-}
-
-func TestYAMLParser_NestedArrays(t *testing.T) {
-	input := `matrix:
-  - - a
-    - b
-  - - c
-    - d`
-	lexer := newYAMLLexer([]byte(input))
-	tokens, err := lexer.tokenizeInto(nil)
-	if err != nil {
-		t.Fatalf("Tokenize() error = %v", err)
-	}
-
-	parser := NewYAMLParser(tokens, 10)
-	result, err := parser.Parse()
-	if err != nil {
-		t.Fatalf("Parse() error = %v", err)
-	}
-
-	matrix, ok := result.Map["matrix"]
-	if !ok {
-		t.Fatal("expected 'matrix' key")
-	}
-
-	if matrix.Type != ValueTypeArray {
-		t.Errorf("matrix type = %v, want ValueTypeArray", matrix.Type)
-	}
-
-	// The parser may interpret nested arrays differently
-	// Just verify we have an array with content
-	if len(matrix.Array) < 1 {
-		t.Errorf("matrix length = %d, expected at least 1", len(matrix.Array))
-	}
-}
-
-// ============================================================================
-// ParseYAML Function Tests
-// ============================================================================
-
-func TestParseYAML(t *testing.T) {
-	data := []byte("key: value")
-	result, err := ParseYAML(data, 10)
-	if err != nil {
-		t.Fatalf("ParseYAML() error = %v", err)
-	}
-
-	if result.Map["key"].Scalar != "value" {
-		t.Errorf("key = %q, want %q", result.Map["key"].Scalar, "value")
-	}
-}
-
-func TestParseYAML_Complex(t *testing.T) {
-	data := []byte(`
-app:
-  name: myapp
-  version: "1.0.0"
-database:
-  host: localhost
-  port: 5432
-  credentials:
-    username: admin
-    password: secret
-features:
-  - auth
-  - logging
-  - cache
-`)
-
-	result, err := ParseYAML(data, 10)
-	if err != nil {
-		t.Fatalf("ParseYAML() error = %v", err)
-	}
-
-	// Check nested structure - keys are lowercase in the parsed result
-	app := result.Map["app"]
-	if app == nil {
-		// Keys might be uppercase, check both
-		app = result.Map["APP"]
-		if app == nil {
-			t.Fatalf("expected 'app' or 'APP' key, got keys: %v", getMapKeys(result.Map))
-		}
-	}
-
-	nameKey := "name"
-	if app.Map[nameKey] == nil {
-		nameKey = "NAME"
-	}
-	if app.Map[nameKey] == nil {
-		t.Fatalf("expected 'name' or 'NAME' key in app, got keys: %v", getMapKeys(app.Map))
-	}
-	if app.Map[nameKey].Scalar != "myapp" {
-		t.Errorf("app.name = %q, want %q", app.Map[nameKey].Scalar, "myapp")
-	}
-
-	// Check database
-	db := result.Map["database"]
-	if db == nil {
-		db = result.Map["DATABASE"]
-	}
-	if db == nil {
-		t.Fatal("expected 'database' key")
-	}
-
-	credsKey := "credentials"
-	if db.Map[credsKey] == nil {
-		credsKey = "CREDENTIALS"
-	}
-	creds := db.Map[credsKey]
-	if creds == nil {
-		t.Fatal("expected database.credentials key")
-	}
-
-	usernameKey := "username"
-	if creds.Map[usernameKey] == nil {
-		usernameKey = "USERNAME"
-	}
-	if creds.Map[usernameKey].Scalar != "admin" {
-		t.Errorf("database.credentials.username = %q, want %q", creds.Map[usernameKey].Scalar, "admin")
-	}
-
-	// Check features array
-	features := result.Map["features"]
-	if features == nil {
-		features = result.Map["FEATURES"]
-	}
-	if features == nil {
-		t.Fatal("expected 'features' key")
-	}
-
-	if features.Type != ValueTypeArray {
-		t.Errorf("features type = %v, want ValueTypeArray", features.Type)
-	}
-
-	if len(features.Array) != 3 {
-		t.Errorf("features length = %d, want 3", len(features.Array))
-	}
-}
-
-// Helper function to get map keys
-func getMapKeys(m map[string]*Value) []string {
+//
+// Coverage map for this file:
+//   - TestYAMLParser_Structure: every parse-pipeline shape (table-driven,
+//     through the public ParseYAML API).
+//   - TestParseYAML / TestParseYAML_Complex: the real entry point.
+//   - TestYAMLParser_TokenLevelBranches and the direct-construction tests
+//     below: defensive branches the lexer never emits.
+//
+// Lexer-level behavior (quoting, escapes, colons-in-values, comment
+// stripping, line endings, token counts) is pinned authoritatively in
+// yaml_lexer_test.go and is deliberately not retested here.
+
+// iyValueKeys returns the sorted keys of a parsed Value map for failure
+// messages. (keysOf in yaml_flatten_test.go serves the same purpose for
+// map[string]string and is shared with json_flatten_test.go.)
+func iyValueKeys(m map[string]*Value) []string {
 	keys := make([]string, 0, len(m))
 	for k := range m {
 		keys = append(keys, k)
 	}
+	sort.Strings(keys)
 	return keys
 }
 
-// ============================================================================
-// Value Type Tests
-// ============================================================================
-
-func TestNewScalarValue(t *testing.T) {
-	v := NewScalarValue("test", 1, 5)
-	if v.Type != ValueTypeScalar {
-		t.Errorf("type = %v, want ValueTypeScalar", v.Type)
-	}
-	if v.Scalar != "test" {
-		t.Errorf("scalar = %q, want %q", v.Scalar, "test")
-	}
-	if v.Line != 1 {
-		t.Errorf("line = %d, want 1", v.Line)
-	}
-	if v.Column != 5 {
-		t.Errorf("column = %d, want 5", v.Column)
-	}
-}
-
-func TestNewMapValue(t *testing.T) {
-	v := NewMapValue(2, 10)
-	if v.Type != ValueTypeMap {
-		t.Errorf("type = %v, want ValueTypeMap", v.Type)
-	}
-	if v.Map == nil {
-		t.Error("map is nil")
-	}
-	if v.Line != 2 {
-		t.Errorf("line = %d, want 2", v.Line)
-	}
-	if v.Column != 10 {
-		t.Errorf("column = %d, want 10", v.Column)
-	}
-}
-
-func TestNewArrayValue(t *testing.T) {
-	v := NewArrayValue(3, 15)
-	if v.Type != ValueTypeArray {
-		t.Errorf("type = %v, want ValueTypeArray", v.Type)
-	}
-	if v.Array == nil {
-		t.Error("array is nil")
-	}
-	if v.Line != 3 {
-		t.Errorf("line = %d, want 3", v.Line)
-	}
-	if v.Column != 15 {
-		t.Errorf("column = %d, want 15", v.Column)
-	}
-}
-
-// ============================================================================
-// Parser Edge Cases
-// ============================================================================
-
-func TestYAMLParser_DefaultMaxDepth(t *testing.T) {
-	// Test that default maxDepth is applied when 0 or negative
-	lexer := newYAMLLexer([]byte("key: value"))
-	tokens, err := lexer.tokenizeInto(nil)
-	if err != nil {
-		t.Fatalf("Tokenize() error = %v", err)
-	}
-
-	parser := NewYAMLParser(tokens, 0)
-	if parser.maxDepth != 10 {
-		t.Errorf("maxDepth = %d, want 10 (default)", parser.maxDepth)
-	}
-
-	parser = NewYAMLParser(tokens, -1)
-	if parser.maxDepth != 10 {
-		t.Errorf("maxDepth = %d, want 10 (default)", parser.maxDepth)
-	}
-}
-
-func TestYAMLParser_ValueWithColon(t *testing.T) {
-	input := `url: "https://example.com:8080"`
-	lexer := newYAMLLexer([]byte(input))
-	tokens, err := lexer.tokenizeInto(nil)
-	if err != nil {
-		t.Fatalf("Tokenize() error = %v", err)
-	}
-
-	parser := NewYAMLParser(tokens, 10)
-	result, err := parser.Parse()
-	if err != nil {
-		t.Fatalf("Parse() error = %v", err)
-	}
-
-	if result.Map["url"].Scalar != "https://example.com:8080" {
-		t.Errorf("url = %q, want %q", result.Map["url"].Scalar, "https://example.com:8080")
-	}
-}
-
-func TestYAMLParser_ArrayWithComments(t *testing.T) {
-	input := `items:
-  # first item
-  - one
-  # second item
-  - two`
-	lexer := newYAMLLexer([]byte(input))
-	tokens, err := lexer.tokenizeInto(nil)
-	if err != nil {
-		t.Fatalf("Tokenize() error = %v", err)
-	}
-
-	parser := NewYAMLParser(tokens, 10)
-	result, err := parser.Parse()
-	if err != nil {
-		t.Fatalf("Parse() error = %v", err)
-	}
-
-	items := result.Map["items"]
-	if items.Type != ValueTypeArray {
-		t.Errorf("items type = %v, want ValueTypeArray", items.Type)
-	}
-
-	if len(items.Array) != 2 {
-		t.Errorf("items length = %d, want 2", len(items.Array))
-	}
-}
-
-func TestReleaseValue_Nil(t *testing.T) {
-	ReleaseValue(nil) // should not panic
-}
-
-func TestReleaseValue_Scalar(t *testing.T) {
-	v := NewScalarValue("test", 1, 1)
-	ReleaseValue(v)
-	if v.Scalar != "" {
-		t.Error("scalar not cleared after release")
-	}
-}
-
-func TestReleaseValue_Nested(t *testing.T) {
-	input := `
-parent:
-  child1: value1
-  child2:
-    - a
-    - b
-`
-	value, err := ParseYAML([]byte(input), 10)
-	if err != nil {
-		t.Fatalf("ParseYAML() error = %v", err)
-	}
-	ReleaseValue(value)
-	// Verify the tree is cleared
-	if value.Map != nil {
-		t.Error("map not cleared after release")
-	}
-}
-
-func TestReleaseValue_DoubleRelease(t *testing.T) {
-	v := NewScalarValue("test", 1, 1)
-	ReleaseValue(v)
-	ReleaseValue(v) // should not panic
-}
-
-// ============================================================================
-// Edge Cases for parseMap, parseArray, parseNestedValue (table-driven)
-// ============================================================================
-
 // TestYAMLParser_Structure exercises the structural branches of parseMap,
-// parseArray, and parseNestedValue: comments before nested content, blank
-// lines, dedents, array items at EOF, and nested array/map combinations.
-// Each case parses a snippet and asserts the resulting Value tree's shape.
+// parseArray, and parseNestedValue through the full ParseYAML pipeline:
+// basic nesting, arrays, comments before nested content, blank lines,
+// dedents, array items at EOF, nested array/map combinations, the depth
+// limit, and error transmission from the lexer.
 func TestYAMLParser_Structure(t *testing.T) {
 	tests := []struct {
-		name  string
-		input string
-		check func(t *testing.T, root *Value)
+		name     string
+		input    string
+		maxDepth int // 0 → 10
+		wantErr  bool
+		check    func(t *testing.T, root *Value)
 	}{
+		{
+			name:  "simple nested map",
+			input: "database:\n  host: localhost\n  port: 5432",
+			check: func(t *testing.T, root *Value) {
+				db := root.Map["database"]
+				if db == nil || db.Type != ValueTypeMap {
+					t.Fatal("expected 'database' map")
+				}
+				if db.Map["host"].Scalar != "localhost" {
+					t.Errorf("database.host = %q, want %q", db.Map["host"].Scalar, "localhost")
+				}
+				if db.Map["port"].Scalar != "5432" {
+					t.Errorf("database.port = %q, want %q", db.Map["port"].Scalar, "5432")
+				}
+			},
+		},
+		{
+			name:  "array of scalars",
+			input: "items:\n  - one\n  - two\n  - three",
+			check: func(t *testing.T, root *Value) {
+				items := root.Map["items"]
+				if items == nil || items.Type != ValueTypeArray {
+					t.Fatal("expected 'items' array")
+				}
+				expected := []string{"one", "two", "three"}
+				if len(items.Array) != len(expected) {
+					t.Fatalf("items length = %d, want %d", len(items.Array), len(expected))
+				}
+				for i, exp := range expected {
+					if items.Array[i].Scalar != exp {
+						t.Errorf("items[%d] = %q, want %q", i, items.Array[i].Scalar, exp)
+					}
+				}
+			},
+		},
+		{
+			name:  "array of maps",
+			input: "servers:\n  - host: server1\n    port: 8080\n  - host: server2\n    port: 9090",
+			check: func(t *testing.T, root *Value) {
+				servers := root.Map["servers"]
+				if servers == nil || servers.Type != ValueTypeArray {
+					t.Fatal("expected 'servers' array")
+				}
+				if len(servers.Array) != 2 {
+					t.Fatalf("servers length = %d, want 2", len(servers.Array))
+				}
+				want := [2]struct{ host, port string }{{"server1", "8080"}, {"server2", "9090"}}
+				for i, w := range want {
+					srv := servers.Array[i]
+					if srv.Type != ValueTypeMap {
+						t.Fatalf("servers[%d] type = %v, want ValueTypeMap", i, srv.Type)
+					}
+					if srv.Map["host"].Scalar != w.host {
+						t.Errorf("servers[%d].host = %q, want %q", i, srv.Map["host"].Scalar, w.host)
+					}
+					if srv.Map["port"].Scalar != w.port {
+						t.Errorf("servers[%d].port = %q, want %q", i, srv.Map["port"].Scalar, w.port)
+					}
+				}
+			},
+		},
+		{
+			name:  "key with empty value",
+			input: "key:",
+			check: func(t *testing.T, root *Value) {
+				if got := root.Map["key"]; got == nil || got.Scalar != "" {
+					t.Errorf("key = %v, want an empty scalar", got)
+				}
+			},
+		},
+		{
+			name:  "empty document yields empty root map",
+			input: "",
+			check: func(t *testing.T, root *Value) {
+				if root.Type != ValueTypeMap {
+					t.Errorf("result type = %v, want ValueTypeMap", root.Type)
+				}
+				if len(root.Map) != 0 {
+					t.Errorf("result map length = %d, want 0", len(root.Map))
+				}
+			},
+		},
+		{
+			name:  "document start then content",
+			input: "---\nkey: value",
+			check: func(t *testing.T, root *Value) {
+				if root.Map["key"].Scalar != "value" {
+					t.Errorf("key = %q, want %q", root.Map["key"].Scalar, "value")
+				}
+			},
+		},
+		{
+			name:  "multiple sibling keys",
+			input: "key1: value1\nkey2: value2\nkey3: value3",
+			check: func(t *testing.T, root *Value) {
+				if len(root.Map) != 3 {
+					t.Fatalf("result map length = %d, want 3 (keys: %v)", len(root.Map), iyValueKeys(root.Map))
+				}
+				expected := map[string]string{
+					"key1": "value1",
+					"key2": "value2",
+					"key3": "value3",
+				}
+				for key, exp := range expected {
+					if root.Map[key].Scalar != exp {
+						t.Errorf("result[%q] = %q, want %q", key, root.Map[key].Scalar, exp)
+					}
+				}
+			},
+		},
+		{
+			// Parser-level quoting pin: the escape is decoded by the lexer
+			// (pinned in yaml_lexer_test.go) and scalarFromToken must copy
+			// the token's IsQuoted flag onto the Value — quoted scalars are
+			// exempt from null/bool/number coercion downstream.
+			name:  "quoted value keeps escapes and the quoting flag",
+			input: `key: "line1\nline2"`,
+			check: func(t *testing.T, root *Value) {
+				v := root.Map["key"]
+				if v == nil || v.Type != ValueTypeScalar || !v.Quoted {
+					t.Fatalf("key = %v, want a quoted scalar", v)
+				}
+				if v.Scalar != "line1\nline2" {
+					t.Errorf("key = %q, want %q", v.Scalar, "line1\nline2")
+				}
+			},
+		},
+		{
+			// PIN (column-based nesting): one space of indentation is
+			// strictly deeper than the parent's column 0, so "sub" nests
+			// under "key". The old width/2 truncation treated it as the
+			// same level, silently re-parenting "sub" as a root sibling.
+			name:  "one-space indent nests under the parent",
+			input: "key:\n sub: v",
+			check: func(t *testing.T, root *Value) {
+				if len(root.Map) != 1 {
+					t.Fatalf("root has %d keys, want 1 (keys: %v)", len(root.Map), iyValueKeys(root.Map))
+				}
+				key := root.Map["key"]
+				if key == nil || key.Type != ValueTypeMap {
+					t.Fatalf("key = %v, want a nested map", key)
+				}
+				if got := key.Map["sub"]; got == nil || got.Scalar != "v" {
+					t.Errorf("key.sub = %v, want scalar \"v\"", got)
+				}
+			},
+		},
+		{
+			// Document semantics (GEN-001): a second '---' document used to
+			// be silently dropped — the load reported success while holding
+			// a fraction of the file. Multi-document streams now fail
+			// loudly; load one document per file.
+			name:    "second document errors",
+			input:   "a: 1\n---\nb: 2",
+			wantErr: true,
+		},
+		{
+			// parseDocument/parseNestedValue use depth >= maxDepth, so
+			// nesting exactly AT the limit still succeeds.
+			name:     "nesting exactly at maxDepth succeeds",
+			input:    "a:\n  b: v",
+			maxDepth: 2,
+			check: func(t *testing.T, root *Value) {
+				a := root.Map["a"]
+				if a == nil || a.Map["b"] == nil || a.Map["b"].Scalar != "v" {
+					t.Errorf("a.b = %v, want \"v\"", a)
+				}
+			},
+		},
+		{
+			// ...and one level beyond the limit errors out.
+			name:     "nesting one beyond maxDepth errors",
+			input:    "a:\n  b:\n    c: v",
+			maxDepth: 2,
+			wantErr:  true,
+		},
+		{
+			name:     "nesting beyond a low maxDepth errors",
+			input:    "a:\n  b:\n    c:\n      d:\n        e: value",
+			maxDepth: 2,
+			wantErr:  true,
+		},
+		{
+			// Error transmission: a lexer failure (unterminated quoted
+			// string) must surface as a ParseYAML error, never be silently
+			// parsed. This is the single lexer-error case at parser level;
+			// the full lexer error matrix lives in yaml_lexer_test.go.
+			name:    "lexer error propagates through ParseYAML",
+			input:   `key: "unterminated`,
+			wantErr: true,
+		},
 		{
 			name:  "key with comment then nested map",
 			input: "parent:\n  # a comment\n  child: value",
@@ -723,8 +306,12 @@ func TestYAMLParser_Structure(t *testing.T) {
 			name:  "key with empty value then nested scalar",
 			input: "key:\n  value",
 			check: func(t *testing.T, root *Value) {
-				if root.Map["key"] == nil {
+				key := root.Map["key"]
+				if key == nil {
 					t.Fatal("expected 'key'")
+				}
+				if key.Type != ValueTypeScalar || key.Scalar != "value" {
+					t.Errorf("key = %v, want the nested scalar \"value\"", key)
 				}
 			},
 		},
@@ -809,14 +396,17 @@ func TestYAMLParser_Structure(t *testing.T) {
 			},
 		},
 		{
-			name:  "nested array direct",
-			input: "data:\n  - - x\n      y\n    - z",
-			check: func(t *testing.T, root *Value) {
-				data := root.Map["data"]
-				if data == nil || data.Type != ValueTypeArray {
-					t.Fatal("expected data array")
-				}
-			},
+			// Genuine continuation-line shape. The lexer does not join
+			// plain-scalar continuation lines, and under column-based
+			// nesting (M-013) the over-indented "y" (col 6) and the
+			// mid-width trailing "- z" (col 4, net zero depth change from
+			// col 6) leave a sequence item in a mapping context — the
+			// parser now rejects the document instead of the previous
+			// silent drop of both lines (data = [["x"]], "y" and "z" lost
+			// without any signal).
+			name:    "nested array direct",
+			input:   "data:\n  - - x\n      y\n    - z",
+			wantErr: true,
 		},
 		{
 			name:  "array item with newline before nested map",
@@ -866,16 +456,240 @@ func TestYAMLParser_Structure(t *testing.T) {
 				}
 			},
 		},
+		{
+			// Non-ASCII text passes through the whole pipeline verbatim:
+			// the tree stores the document's bytes, and case handling
+			// (which is ASCII-only, see flatten_keys.go) never applies at
+			// parse level.
+			name:  "unicode key and value preserved",
+			input: "键: 值",
+			check: func(t *testing.T, root *Value) {
+				v := root.Map["键"]
+				if v == nil || v.Type != ValueTypeScalar || v.Scalar != "值" {
+					t.Errorf("root[\"键\"] = %v, want scalar \"值\" (keys: %v)", v, iyValueKeys(root.Map))
+				}
+			},
+		},
 	}
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			result, err := ParseYAML([]byte(tt.input), 10)
-			if err != nil {
-				t.Fatalf("ParseYAML() error = %v", err)
+			maxDepth := tt.maxDepth
+			if maxDepth == 0 {
+				maxDepth = 10
 			}
-			tt.check(t, result)
+			result, err := ParseYAML([]byte(tt.input), maxDepth)
+			if (err != nil) != tt.wantErr {
+				t.Fatalf("ParseYAML() error = %v, wantErr %v", err, tt.wantErr)
+			}
+			if tt.wantErr {
+				return
+			}
+			if tt.check != nil {
+				tt.check(t, result)
+			}
 		})
+	}
+}
+
+// ============================================================================
+// ParseYAML Function Tests
+// ============================================================================
+
+// (The trivial single-pair ParseYAML smoke test was removed: "key: value"
+// through the full pipeline is pinned by TestYAMLParser_Structure, and
+// ParseYAML's own integration behavior by TestParseYAML_Complex below.)
+
+// TestParseYAML_RootSequenceErrors pins the root-sequence rejection: a
+// document starting with "- " previously fell through parseMap's
+// "shouldn't happen" Dash break and parsed to a SILENTLY EMPTY map — the
+// whole file loaded as zero variables with no error. (JSON root arrays
+// flatten to _0.._N keys; YAML root sequences error instead.)
+func TestParseYAML_RootSequenceErrors(t *testing.T) {
+	for _, input := range []string{
+		"- a\n- b\n",
+		"- a\n",
+		"key: 1\n- b\n", // sequence at map level mid-document
+	} {
+		result, err := ParseYAML([]byte(input), 10)
+		if err == nil {
+			t.Errorf("ParseYAML(%q) succeeded with result %v, want an error", input, result)
+			continue
+		}
+		if !strings.Contains(err.Error(), "mapping") {
+			t.Errorf("ParseYAML(%q) error = %v, want it to name the root-mapping requirement", input, err)
+		}
+	}
+}
+
+func TestParseYAML_Complex(t *testing.T) {
+	data := []byte(`
+app:
+  name: myapp
+  version: "1.0.0"
+database:
+  host: localhost
+  port: 5432
+  credentials:
+    username: admin
+    password: secret
+features:
+  - auth
+  - logging
+  - cache
+`)
+
+	result, err := ParseYAML(data, 10)
+	if err != nil {
+		t.Fatalf("ParseYAML() error = %v", err)
+	}
+
+	// The parser preserves key case verbatim — uppercasing happens only in
+	// the flattener's buildFlatKey (flatten_keys.go), never in the lexer
+	// or parser — so the tree keeps the document's lowercase keys.
+	app := result.Map["app"]
+	if app == nil {
+		t.Fatalf("expected 'app' key, got keys: %v", iyValueKeys(result.Map))
+	}
+	name := app.Map["name"]
+	if name == nil || name.Scalar != "myapp" {
+		t.Errorf("app.name = %v, want %q", name, "myapp")
+	}
+	version := app.Map["version"]
+	if version == nil || version.Scalar != "1.0.0" {
+		t.Errorf("app.version = %v, want %q", version, "1.0.0")
+	}
+
+	db := result.Map["database"]
+	if db == nil {
+		t.Fatalf("expected 'database' key, got keys: %v", iyValueKeys(result.Map))
+	}
+	host := db.Map["host"]
+	if host == nil || host.Scalar != "localhost" {
+		t.Errorf("database.host = %v, want %q", host, "localhost")
+	}
+	creds := db.Map["credentials"]
+	if creds == nil {
+		t.Fatalf("expected database.credentials key, got keys: %v", iyValueKeys(db.Map))
+	}
+	username := creds.Map["username"]
+	if username == nil || username.Scalar != "admin" {
+		t.Errorf("database.credentials.username = %v, want %q", username, "admin")
+	}
+	password := creds.Map["password"]
+	if password == nil || password.Scalar != "secret" {
+		t.Errorf("database.credentials.password = %v, want %q", password, "secret")
+	}
+
+	features := result.Map["features"]
+	if features == nil || features.Type != ValueTypeArray {
+		t.Fatalf("expected 'features' array, got %v", features)
+	}
+	wantFeatures := []string{"auth", "logging", "cache"}
+	if len(features.Array) != len(wantFeatures) {
+		t.Fatalf("features length = %d, want %d", len(features.Array), len(wantFeatures))
+	}
+	for i, want := range wantFeatures {
+		if got := features.Array[i].Scalar; got != want {
+			t.Errorf("features[%d] = %q, want %q", i, got, want)
+		}
+	}
+}
+
+// ============================================================================
+// Value Type Tests
+// ============================================================================
+
+// TestValueConstructors pins the exported Value constructors' field wiring:
+// type, source position, and the non-nil container each container
+// constructor must install.
+func TestValueConstructors(t *testing.T) {
+	t.Run("scalar", func(t *testing.T) {
+		v := NewScalarValue("test", 1, 5)
+		if v.Type != ValueTypeScalar || v.Scalar != "test" || v.Line != 1 || v.Column != 5 {
+			t.Errorf("NewScalarValue() = %+v, want scalar %q at 1:5", v, "test")
+		}
+	})
+
+	t.Run("map", func(t *testing.T) {
+		v := NewMapValue(2, 10)
+		if v.Type != ValueTypeMap || v.Map == nil || v.Line != 2 || v.Column != 10 {
+			t.Errorf("NewMapValue() = %+v, want a non-nil map at 2:10", v)
+		}
+	})
+
+	t.Run("array", func(t *testing.T) {
+		v := NewArrayValue(3, 15)
+		if v.Type != ValueTypeArray || v.Array == nil || v.Line != 3 || v.Column != 15 {
+			t.Errorf("NewArrayValue() = %+v, want a non-nil array at 3:15", v)
+		}
+	})
+}
+
+// ============================================================================
+// Parser Edge Cases
+// ============================================================================
+
+func TestYAMLParser_DefaultMaxDepth(t *testing.T) {
+	// Test that default maxDepth is applied when 0 or negative
+	lexer := newYAMLLexer([]byte("key: value"))
+	tokens, err := lexer.tokenizeInto(nil)
+	if err != nil {
+		t.Fatalf("Tokenize() error = %v", err)
+	}
+
+	parser := NewYAMLParser(tokens, 0)
+	if parser.maxDepth != 16 {
+		t.Errorf("maxDepth = %d, want 16 (default, matches the root package's defaultStructuredMaxDepth)", parser.maxDepth)
+	}
+
+	parser = NewYAMLParser(tokens, -1)
+	if parser.maxDepth != 16 {
+		t.Errorf("maxDepth = %d, want 16 (default, matches the root package's defaultStructuredMaxDepth)", parser.maxDepth)
+	}
+}
+
+// TestReleaseValue covers the nil-safe and idempotent release paths; the
+// full-tree release semantics are pinned separately by
+// TestReleaseValue_Nested below.
+func TestReleaseValue(t *testing.T) {
+	t.Run("nil is a no-op", func(t *testing.T) {
+		ReleaseValue(nil) // should not panic
+	})
+
+	t.Run("scalar is cleared", func(t *testing.T) {
+		v := NewScalarValue("test", 1, 1)
+		ReleaseValue(v)
+		if v.Scalar != "" {
+			t.Error("scalar not cleared after release")
+		}
+	})
+
+	t.Run("double release does not panic", func(t *testing.T) {
+		v := NewScalarValue("test", 1, 1)
+		ReleaseValue(v)
+		ReleaseValue(v) // guarded no-op: Value.pooled blocks the second Put
+	})
+}
+
+func TestReleaseValue_Nested(t *testing.T) {
+	input := `
+parent:
+  child1: value1
+  child2:
+    - a
+    - b
+`
+	value, err := ParseYAML([]byte(input), 10)
+	if err != nil {
+		t.Fatalf("ParseYAML() error = %v", err)
+	}
+	ReleaseValue(value)
+	// Verify the tree holds no residual content. Small containers may be
+	// retained on the pooled node for reuse (see maxPooledValueChildren);
+	// the release contract is emptiness, not a nil reference.
+	if len(value.Map) != 0 {
+		t.Error("map not cleared after release")
 	}
 }
 
@@ -941,7 +755,7 @@ func TestParseYAML_HashMidTokenKey(t *testing.T) {
 	}
 	node := result.Map["weird#key"]
 	if node == nil {
-		t.Fatalf("key containing mid-token '#' was not preserved; keys: %v", getMapKeys(result.Map))
+		t.Fatalf("key containing mid-token '#' was not preserved; keys: %v", iyValueKeys(result.Map))
 	}
 	if node.Scalar != "v" {
 		t.Errorf("weird#key = %q, want %q", node.Scalar, "v")
@@ -965,16 +779,6 @@ func TestYAMLParser_TokenLevelBranches(t *testing.T) {
 		maxDep int
 		check  func(t *testing.T, root *Value)
 	}{
-		{
-			name:   "document start terminates nested map",
-			tokens: []Token{mkKey("K", 0), {Type: TokenIndent, Indent: 1}, mkKey("N", 1), {Type: TokenValue, Value: "v"}, {Type: TokenDocumentStart}, mkKey("AFTER", 0), {Type: TokenValue, Value: "w"}},
-			check: func(t *testing.T, root *Value) {
-				k := root.Map["K"]
-				if k == nil || k.Type != ValueTypeMap || k.Map["N"] == nil || k.Map["N"].Scalar != "v" {
-					t.Errorf("K = %v, want nested map with N=v (terminated at document start)", k)
-				}
-			},
-		},
 		{
 			name:   "key below expected indent ends nested map",
 			tokens: []Token{mkKey("K", 0), {Type: TokenIndent, Indent: 1}, mkKey("INNER", 0), {Type: TokenValue, Value: "v"}},
@@ -1060,16 +864,6 @@ func TestYAMLParser_TokenLevelBranches(t *testing.T) {
 			},
 		},
 		{
-			name:   "document start terminates array",
-			tokens: []Token{mkKey("K", 0), {Type: TokenDash, Indent: 1}, {Type: TokenValue, Value: "a"}, {Type: TokenDocumentStart}},
-			check: func(t *testing.T, root *Value) {
-				k := root.Map["K"]
-				if k == nil || k.Type != ValueTypeArray || len(k.Array) != 1 {
-					t.Errorf("K = %v, want array with one element", k)
-				}
-			},
-		},
-		{
 			name:   "indent directly after dash parses nested item",
 			tokens: []Token{mkKey("K", 0), {Type: TokenDash, Indent: 1}, {Type: TokenIndent, Indent: 2}, mkKey("N", 2), {Type: TokenValue, Value: "v"}},
 			check: func(t *testing.T, root *Value) {
@@ -1112,6 +906,161 @@ func TestYAMLParser_TokenLevelBranches(t *testing.T) {
 	}
 }
 
+// TestYAMLParser_DocumentStartTerminatesNested pinpoints the token-level
+// behavior the former TokenLevelBranches rows covered: a nested map or
+// array ends CLEANLY on a '---' separator (the separator is left as the
+// current token and later keys are not consumed into the nested value).
+// Through Parse() such input is now a hard multi-document error (see
+// TestYAMLParser_Structure), so this drives parseMap directly.
+func TestYAMLParser_DocumentStartTerminatesNested(t *testing.T) {
+	t.Run("map", func(t *testing.T) {
+		p := NewYAMLParser([]Token{
+			mkKey("K", 0), {Type: TokenIndent, Indent: 1}, mkKey("N", 1),
+			{Type: TokenValue, Value: "v"}, {Type: TokenDocumentStart},
+			mkKey("AFTER", 0), {Type: TokenValue, Value: "w"},
+		}, 10)
+		root, err := p.parseMap(0, 0)
+		if err != nil {
+			t.Fatalf("parseMap() error = %v", err)
+		}
+		k := root.Map["K"]
+		if k == nil || k.Type != ValueTypeMap || k.Map["N"] == nil || k.Map["N"].Scalar != "v" {
+			t.Fatalf("K = %v, want nested map with N=v (terminated at document start)", k)
+		}
+		if root.Map["AFTER"] != nil {
+			t.Errorf("AFTER was consumed into the first document; want it past the separator")
+		}
+		if p.current().Type != TokenDocumentStart {
+			t.Errorf("current token = %v, want TokenDocumentStart left unconsumed", p.current().Type)
+		}
+	})
+
+	t.Run("array", func(t *testing.T) {
+		p := NewYAMLParser([]Token{
+			mkKey("K", 0), {Type: TokenDash, Indent: 1}, {Type: TokenValue, Value: "a"},
+			{Type: TokenDocumentStart},
+		}, 10)
+		root, err := p.parseMap(0, 0)
+		if err != nil {
+			t.Fatalf("parseMap() error = %v", err)
+		}
+		k := root.Map["K"]
+		if k == nil || k.Type != ValueTypeArray || len(k.Array) != 1 || k.Array[0].Scalar != "a" {
+			t.Errorf("K = %v, want array with one element (terminated at document start)", k)
+		}
+	})
+}
+
+// TestYAMLParser_BlockScalars pins GEN-001 block scalar support: literal
+// (|) and folded (>) scalars with all three chomping indicators, explicit
+// indentation, nested keys after the block, and the error paths (header
+// with content, bad explicit indent).
+func TestYAMLParser_BlockScalars(t *testing.T) {
+	tests := []struct {
+		name  string
+		input string
+		want  string
+	}{
+		{"literal clip keeps one trailing newline",
+			"cert: |\n  -----BEGIN-----\n  abc\nnext: 1\n", "-----BEGIN-----\nabc\n"},
+		{"literal strip drops the trailing newline",
+			"cert: |-\n  a\n  b\n", "a\nb"},
+		{"literal keep keeps blank lines",
+			"cert: |+\n  a\n\n\n", "a\n\n\n"},
+		{"empty literal block",
+			"cert: |\nnext: 1\n", ""},
+		{"literal at EOF without trailing newline",
+			"cert: |\n  a", "a\n"},
+		{"extra indentation beyond the block indent is content",
+			"v: |\n    a\n      b\n    c\n", "a\n  b\nc\n"},
+		{"blank line inside the block is content",
+			"v: |\n  a\n\n  b\n", "a\n\nb\n"},
+		{"header comment is not content",
+			"v: | # cert\n  a\n", "a\n"},
+		{"folded joins lines with spaces",
+			"v: >\n  a\n  b\n", "a b\n"},
+		{"folded blank line becomes a newline",
+			"v: >\n  a\n\n  b\n", "a\nb\n"},
+		{"folded strip",
+			"v: >-\n  a\n  b\n", "a b"},
+		{"folded keep",
+			"v: >+\n  a\n\n", "a\n\n"},
+		{"explicit indentation indicator",
+			"v: |2\n   a\n", " a\n"},
+		{"block under a nested key",
+			"top:\n  cert: |\n    line1\n    line2\n  sibling: v\n", "line1\nline2\n"},
+		{"crlf line endings",
+			"cert: |\r\n  a\r\n  b\r\n", "a\nb\n"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			root, err := ParseYAMLWithPolicy([]byte(tt.input), 10, DuplicateKeyInherit)
+			if err != nil {
+				t.Fatalf("ParseYAML() error = %v", err)
+			}
+			// Locate the value: top-level "cert"/"v", or top.cert.
+			v := root.Map["cert"]
+			if v == nil {
+				v = root.Map["v"]
+			}
+			if v == nil {
+				if top := root.Map["top"]; top != nil {
+					v = top.Map["cert"]
+				}
+			}
+			if v == nil {
+				t.Fatalf("value key not found (root: %v)", iyValueKeys(root.Map))
+			}
+			if v.Scalar != tt.want {
+				t.Errorf("block scalar = %q, want %q", v.Scalar, tt.want)
+			}
+			if !v.Quoted {
+				t.Error("block scalar value is not quoted (must flatten verbatim)")
+			}
+		})
+	}
+
+	// Sibling keys after the block still parse.
+	root, err := ParseYAMLWithPolicy([]byte("cert: |\n  body\nnext: 1\n"), 10, DuplicateKeyInherit)
+	if err != nil {
+		t.Fatalf("ParseYAML() error = %v", err)
+	}
+	if root.Map["next"] == nil || root.Map["next"].Scalar != "1" {
+		t.Errorf("next = %v, want 1 (sibling after block)", root.Map["next"])
+	}
+
+	// A header with content on the same line is a plain scalar, not a block.
+	root, err = ParseYAMLWithPolicy([]byte("v: | text\n"), 10, DuplicateKeyInherit)
+	if err != nil {
+		t.Fatalf("ParseYAML() error = %v", err)
+	}
+	if root.Map["v"].Scalar != "| text" {
+		t.Errorf("v = %q, want plain scalar %q", root.Map["v"].Scalar, "| text")
+	}
+
+	// Explicit indentation deeper than the content: loud error.
+	if _, err := ParseYAMLWithPolicy([]byte("v: |4\n  a\n"), 10, DuplicateKeyInherit); err == nil {
+		t.Error("ParseYAML() = nil error, want indentation error for explicit |4 with 2-space content")
+	}
+}
+
+// TestYAMLParser_MultiDocumentErrors pins the GEN-001 multi-document error
+// through the public parse entry: leading separators are fine, a second
+// document is a hard error, and the message names the separator.
+func TestYAMLParser_MultiDocumentErrors(t *testing.T) {
+	if _, err := ParseYAMLWithPolicy([]byte("---\na: 1\n"), 10, DuplicateKeyInherit); err != nil {
+		t.Fatalf("leading separator: ParseYAML() error = %v", err)
+	}
+	_, err := ParseYAMLWithPolicy([]byte("a: 1\n---\nb: 2\n"), 10, DuplicateKeyInherit)
+	if err == nil {
+		t.Fatal("second document: ParseYAML() = nil, want multi-document error")
+	}
+	var yamlErr *YAMLError
+	if !errors.As(err, &yamlErr) || !strings.Contains(yamlErr.Message, "multiple YAML documents") {
+		t.Errorf("error = %v, want a YAMLError naming multiple documents", err)
+	}
+}
+
 // TestYAMLParser_ParseNestedValueIndentEntry covers the indent-consumption
 // branch at the head of parseNestedValue, reachable only when the parser is
 // handed a token stream whose current token is an indent at entry.
@@ -1140,11 +1089,18 @@ func TestNewArrayValue_PooledReuse(t *testing.T) {
 	}
 }
 
-// TestParseYAML_LexerError covers the tokenize-failure path: input the lexer
-// rejects (an unterminated double-quoted string) surfaces as a ParseYAML
-// error instead of being silently parsed.
-func TestParseYAML_LexerError(t *testing.T) {
-	if _, err := ParseYAML([]byte("key: \"unterminated"), 10); err == nil {
-		t.Error("ParseYAML() should reject input the lexer cannot tokenize")
+// TestNewMapValue_PooledReuse is the map counterpart of the array test
+// above: a pooled Value that still carries a non-nil Map (only reachable
+// via a seeded pool entry — ReleaseValue nils Map before returning values)
+// must be reused with its stale entries cleared.
+func TestNewMapValue_PooledReuse(t *testing.T) {
+	valuePool.Put(&Value{Map: map[string]*Value{"stale": NewScalarValue("stale", 1, 1)}})
+
+	v := NewMapValue(1, 1)
+	if v.Type != ValueTypeMap {
+		t.Fatalf("NewMapValue() type = %v, want ValueTypeMap", v.Type)
+	}
+	if len(v.Map) != 0 {
+		t.Errorf("reused Map length = %d, want 0 (stale entries must be cleared)", len(v.Map))
 	}
 }

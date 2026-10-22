@@ -27,22 +27,22 @@ The core storage mechanism uses a **sharded map architecture** to minimize lock 
 ```
 ┌─────────────────────────────────────────────────────┐
 │                    secureMap                        │
-├──────────┬──────────┬──────────┬─────────┬─────────┤
-│ Shard 0  │ Shard 1  │ Shard 2  │   ...   │ Shard 7 │
-│ RWMutex  │ RWMutex  │ RWMutex  │         │ RWMutex │
-│ map[K]V  │ map[K]V  │ map[K]V  │         │ map[K]V │
-└──────────┴──────────┴──────────┴─────────┴─────────┘
+├──────────┬──────────┬──────────┬─────────┬──────────┤
+│ Shard 0  │ Shard 1  │ Shard 2  │   ...   │ Shard 31 │
+│ RWMutex  │ RWMutex  │ RWMutex  │         │ RWMutex  │
+│ map[K]V  │ map[K]V  │ map[K]V  │         │ map[K]V  │
+└──────────┴──────────┴──────────┴─────────┴──────────┘
 ```
 
 **Implementation Details:**
-- **8 shards** for optimal distribution
+- **32 shards** for optimal distribution (raised from 8 by interleaved benchmarking; see the `numSecureMapShards` note in secure.go)
 - **Lazy shard maps** — each shard's map is created on first write; reads over a nil map are no-ops, so empty loaders cost nothing
-- **Hybrid hash** for shard selection — multiplicative (Knuth) hashing for short keys (≤8 chars, the common case), full FNV-1a for medium keys (9–16 chars), and FNV-1a with first/last-8-byte sampling for longer keys (>16 chars)
+- **Hybrid hash** for shard selection — a loop-free little-endian byte combine for very short keys (1–4 chars), multiplicative (Knuth) XOR hashing for short keys (5–8 chars, the common case), full FNV-1a for medium keys (9–16 chars), and FNV-1a with first/last-8-byte sampling for longer keys (>16 chars)
 - **Per-shard RWMutex** for fine-grained locking
 - **Atomic counter** for O(1) `Len()` operations
 
 ```go
-const numSecureMapShards = 8
+const numSecureMapShards = 32
 
 type secureMapShard struct {
     mu     sync.RWMutex
@@ -107,9 +107,10 @@ type SecureValue struct {
 ### 4. Singleton Pattern (Default Loader)
 
 The default loader is an **explicitly-initialized singleton** — it is *not* lazily
-created on first access. It must be set once via `Load()` or `LoadWithConfig()`
-(both call `setDefaultLoader()` under a mutex). Subsequent reads use a lock-free
-atomic pointer load and return `ErrNotInitialized` until it has been set.
+created on first access. It must be set once via `Load()`, `Overload()` or
+`LoadWithConfig()` (all call `setDefaultLoader()` under a mutex). Subsequent
+reads use a lock-free atomic pointer load and return `ErrNotInitialized` until
+it has been set.
 
 ```go
 var (
@@ -140,7 +141,7 @@ func setDefaultLoader(loader *Loader) error {
 ```
 
 **Guarantees:**
-- Explicit, once-only initialization via `Load()` / `LoadWithConfig()` (no silent auto-creation)
+- Explicit, once-only initialization via `Load()` / `Overload()` / `LoadWithConfig()` (no silent auto-creation)
 - Lock-free fast path for read access (atomic `Pointer.Load`)
 - Safe concurrent reset via `Swap()` in `ResetDefaultLoader()`
 
@@ -197,8 +198,8 @@ func TestLoader_Concurrent(t *testing.T)
 ### Concurrent Operations with Close
 
 ```go
-// Test: Operations running during Close()
-func TestLoader_ConcurrentWithClose(t *testing.T)
+// Test: Operations (Set fast path + lock-free reads + Close) running together
+func TestLoader_ConcurrentFastPaths(t *testing.T)
 ```
 
 **Result:** ✅ Graceful degradation, no panics
@@ -335,7 +336,7 @@ defer loader.Close()
 ```go
 // ❌ Undefined behavior
 loader.Close()
-val := loader.GetString("KEY")  // Returns error/zero after close
+val := loader.GetString("KEY")  // Returns "" (zero value) after close
 
 // ✅ Check state before use
 if !loader.IsClosed() {
@@ -368,7 +369,7 @@ if !loader.IsClosed() {
 
 ### Scalability
 
-- **Horizontal:** Scales well with CPU cores (8 shards)
+- **Horizontal:** Scales well with CPU cores (32 shards)
 - **Vertical:** Memory usage bounded by `MaxVariables` config
 - **Throughput:** ~1M+ ops/sec on modern hardware
 

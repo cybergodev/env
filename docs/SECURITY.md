@@ -22,18 +22,19 @@ This library is designed for **high-security environments** with the following b
 
 | Protection | Description |
 |------------|-------------|
-| **Key Pattern Validation** | Only allows `^[A-Za-z][A-Za-z0-9_]*$` by default |
+| **Key Pattern Validation** | `.env` parsing allows only `^[A-Za-z][A-Za-z0-9_]*$` by default; `Loader.Set()` accepts the wider structured-format key space (letters, digits, `_`, `@`, `-`, `.` — dotted keys are settable) unless a custom `KeyPattern` is configured |
 | **Value Content Validation** | Blocks null bytes and control characters (tab, newline, and carriage return are permitted) |
-| **Key Length Limits** | Default: 64 chars, Hard limit: 1024 chars |
-| **Value Length Limits** | Default: 4096 chars, Hard limit: 1MB |
+| **Key Length Limits** | Default: 128 chars, Hard limit: 1024 chars |
+| **Value Length Limits** | Default: 8192 chars, Hard limit: 1MB |
 
 ### File Security
 
 | Protection | Description |
 |------------|-------------|
-| **File Size Limits** | Default: 2MB, Hard limit: 100MB |
-| **Line Length Limits** | Default: 1024 chars, Hard limit: 64KB |
-| **Variable Count Limits** | Default: 500, Hard limit: 10,000 |
+| **File Size Limits** | Default: 8MB, Hard limit: 100MB |
+| **Line Length Limits** | Default: 8192 chars, Hard limit: 64KB |
+| **Variable Count Limits** | Default: 1000, Hard limit: 10,000 |
+| **Nesting Depth Limits (JSON/YAML)** | Default: 16 levels, Hard limit: 100 levels |
 | **Format Detection** | Automatic detection by extension |
 
 ### Forbidden Keys
@@ -48,7 +49,13 @@ LD_DEBUG, LD_AUDIT, DYLD_INSERT_LIBRARIES, DYLD_LIBRARY_PATH
 # Shell escape
 IFS, SHELL, ENV, BASH_ENV
 # Language-specific injection
-PERL5OPT, PYTHONPATH, RUBYLIB, NODE_PATH
+PERL5OPT, PERL5LIB, PYTHONPATH, PYTHONSTARTUP, PYTHONINSPECT,
+RUBYLIB, RUBYOPT, GEM_PATH, GEM_HOME, NODE_PATH, NODE_OPTIONS
+# Runtime/VM code-execution option vectors
+RUSTFLAGS, JAVA_TOOL_OPTIONS, JDK_JAVA_OPTIONS, _JAVA_OPTIONS,
+CLASSPATH, PS4, SHELLOPTS, BASHOPTS
+# Git config/proxy injection
+GIT_CONFIG_COUNT, GIT_PROXY_COMMAND
 # Windows-specific injection
 COMSPEC, PATHEXT, SYSTEMROOT, WINDIR
 ```
@@ -60,10 +67,43 @@ COMSPEC, PATHEXT, SYSTEMROOT, WINDIR
 
 | Feature | Description |
 |---------|-------------|
-| **SecureValue** | Automatic memory zeroing on GC/cleanup |
-| **Sensitive Data Masking** | Logs never expose passwords, tokens, keys |
+| **SecureValue** | The value's internal byte slice is zeroed — including unused slice capacity — on Close/Release and by a finalizer |
+| **Memory locking** | Optional (`SetMemoryLockEnabled`): mlock on Linux/macOS, VirtualLock on Windows |
+| **Sensitive Data Masking** | Logs and errors never expose values; sensitive keys are masked |
 | **Memory Pool Clearing** | Pooled objects are cleared before reuse |
-| **Finalizer Cleanup** | GC triggers secure memory erasure |
+| **Finalizer Cleanup** | GC triggers secure erasure of the internal byte slice |
+
+**Protection scope — what memory locking does NOT cover (GEN-001 disclosure).**
+The lock and zeroing protect only the `SecureValue`'s internal `[]byte`:
+
+- Every read API that returns a Go string — `Reveal` on a SecureValue,
+  `ToMap`, `GetSecure` (which copies through an intermediate string), and
+  `Apply` — produces an immutable string copy that is
+  neither locked nor zeroed; it survives until the GC reclaims it, and the
+  GC does not erase memory. Minimize reads, and prefer `Bytes()` (a copy
+  you can wipe yourself with `ClearBytes`) or short-lived scopes.
+- Memory locking exists on Linux, macOS and Windows only. On other
+  platforms (BSD, Solaris, AIX, Plan9, WASM) `LockMemory` returns
+  `ErrMemoryLockNotSupported` and, outside strict mode, the failure is
+  silent: values are usable and unlocked. Check `IsMemoryLocked()` on the
+  value, or `IsMemoryLockSupported()` for platform support, if locking is a
+  requirement.
+- A window of unlocked memory exists between value creation and the lock
+  call, and between unlock and zeroing on reset.
+- mlock/VirtualLock do NOT prevent hibernation files or crash dumps from
+  writing the memory to disk, and on Unix they require the process's
+  locked-memory limit (`ulimit -l` / `CAP_IPC_LOCK`) to be raised for large
+  working sets.
+- Values that pass through variable expansion transit pooled buffers and
+  `strings.Builder` scratch that cannot be zeroed; only their pool slots
+  are cleared for reuse.
+
+**Masking side channel.** `SecureValue.Masked()` embeds a length —
+`[SECURE:<N> bytes]` — which leaks the length (and rotation) of the secret to
+anyone who can read the logs. Key masks and value masks are fixed tokens
+(`[MASKED]`) that reveal neither content nor length, per SEC-005. This is a
+deliberate debugging affordance; treat masked logs accordingly when the
+length of a SecureValue is itself sensitive.
 
 ### Variable Expansion Security
 
@@ -75,28 +115,27 @@ COMSPEC, PATHEXT, SYSTEMROOT, WINDIR
 
 ### Expansion Scope
 
-By default, `${VAR}` references resolve from the loaded file first and then
-**fall back to the process environment** (traditional dotenv semantics).
-This means a configuration file can reference — and capture into its values —
-any variable already present in the process (e.g. `${AWS_SECRET_ACCESS_KEY}`).
-If those values are later logged, marshaled, or persisted, the secret leaks.
+By default, `${VAR}` references resolve from the loaded file only
+(`ExpansionFileOnly`). The process-environment fallback is **opt-in** and must
+be requested explicitly — a configuration file otherwise cannot capture
+unrelated process secrets (e.g. `${AWS_SECRET_ACCESS_KEY}`) into its values.
 
-When configuration files come from a less-trusted source, restrict expansion
-to file-local variables:
+When configuration files come from a fully trusted source, restore the
+traditional dotenv semantics by opting back into the process fallback:
 
 ```go
 cfg := env.DefaultConfig()
-cfg.ExpansionScope = env.ExpansionFileOnly
+cfg.ExpansionScope = env.ExpansionFileThenProcess
 ```
 
-With `ExpansionFileOnly`, references that are not defined in the file(s)
-being loaded expand to the empty string instead of reading `os.Environ`.
-The default (`ExpansionFileThenProcess`) preserves dotenv compatibility.
+With the default `ExpansionFileOnly`, references that are not defined in the
+file(s) being loaded expand to the empty string instead of reading
+`os.Environ`.
 
 ### Concurrency Safety
 
 - All operations are **thread-safe**
-- Sharded storage design (8 shards) for reduced lock contention
+- Sharded storage design (32 shards) for reduced lock contention
 - Atomic operations for fast-path checks
 - 100+ race detection test runs pass
 
@@ -203,25 +242,24 @@ cfg.AuditHandler = env.NewNopAuditHandler()
 ### Audit Output Format
 
 Each event is written as a single JSON line. The `key` field is **masked for
-sensitive keys** as `[MASKED:<len> chars]` (where `<len>` is the key length);
-non-sensitive keys are logged verbatim. Optional fields (`file`, `masked`,
-`details`, `duration_ns`) are omitted when empty.
+sensitive keys** as `[MASKED]`; non-sensitive keys are logged verbatim.
+Optional fields (`file`, `masked`, `details`, `duration_ns`) are omitted when
+empty.
 
 ```json
 {
     "timestamp": "2026-03-11T10:30:00Z",
     "action": "set",
-    "key": "[MASKED:7 chars]",
+    "key": "[MASKED]",
     "reason": "loaded",
     "success": true,
     "masked": true
 }
 ```
 
-> Note: The `AP***` (2-char prefix) style is used only in validator/path error
-> messages (`DefaultMaskKey`), not in audit output. Sensitive keys loaded from
-> files use the same reason `"loaded"` as other keys; sensitivity is reflected
-> by the masked `key` field and `"masked": true`.
+> Note: Sensitive keys loaded from files use the same reason `"loaded"` as
+> other keys; sensitivity is reflected by the masked `key` field and
+> `"masked": true`.
 
 ### Built-in Handlers
 
@@ -233,6 +271,33 @@ non-sensitive keys are logged verbatim. Optional fields (`file`, `masked`,
 | `CloseableChannelHandler` | Async processing with owned channel lifecycle (`Close()` closes the channel) |
 | `NopAuditHandler` | Disabled auditing |
 
+### Audit Failure Semantics
+
+**Default: fail-open.** Audit logging is best-effort — a handler error (full
+disk, closed writer), a handler panic, or an event dropped because a channel
+buffer is full never fails the configuration operation that emitted the
+event. Operation results are independent of the audit pipeline.
+
+Observability for lost events:
+
+- `CloseableChannelHandler.DroppedEvents()` counts every event the handler
+  discarded (full buffer with no consumer, or sends after `Close()`).
+- `Auditor.Failures()` on the built-in auditor counts every event that never
+  reached its handler.
+
+**Opt-in: fail-closed.** Set `Config.AuditFailClosed` (with `AuditEnabled`)
+to make a lost event fail the operation that emitted it: `LoadFiles`,
+`Apply`, `Set` and `Delete` then return an error matching
+`env.ErrAuditFailed` instead of succeeding silently. The built-in auditor
+latches the first failure and reports it at the end of the operation; a
+`CustomAuditor` participates by implementing `TakeFailure() error` (detected
+via interface assertion, so the `AuditLogger` interface itself is unchanged).
+With concurrent operations the latched failure is delivered to whichever
+operation checks first — the signaling is best-effort, not exactly-once.
+
+Once an auditor is closed it stays disabled: `SetEnabled(true)` on a closed
+auditor is a no-op (its handler's resources may already be released).
+
 ---
 
 ## Sensitive Data Detection
@@ -241,13 +306,13 @@ Keys containing these patterns (case-insensitive) are automatically masked:
 
 ```
 # Authentication & Authorization
-PASSWORD, SECRET, TOKEN, AUTH, CREDENTIAL, PASSPHRASE, SESSION, COOKIE
+PASSWORD, PASSWD, SECRET, TOKEN, AUTH, CREDENTIAL, PASSPHRASE, SESSION, COOKIE
 
 # API & Keys
-API_KEY, APIKEY, ACCESS_KEY, SECRET_KEY, PRIVATE_KEY, PUBLIC_KEY
+API_KEY, APIKEY, ACCESS_KEY, SECRET_KEY, PRIVATE_KEY, PUBLIC_KEY, KEYSTORE
 
 # Encryption & Security
-PRIVATE, ENCRYPTION_KEY, ENCRYPT_KEY, DECRYPT_KEY, SIGNING_KEY, SIGN_KEY, VERIFY_KEY
+PRIVATE, ENCRYPTION_KEY, ENCRYPT_KEY, DECRYPT_KEY, SIGNING_KEY, SIGN_KEY, VERIFY_KEY, CERT, SALT, NONCE
 
 # Financial & Personal (PII)
 SSN, SOCIAL_SECURITY, CREDIT_CARD, CARD_NUMBER, CVV, CVC, CCV, PAN
@@ -256,21 +321,27 @@ SSN, SOCIAL_SECURITY, CREDIT_CARD, CARD_NUMBER, CVV, CVC, CCV, PAN
 MNEMONIC, SEED, RECOVERY, WALLET, PRIVATE_ADDRESS
 
 # Database & Infrastructure
-CONNECTION_STRING, CONN_STRING, DATABASE_URL, DB_PASSWORD
+CONNECTION_STRING, CONN_STRING, DATABASE_URL, DB_PASSWORD, DSN
+
+# Password/PII spellings
+PWD, USERNAME
 
 # Cloud & Services
 AWS_SECRET, AZURE_KEY, GCP_KEY, SERVICE_ACCOUNT
 ```
 
-Matching is substring-based and case-insensitive — a key like `MY_API_KEY`
-matches because it contains `API_KEY`.
+Matching is case-insensitive. Most patterns match as substrings — a key like
+`MY_API_KEY` matches because it contains `API_KEY`. Four short tokens are
+matched only at identifier boundaries to avoid over-masking ordinary words
+(`AUTH`, `PAN`, `PWD`, `USERNAME` — so `AUTHOR`, `COMPANY` and `MONKEY` are
+not flagged, while `DB_AUTH` and `MYSQL_PWD` still are).
 
 ### Example
 
 ```go
 // Key: DATABASE_PASSWORD
-// In audit output (masked): [MASKED:17 chars]
-// In error messages (DefaultMaskKey): DA***
+// In audit output (masked): [MASKED]
+// In error messages (DefaultMaskKey): [MASKED]
 ```
 
 ---
@@ -291,6 +362,7 @@ matches because it contains `API_KEY`.
 - Never store `SecureValue` pointers longer than needed
 - Never disable `ValidateValues` in production
 - Never allow untrusted input as file paths
+- Avoid `Overload` / `OverwriteExisting = true` when environment variables injected by the deployment platform (container secrets, CI variables) must keep precedence over file values — `Overload` replaces existing process variables, `Load` never does
 
 ---
 
@@ -299,15 +371,17 @@ matches because it contains `API_KEY`.
 | Item | Status |
 |------|--------|
 | Input validation on all keys and values | Implemented |
-| File size and line length limits | Implemented |
+| File size and line length limits | Implemented (all formats; a minified single-line JSON document must fit `MaxLineLength`, hard-capped at 64 KB) |
 | Forbidden keys blocking | Implemented |
-| Memory zeroing for sensitive data | Implemented |
+| Memory zeroing for sensitive data | Implemented for SecureValue's internal buffer (string copies from read APIs are NOT zeroable — see "Protection scope" above) |
 | Audit logging support | Implemented |
 | Thread-safe operations | Implemented |
 | Race condition prevention | Verified (100+ test runs) |
 | Sensitive data masking in logs/errors | Implemented |
 | Variable expansion cycle detection | Implemented |
 | Hard limits to prevent DoS | Implemented |
+| Flat-key collision rejection (nondeterministic resolution removed) | Implemented (always on, `ErrDuplicateKey`) |
+| Strict duplicate-key mode (`DuplicateKeyError`) | Implemented (opt-in) |
 
 ---
 

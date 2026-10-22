@@ -31,12 +31,15 @@ func demonstrateJSONAudit() {
 	if err != nil {
 		log.Fatalf("Failed to create loader: %v", err)
 	}
-	defer loader.Close()
+	defer func() { _ = loader.Close() }() // best-effort cleanup
 
-	// Operations are audited automatically.
-	_ = loader.GetString("APP_NAME")         // read event
-	_ = loader.Set("TEST_VAR", "test_value") // write event
+	// Security-relevant operations are audited automatically. Successful
+	// plain reads are NOT audited — but a FAILED typed read is (a get that
+	// cannot parse is anomalous access worth recording).
+	_ = loader.GetString("APP_NAME")         // no event
+	_ = loader.Set("TEST_VAR", "test_value") // set event
 	_ = loader.Delete("TEST_VAR")            // delete event
+	_ = loader.GetInt("APP_NAME")            // get event (parse failure)
 
 	fmt.Println("  Captured audit events:")
 	fmt.Print(buf.String())
@@ -47,7 +50,7 @@ func demonstrateChannelAudit() {
 	fmt.Println("=== Channel Audit Handler ===")
 
 	handler := env.NewCloseableChannelHandler(64)
-	defer handler.Close()
+	defer func() { _ = handler.Close() }() // best-effort cleanup
 
 	cfg := env.DefaultConfig()
 	cfg.Filenames = []string{"examples/data/config.env"}
@@ -58,27 +61,28 @@ func demonstrateChannelAudit() {
 	if err != nil {
 		log.Fatalf("Failed to create loader: %v", err)
 	}
-	defer loader.Close()
+	defer func() { _ = loader.Close() }() // best-effort cleanup
 
-	// Collect events in a goroutine.
+	// Collect events in a goroutine and summarize by AuditEvent.Action.
 	events := handler.Channel()
-	done := make(chan int)
+	done := make(chan struct{})
 	go func() {
-		count := 0
-		for range events {
-			count++
+		counts := make(map[env.AuditAction]int)
+		for ev := range events {
+			counts[ev.Action]++
 		}
-		done <- count
+		fmt.Printf("  Events by action: %v\n", counts)
+		close(done)
 	}()
 
-	// Trigger some reads.
+	// A successful read produces no event; a failed typed read does.
 	_ = loader.GetString("APP_NAME")
-	_ = loader.GetString("DB_HOST")
+	_ = loader.GetInt("DB_HOST")
 
-	// Close the handler to stop the channel, then print the count.
+	// Close the handler to stop the channel, then wait for the summary.
 	_ = handler.Close()
 	_ = loader.Close()
-	fmt.Printf("  Received %d audit events\n", <-done)
+	<-done
 
 	// Also show the Log handler for stderr-based audit output.
 	demonstrateLogAudit()
@@ -98,7 +102,7 @@ func demonstrateLogAudit() {
 	if err != nil {
 		log.Fatalf("Failed to create loader: %v", err)
 	}
-	defer loader.Close()
+	defer func() { _ = loader.Close() }() // best-effort cleanup
 
 	_ = loader.GetString("APP_NAME") // appears as [AUDIT] line on stderr
 	fmt.Println("  (audit lines written to stderr)")

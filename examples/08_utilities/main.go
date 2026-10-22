@@ -5,6 +5,7 @@ package main
 import (
 	"fmt"
 	"log"
+	"sort"
 
 	"github.com/cybergodev/env"
 )
@@ -27,7 +28,11 @@ func main() {
 func demonstrateIntrospection() {
 	fmt.Println("=== Introspection ===")
 	fmt.Printf("  Total variables: %d\n", env.Len())
-	fmt.Printf("  Keys: %v\n", env.Keys())
+
+	// Keys() does not guarantee an order — sort for stable display.
+	keys := env.Keys()
+	sort.Strings(keys)
+	fmt.Printf("  Keys: %v\n", keys)
 
 	// Iterate a sample from All()
 	all := env.All()
@@ -67,14 +72,19 @@ func demonstrateMasking() {
 	fmt.Printf("\n  MaskValue(DB_PASSWORD): %s\n", env.MaskValue("DB_PASSWORD", pw))
 	fmt.Printf("  MaskKey(DB_PASSWORD):    %s\n", env.MaskKey("DB_PASSWORD"))
 
-	// SanitizeForLog — auto-mask sensitive patterns in arbitrary strings
+	// SanitizeForLog / MaskSensitiveInString — auto-mask sensitive patterns
+	// in arbitrary strings (log lines, error messages, dumps)
 	raw := fmt.Sprintf("Config: DB_PASSWORD=%s, API_KEY=%s",
 		env.GetString("DB_PASSWORD"), env.GetString("API_KEY"))
-	fmt.Printf("  SanitizeForLog: %s\n", env.SanitizeForLog(raw))
+	fmt.Printf("  SanitizeForLog:         %s\n", env.SanitizeForLog(raw))
+	fmt.Printf("  MaskSensitiveInString:  %s\n", env.MaskSensitiveInString(raw))
 
-	// Safe iteration: auto-mask based on key sensitivity
+	// Safe iteration: auto-mask based on key sensitivity (sorted for a
+	// stable sample)
+	sorted := env.Keys()
+	sort.Strings(sorted)
 	fmt.Println("\n  Safe iteration (first 5):")
-	for i, key := range env.Keys() {
+	for i, key := range sorted {
 		if i >= 5 {
 			break
 		}

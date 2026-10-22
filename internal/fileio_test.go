@@ -1,6 +1,7 @@
 package internal
 
 import (
+	"errors"
 	"strings"
 	"testing"
 )
@@ -16,12 +17,28 @@ func TestMarshalEnv_ValueEscaping(t *testing.T) {
 		{"simple value", "simple", "simple"},
 		{"value with space", "value with space", `"value with space"`},
 		{"value with newline", "line1\nline2", `"line1\nline2"`},
+		{"value with carriage return", "a\rb", `"a\rb"`},
 		{"value with tab", "col1\tcol2", `"col1\tcol2"`},
 		{"value with quote", `say "hello"`, `"say \"hello\""`},
 		{"value with hash", "value#comment", `"value#comment"`},
+		// BOUNDARY: a single quote triggers quoting but needs no escaping —
+		// only the double quote is special inside the double-quoted grammar.
+		{"value with single quote", "it's", `"it's"`},
 		// A lone backslash neither triggers quoting nor is escaped.
 		{"value with backslash only", `path\to\file`, `path\to\file`},
+		// BOUNDARY: once quoting is on (here: by the space), a backslash IS
+		// escaped, so the value re-parses to the same bytes.
+		{"backslash escaped when quoted", `path\to file`, `"path\\to file"`},
 		{"empty value", "", `""`},
+		// BOUNDARY: values the YAML reader coerces to "" on reload ("null",
+		// "~") are quoted even though they contain no special character.
+		{"yaml null coerces to quoted", "null", `"null"`},
+		{"yaml tilde coerces to quoted", "~", `"~"`},
+		// SEC-009: dollar references are quoted and escaped so a Marshal→Load
+		// round trip does not re-expand them.
+		{"value with dollar ref", "cost $5", `"cost \$5"`},
+		{"value with braced ref", "${HOME}/app", `"\${HOME}/app"`},
+		{"bare dollar", "$", `"\$"`},
 	}
 
 	for _, tt := range tests {
@@ -55,15 +72,6 @@ func TestMarshalEnv(t *testing.T) {
 			contains: []string{"KEY1=value1", "KEY2=value2"},
 		},
 		{
-			name: "sorted output",
-			input: map[string]string{
-				"B_KEY": "b",
-				"A_KEY": "a",
-			},
-			sorted:   true,
-			contains: []string{"A_KEY=a", "B_KEY=b"},
-		},
-		{
 			name:     "empty map",
 			input:    map[string]string{},
 			sorted:   false,
@@ -87,26 +95,95 @@ func TestMarshalEnv(t *testing.T) {
 	}
 }
 
-func TestMarshalEnvSorted(t *testing.T) {
+// TestMarshalEnv_KeyValidation pins the SEC-06 key-validation arms of
+// validateEnvKeyForMarshal through the public MarshalEnv path (previously
+// never triggered by any test): keys that would change tokenization on a
+// re-parse fail the marshal before any output is produced.
+func TestMarshalEnv_KeyValidation(t *testing.T) {
+	tests := []struct {
+		name    string
+		key     string
+		wantErr bool
+	}{
+		{"empty key", "", true},
+		{"key with equals sign", "A=B", true},
+		{"key with colon", "A:B", true},
+		{"key with control character", "BAD\x00KEY", true},
+		{"key starts with hash", "#COMMENT", true},
+		{"export prefix", "export PATH", true},
+		{"leading space", " KEY", true},
+		{"trailing space", "KEY ", true},
+		// Pinning actual behavior: an INTERIOR space does not trip the
+		// validator — only leading/trailing whitespace is stripped by the
+		// .env parser, so "BAD KEY=..." round-trips verbatim and marshals
+		// successfully.
+		{"interior space passes", "BAD KEY", false},
+		{"plain key", "GOOD_KEY", false},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			_, err := MarshalEnv(map[string]string{tt.key: "v"}, false)
+			if (err != nil) != tt.wantErr {
+				t.Fatalf("MarshalEnv(key=%q) error = %v, wantErr %v", tt.key, err, tt.wantErr)
+			}
+			var marshalErr *MarshalError
+			if tt.wantErr && !errors.As(err, &marshalErr) {
+				t.Errorf("MarshalEnv(key=%q) error = %T, want *MarshalError", tt.key, err)
+			}
+		})
+	}
+}
+
+// TestMarshalEnv_NilMap pins the nil-map contract: no keys, no error, empty
+// output.
+func TestMarshalEnv_NilMap(t *testing.T) {
+	result, err := MarshalEnv(nil, false)
+	if err != nil {
+		t.Fatalf("MarshalEnv(nil) error = %v, want nil", err)
+	}
+	if result != "" {
+		t.Errorf("MarshalEnv(nil) = %q, want empty string", result)
+	}
+}
+
+// TestMarshalSorted pins the sorted=true key ordering for the .env and YAML
+// writers through one table (both marshal funcs share the
+// func(map[string]string, bool) (string, error) shape; the JSON encoder
+// sorts keys itself).
+func TestMarshalSorted(t *testing.T) {
+	tests := []struct {
+		name    string
+		marshal func(map[string]string, bool) (string, error)
+	}{
+		{"MarshalEnv", MarshalEnv},
+		{"marshalToYAML", marshalToYAML},
+	}
+
 	input := map[string]string{
 		"Z_KEY": "z",
 		"A_KEY": "a",
 		"M_KEY": "m",
 	}
 
-	result, err := MarshalEnv(input, true)
-	if err != nil {
-		t.Errorf("MarshalEnv() error = %v", err)
-		return
-	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			result, err := tt.marshal(input, true)
+			if err != nil {
+				t.Fatalf("%s(sorted) error = %v", tt.name, err)
+			}
 
-	// Verify order: A_KEY should appear before M_KEY before Z_KEY
-	aIdx := strings.Index(result, "A_KEY")
-	mIdx := strings.Index(result, "M_KEY")
-	zIdx := strings.Index(result, "Z_KEY")
-
-	if !(aIdx < mIdx && mIdx < zIdx) {
-		t.Errorf("keys not in sorted order: A=%d, M=%d, Z=%d", aIdx, mIdx, zIdx)
+			// Verify order: A_KEY should appear before M_KEY before Z_KEY.
+			aIdx := strings.Index(result, "A_KEY")
+			mIdx := strings.Index(result, "M_KEY")
+			zIdx := strings.Index(result, "Z_KEY")
+			if aIdx < 0 || mIdx < 0 || zIdx < 0 {
+				t.Fatalf("output missing expected keys: %q", result)
+			}
+			if aIdx >= mIdx || mIdx >= zIdx {
+				t.Errorf("keys not in sorted order: A=%d, M=%d, Z=%d", aIdx, mIdx, zIdx)
+			}
+		})
 	}
 }
 
@@ -240,11 +317,25 @@ func TestInferJSONType(t *testing.T) {
 	}{
 		{"true", true},
 		{"false", false},
-		{"null", nil},
+		// "null" is NOT typed: JSON null reloads as "" (NullAsEmpty), so
+		// converting would silently rewrite the value on a Marshal→load
+		// cycle. It stays a string, like non-canonical number spellings.
+		{"null", "null"},
 		{"42", int64(42)},
 		{"3.14", float64(3.14)},
 		{"hello", "hello"},
 		{"", ""},
+		// Non-canonical spellings round-trip as strings (M-6): typing them
+		// re-rendered "007" as 7 and "1.50" as 1.5 — silent mutation.
+		{"007", "007"},
+		{"1.50", "1.50"},
+		{"1e3", "1e3"},
+		{"+5", "+5"},
+		{"-0", "-0"},
+		// BOUNDARY: 2^64 overflows ParseInt, but its shortest float64
+		// rendering is 18446744073709552000 — not the input spelling — so
+		// the canonical-form rule keeps it a string (no silent mutation).
+		{"18446744073709551616", "18446744073709551616"},
 	}
 
 	for _, tt := range tests {
@@ -255,6 +346,122 @@ func TestInferJSONType(t *testing.T) {
 					tt.input, result, result, tt.expected, tt.expected)
 			}
 		})
+	}
+}
+
+// TestMarshalToYAML_KeyValidation pins the SEC-06 arms of
+// validateYAMLKeyForMarshal through the public marshalToYAML path — the YAML
+// twin of TestMarshalEnv_KeyValidation: keys that would change tokenization
+// on a re-parse (comment-starting '#', a ':' that terminates the key token,
+// array-item prefixes, edge whitespace) fail the marshal before any output
+// is produced.
+func TestMarshalToYAML_KeyValidation(t *testing.T) {
+	tests := []struct {
+		name    string
+		key     string
+		wantErr bool
+	}{
+		{"empty key", "", true},
+		{"key starts with hash", "#COMMENT", true},
+		{"hash after space", "A #B", true},
+		{"colon at end of key", "A:", true},
+		{"colon followed by tab", "A:\tB", true},
+		{"array-item prefix", "- ITEM", true},
+		{"leading space", " KEY", true},
+		{"trailing space", "KEY ", true},
+		// A colon or '#' NOT at a token boundary is part of the key.
+		{"interior colon passes", "A:B", false},
+		{"interior hash passes", "A#B", false},
+		{"plain key", "GOOD_KEY", false},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			_, err := marshalToYAML(map[string]string{tt.key: "v"}, false)
+			if (err != nil) != tt.wantErr {
+				t.Fatalf("marshalToYAML(key=%q) error = %v, wantErr %v", tt.key, err, tt.wantErr)
+			}
+			var marshalErr *MarshalError
+			if tt.wantErr && !errors.As(err, &marshalErr) {
+				t.Errorf("marshalToYAML(key=%q) error = %T, want *MarshalError", tt.key, err)
+			}
+		})
+	}
+}
+
+// TestSetNestedValue_UnsortedConflictKeepsData pins the bidirectional
+// conflict hardening: whichever order unsorted keys arrive in, neither the
+// scalar nor the nested subtree is lost. (The public Marshal paths always
+// sort, where the scalar prefix key lands first and the longer key falls
+// back to the flat form — this exercises the hardened unsorted path.)
+func TestSetNestedValue_UnsortedConflictKeepsData(t *testing.T) {
+	for _, order := range [][2]string{{"A_B_C", "A_B"}, {"A_B", "A_B_C"}} {
+		result := make(map[string]interface{})
+		values := map[string]string{"A_B": "scalar", "A_B_C": "deep"}
+		for _, k := range order {
+			setNestedValue(result, k, values[k])
+		}
+
+		scalar := ""
+		if outer, ok := result["A"].(map[string]interface{}); ok {
+			if v, ok := outer["B"].(string); ok {
+				scalar = v
+			}
+		}
+		if scalar == "" {
+			if v, ok := result["A_B"].(string); ok {
+				scalar = v
+			}
+		}
+		if scalar != "scalar" {
+			t.Errorf("order %v: scalar lost (result=%v)", order, result)
+		}
+
+		deep := ""
+		if outer, ok := result["A"].(map[string]interface{}); ok {
+			if mid, ok := outer["B"].(map[string]interface{}); ok {
+				if v, ok := mid["C"].(string); ok {
+					deep = v
+				}
+			}
+		}
+		if deep == "" {
+			if v, ok := result["A_B_C"].(string); ok {
+				deep = v
+			}
+		}
+		if deep != "deep" {
+			t.Errorf("order %v: deep value lost (result=%v)", order, result)
+		}
+	}
+}
+
+// TestMarshalJSONRoundTripPreservesValues pins the M-6 rule end to end: a
+// value is typed as JSON number/bool only when the canonical re-rendering
+// equals the input string, so Marshal→FlattenJSON returns every value
+// unchanged. Previously "007"→7, "1.50"→1.5 and "null"→null silently
+// mutated the values on reload.
+func TestMarshalJSONRoundTripPreservesValues(t *testing.T) {
+	m := map[string]string{
+		"VER":   "1.50",
+		"PAD":   "007",
+		"LABEL": "null",
+		"N":     "42",
+		"F":     "0.1",
+		"B":     "true",
+	}
+	out, err := MarshalEnvAs(m, FormatJSON, true)
+	if err != nil {
+		t.Fatalf("MarshalEnvAs error = %v", err)
+	}
+	back, err := FlattenJSON([]byte(out), defaultJSONCfg())
+	if err != nil {
+		t.Fatalf("FlattenJSON error = %v", err)
+	}
+	for k, v := range m {
+		if back[k] != v {
+			t.Errorf("round-trip[%q] = %q, want %q", k, back[k], v)
+		}
 	}
 }
 
@@ -324,116 +531,40 @@ func TestMarshalToYAML(t *testing.T) {
 
 func TestEscapeYAMLValue(t *testing.T) {
 	tests := []struct {
+		name     string
 		input    string
 		expected string
 	}{
-		{"simple", "simple"},
-		{"", `""`},
-		{"has: colon", `"has: colon"`},
-		{"has# hash", `"has# hash"`},
-		{"has\n newline", `"has\n newline"`},
-		{"has \"quote\"", `"has \"quote\""`},
-		{"- starts with dash", `"- starts with dash"`},
+		{"simple", "simple", "simple"},
+		{"empty", "", `""`},
+		{"has: colon", "has: colon", `"has: colon"`},
+		{"has# hash", "has# hash", `"has# hash"`},
+		{"has\n newline", "has\n newline", `"has\n newline"`},
+		{"has \"quote\"", "has \"quote\"", `"has \"quote\""`},
+		{"- starts with dash", "- starts with dash", `"- starts with dash"`},
 		// Scalars the YAML reader would type-coerce on reparse are quoted so
 		// the string value survives a Marshal→Unmarshal round trip.
-		{"true", `"true"`},
-		{"null", `"null"`},
-		{"~", `"~"`},
-		{"42", `"42"`},
-		{"3.14", `"3.14"`},
+		{"true", "true", `"true"`},
+		{"null", "null", `"null"`},
+		{"~", "~", `"~"`},
+		{"42", "42", `"42"`},
+		{"3.14", "3.14", `"3.14"`},
 		// Trailing whitespace is stripped from plain scalars — quote it.
-		{"trailing ", `"trailing "`},
+		{"trailing space", "trailing ", `"trailing "`},
+		// Control characters trigger quoting and are escaped inside the
+		// quoted scalar; a backslash is escaped only when quoting is on.
+		{"carriage return", "a\rb", `"a\rb"`},
+		{"tab", "a\tb", `"a\tb"`},
+		{"backslash plus tab", "a\\b\t", `"a\\b\t"`},
 	}
 
 	for _, tt := range tests {
-		t.Run(tt.input, func(t *testing.T) {
+		t.Run(tt.name, func(t *testing.T) {
 			result := escapeYAMLValue(tt.input)
 			if result != tt.expected {
 				t.Errorf("escapeYAMLValue(%q) = %q, want %q", tt.input, result, tt.expected)
 			}
 		})
-	}
-}
-
-func TestMarshalToYAMLSorted(t *testing.T) {
-	input := map[string]string{
-		"Z_KEY": "z",
-		"A_KEY": "a",
-		"M_KEY": "m",
-	}
-
-	result, err := marshalToYAML(input, true)
-	if err != nil {
-		t.Errorf("marshalToYAML() error = %v", err)
-		return
-	}
-
-	// Verify order: A_KEY should appear before M_KEY before Z_KEY
-	str := string(result)
-	aIdx := strings.Index(str, "A_KEY:")
-	mIdx := strings.Index(str, "M_KEY:")
-	zIdx := strings.Index(str, "Z_KEY:")
-
-	if !(aIdx < mIdx && mIdx < zIdx) {
-		t.Errorf("keys not in sorted order: A=%d, M=%d, Z=%d", aIdx, mIdx, zIdx)
-	}
-}
-
-// TestMarshalEnv_EscapeArms pins the carriage-return and backslash arms of
-// escapeValueToBuilder: \r both triggers quoting and escapes, while a lone
-// backslash neither triggers quoting nor is escaped.
-func TestMarshalEnv_EscapeArms(t *testing.T) {
-	tests := []struct {
-		in   string
-		want string
-	}{
-		{"a\rb", `"a\rb"`},
-		{`a\b`, `a\b`},
-	}
-	for _, tt := range tests {
-		out, err := MarshalEnv(map[string]string{"K": tt.in}, false)
-		if err != nil {
-			t.Fatalf("MarshalEnv() error = %v", err)
-		}
-		if got := strings.TrimSuffix(out, "\n"); got != "K="+tt.want {
-			t.Errorf("MarshalEnv(%q) = %q, want %q", tt.in, got, "K="+tt.want)
-		}
-	}
-}
-
-// TestMarshalEnv_EscapeEstimatePath drives the capacity-estimation branch:
-// values containing escapable characters take the doubled-length estimate
-// path while still marshaling correctly.
-func TestMarshalEnv_EscapeEstimatePath(t *testing.T) {
-	m := map[string]string{
-		"WITH_SPACE": "a b",
-		"PLAIN":      "plain",
-	}
-	out, err := MarshalEnv(m, false)
-	if err != nil {
-		t.Fatalf("MarshalEnv error = %v", err)
-	}
-	if !strings.Contains(out, "WITH_SPACE=\"a b\"") {
-		t.Errorf("output missing quoted WITH_SPACE line in:\n%s", out)
-	}
-	if !strings.Contains(out, "PLAIN=plain") {
-		t.Errorf("output missing PLAIN line in:\n%s", out)
-	}
-}
-
-// TestMarshalEnvAs_JSONSorted drives the sorted-keys branch of
-// marshalToJSON; the JSON encoder sorts keys itself, so the observable
-// contract is simply a well-formed document with all keys present.
-func TestMarshalEnvAs_JSONSorted(t *testing.T) {
-	m := map[string]string{"B": "2", "A": "1", "C": "3"}
-	out, err := MarshalEnvAs(m, FormatJSON, true)
-	if err != nil {
-		t.Fatalf("MarshalEnvAs error = %v", err)
-	}
-	for _, k := range []string{`"A"`, `"B"`, `"C"`} {
-		if !strings.Contains(out, k) {
-			t.Errorf("output missing key %s in:\n%s", k, out)
-		}
 	}
 }
 
@@ -450,21 +581,5 @@ func TestSetNestedValue_ConflictBranch(t *testing.T) {
 	}
 	if _, ok := m["A"].(map[string]interface{}); ok {
 		t.Error("A became a map, want it to stay a scalar")
-	}
-}
-
-// TestEscapeYAMLValue_ControlCharArms covers the \r, \t and backslash escape
-// arms inside escapeYAMLValue's quoted-scalar path (control chars trigger
-// quoting; the backslash is then escaped).
-func TestEscapeYAMLValue_ControlCharArms(t *testing.T) {
-	tests := []struct{ in, want string }{
-		{"a\rb", `"a\rb"`},
-		{"a\tb", `"a\tb"`},
-		{`a\b` + "\t", `"a\\b\t"`},
-	}
-	for _, tt := range tests {
-		if got := escapeYAMLValue(tt.in); got != tt.want {
-			t.Errorf("escapeYAMLValue(%q) = %q, want %q", tt.in, got, tt.want)
-		}
 	}
 }

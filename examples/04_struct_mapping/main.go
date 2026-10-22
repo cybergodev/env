@@ -27,11 +27,29 @@ type DatabaseConfig struct {
 	Timeout        time.Duration `env:"DB_TIMEOUT"`
 }
 
-// FullConfig demonstrates nested struct support.
-// YAML/JSON nested keys flatten to UPPER_CASE and map to each sub-struct's tags.
+// appSection and dbSection use RELATIVE keys: the enclosing struct's env tag
+// supplies the prefix. This mirrors how YAML/JSON nested keys flatten
+// (app.name → APP_NAME, db.host → DB_HOST).
+//
+// NOTE: do NOT reuse the absolute-tag AppConfig inside another struct — a
+// nested field's tags are always prefixed, so it would look up APP_APP_NAME
+// and silently match nothing.
+type appSection struct {
+	Name string `env:"NAME"`
+	Port int    `env:"PORT"`
+}
+
+type dbSection struct {
+	Host    string        `env:"HOST"`
+	Port    int           `env:"PORT"`
+	Timeout time.Duration `env:"TIMEOUT"`
+}
+
+// FullConfig demonstrates nested struct support: the outer field's env tag
+// is the key prefix for every inner field (env:"APP" + env:"NAME" → APP_NAME).
 type FullConfig struct {
-	App AppConfig
-	DB  DatabaseConfig
+	App appSection `env:"APP"`
+	DB  dbSection  `env:"DB"`
 }
 
 func main() {
@@ -54,12 +72,20 @@ func main() {
 	}
 	fmt.Printf("DB:   %+v\n", db)
 
-	// Nested struct
+	// Nested struct: env:"APP" + env:"NAME" resolves to the flattened
+	// APP_NAME key produced by the YAML loader.
 	var full FullConfig
 	if err := env.ParseInto(&full); err != nil {
 		log.Fatal(err)
 	}
 	fmt.Printf("Nested: App.Name=%s  DB.Host=%s\n", full.App.Name, full.DB.Host)
+
+	// MarshalStruct emits the same flattened keys — nested round-trips work.
+	nested, err := env.MarshalStruct(full)
+	if err != nil {
+		log.Fatal(err)
+	}
+	fmt.Printf("Nested marshaled: %v\n", nested)
 
 	// Marshal a struct back to an env-key map
 	envMap, err := env.MarshalStruct(DatabaseConfig{

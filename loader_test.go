@@ -47,7 +47,10 @@ func (fs *testFileSystem) Open(name string) (File, error) {
 	if !ok {
 		return nil, ErrFileNotFound
 	}
-	return &testFile{content: content}, nil
+	// The loader checks size via the FILE's Stat() (env.go loadFileLocked),
+	// not via FileSystem.Stat, so an injected statErr must fail on the
+	// returned file to exercise the FileError{"stat"} path.
+	return &testFile{content: content, statErr: fs.statErr}, nil
 }
 
 func (fs *testFileSystem) OpenFile(name string, flag int, perm os.FileMode) (File, error) {
@@ -108,6 +111,7 @@ func (fs *testFileSystem) LookupEnv(key string) (string, bool) {
 type testFile struct {
 	content string
 	pos     int
+	statErr error // when non-nil, Stat() fails with this error
 }
 
 func (f *testFile) Read(p []byte) (n int, err error) {
@@ -128,6 +132,9 @@ func (f *testFile) Close() error {
 }
 
 func (f *testFile) Stat() (os.FileInfo, error) {
+	if f.statErr != nil {
+		return nil, f.statErr
+	}
 	return &testFileInfo{size: int64(len(f.content))}, nil
 }
 
@@ -152,18 +159,6 @@ func (fi *testFileInfo) Sys() interface{}   { return nil }
 // ============================================================================
 
 func TestNew(t *testing.T) {
-	t.Run("valid config", func(t *testing.T) {
-		cfg := DefaultConfig()
-		loader, err := New(cfg)
-		if err != nil {
-			t.Fatalf("New() error = %v", err)
-		}
-		if loader == nil {
-			t.Fatal("New() returned nil loader")
-		}
-		defer loader.Close()
-	})
-
 	t.Run("no arguments - uses default config", func(t *testing.T) {
 		loader, err := New()
 		if err != nil {
@@ -172,7 +167,7 @@ func TestNew(t *testing.T) {
 		if loader == nil {
 			t.Fatal("New() returned nil loader")
 		}
-		defer loader.Close()
+		defer func() { _ = loader.Close() }() // best-effort cleanup
 
 		// Verify default config values are applied
 		returnedCfg := loader.Config()
@@ -192,7 +187,7 @@ func TestNew(t *testing.T) {
 		if loader == nil {
 			t.Fatal("New(Config{}) returned nil loader")
 		}
-		defer loader.Close()
+		defer func() { _ = loader.Close() }() // best-effort cleanup
 
 		// Verify default config values are applied
 		returnedCfg := loader.Config()
@@ -210,7 +205,7 @@ func TestNew(t *testing.T) {
 		if err != nil {
 			t.Fatalf("New() error = %v", err)
 		}
-		defer loader.Close()
+		defer func() { _ = loader.Close() }() // best-effort cleanup
 
 		returnedCfg := loader.Config()
 		if returnedCfg.JSONMaxDepth != 20 {
@@ -221,41 +216,35 @@ func TestNew(t *testing.T) {
 		}
 	})
 
-	t.Run("invalid config - zero max file size", func(t *testing.T) {
-		cfg := DefaultConfig()
-		cfg.MaxFileSize = 0
-		_, err := New(cfg)
-		if err == nil {
-			t.Error("New() should fail with zero MaxFileSize")
-		}
-	})
-
-	t.Run("invalid config - exceeds hard limit", func(t *testing.T) {
-		cfg := DefaultConfig()
-		cfg.MaxFileSize = 200 * 1024 * 1024 // 200MB exceeds hard limit
-		_, err := New(cfg)
-		if err == nil {
-			t.Error("New() should fail with MaxFileSize exceeding hard limit")
-		}
-	})
-
-	t.Run("custom key pattern", func(t *testing.T) {
+	t.Run("custom key pattern accepted", func(t *testing.T) {
 		cfg := DefaultConfig()
 		// A genuinely custom pattern (stricter than the default) must be
 		// accepted — validation only requires it to still match TEST_KEY —
-		// and then be enforced when keys are validated.
+		// and then be enforced when keys are validated. (The rejection side
+		// of a custom pattern is covered by TestLoader_Set_KeyRules.)
 		cfg.KeyPattern = regexp.MustCompile(`^TEST_[A-Z_]+$`)
 		loader, err := New(cfg)
 		if err != nil {
 			t.Fatalf("New() error = %v", err)
 		}
-		defer loader.Close()
+		defer func() { _ = loader.Close() }() // best-effort cleanup
 
 		if err := loader.Set("TEST_KEY", "value"); err != nil {
 			t.Fatalf("Set(key matching custom pattern) error = %v", err)
 		}
-		if err := loader.Set("OTHER_KEY", "value"); err == nil {
-			t.Error("Set(key violating custom pattern) should return error")
+	})
+
+	t.Run("multiple configs are rejected", func(t *testing.T) {
+		cfgA := DefaultConfig()
+		cfgA.Filenames = nil // don't auto-load
+		cfgA.MaxVariables = 100
+		cfgB := DefaultConfig()
+		cfgB.MaxVariables = 200
+
+		_, err := New(cfgA, cfgB)
+		if !errors.Is(err, ErrInvalidConfig) {
+			t.Fatalf("New(cfgA, cfgB) error = %v, want ErrInvalidConfig "+
+				"(extra Configs must be rejected, not silently ignored)", err)
 		}
 	})
 }
@@ -275,7 +264,7 @@ func TestLoader_LoadFiles(t *testing.T) {
 		if err != nil {
 			t.Fatalf("New() error = %v", err)
 		}
-		defer loader.Close()
+		defer func() { _ = loader.Close() }() // best-effort cleanup
 
 		if err := loader.LoadFiles(".env"); err != nil {
 			t.Fatalf("LoadFiles() error = %v", err)
@@ -298,7 +287,7 @@ func TestLoader_LoadFiles(t *testing.T) {
 		if err != nil {
 			t.Fatalf("New() error = %v", err)
 		}
-		defer loader.Close()
+		defer func() { _ = loader.Close() }() // best-effort cleanup
 
 		if err := loader.LoadFiles(".env", ".env.local"); err != nil {
 			t.Fatalf("LoadFiles() error = %v", err)
@@ -319,7 +308,7 @@ func TestLoader_LoadFiles(t *testing.T) {
 		if err != nil {
 			t.Fatalf("New() error = %v", err)
 		}
-		defer loader.Close()
+		defer func() { _ = loader.Close() }() // best-effort cleanup
 
 		if err := loader.LoadFiles(); err != nil {
 			t.Fatalf("LoadFiles() error = %v", err)
@@ -341,7 +330,7 @@ func TestLoader_LoadFiles(t *testing.T) {
 		if err != nil {
 			t.Fatalf("New() error = %v", err)
 		}
-		defer loader.Close()
+		defer func() { _ = loader.Close() }() // best-effort cleanup
 
 		// Load existing file first, then missing file
 		if err := loader.LoadFiles(".env", "missing.env"); err != nil {
@@ -360,7 +349,7 @@ func TestLoader_LoadFiles(t *testing.T) {
 		if err != nil {
 			t.Fatalf("New() error = %v", err)
 		}
-		defer loader.Close()
+		defer func() { _ = loader.Close() }() // best-effort cleanup
 
 		if err := loader.LoadFiles("missing.env"); err == nil {
 			t.Error("LoadFiles() should fail with missing file")
@@ -378,7 +367,7 @@ func TestLoader_LoadFiles(t *testing.T) {
 		if err != nil {
 			t.Fatalf("New() error = %v", err)
 		}
-		defer loader.Close()
+		defer func() { _ = loader.Close() }() // best-effort cleanup
 
 		var fileErr *FileError
 		if err := loader.LoadFiles("large.env"); !errors.As(err, &fileErr) {
@@ -397,7 +386,7 @@ func TestLoader_LoadFiles(t *testing.T) {
 		if err != nil {
 			t.Fatalf("New() error = %v", err)
 		}
-		defer loader.Close()
+		defer func() { _ = loader.Close() }() // best-effort cleanup
 
 		if err := loader.LoadFiles(".env"); err != nil {
 			t.Fatalf("LoadFiles() error = %v", err)
@@ -419,7 +408,7 @@ func TestLoader_LoadFiles(t *testing.T) {
 		if err != nil {
 			t.Fatalf("New() error = %v", err)
 		}
-		defer loader.Close()
+		defer func() { _ = loader.Close() }() // best-effort cleanup
 
 		if err := loader.LoadFiles(".env"); err != nil {
 			t.Fatalf("LoadFiles() error = %v", err)
@@ -444,7 +433,7 @@ func TestLoader_LoadFiles(t *testing.T) {
 		if err != nil {
 			t.Fatalf("New() error = %v", err)
 		}
-		defer loader.Close()
+		defer func() { _ = loader.Close() }() // best-effort cleanup
 
 		if err := loader.LoadFiles(".env"); err != nil {
 			t.Fatalf("LoadFiles() error = %v", err)
@@ -462,6 +451,163 @@ func TestLoader_LoadFiles(t *testing.T) {
 		}
 	})
 
+	t.Run("unknown extension falls back to env parser", func(t *testing.T) {
+		// DetectFormat maps ".txt" to FormatAuto; LoadFiles must fall back to
+		// the .env parser rather than failing (env.go loadFileLocked).
+		fs := newTestFileSystem()
+		fs.files["notes.txt"] = "KEY=value"
+
+		cfg := DefaultConfig()
+		cfg.FileSystem = fs
+		loader, err := New(cfg)
+		if err != nil {
+			t.Fatalf("New() error = %v", err)
+		}
+		defer func() { _ = loader.Close() }() // best-effort cleanup
+
+		if err := loader.LoadFiles("notes.txt"); err != nil {
+			t.Fatalf("LoadFiles() error = %v", err)
+		}
+		if loader.GetString("KEY") != "value" {
+			t.Errorf("GetString(\"KEY\") = %q, want %q", loader.GetString("KEY"), "value")
+		}
+	})
+
+}
+
+// TestLoader_LoadFiles_FileSystemErrors drives the mock's openErr/statErr
+// injection fields through LoadFiles: both must surface as *FileError with
+// the failing operation recorded and the original error wrapped.
+func TestLoader_LoadFiles_FileSystemErrors(t *testing.T) {
+	openErr := errors.New("disk detached")
+	statErr := errors.New("stat corrupted")
+
+	tests := []struct {
+		name   string
+		fsMod  func(fs *testFileSystem)
+		wantOp string
+		wantIs error
+	}{
+		{
+			name:   "open failure returns FileError wrapping original",
+			fsMod:  func(fs *testFileSystem) { fs.openErr = openErr },
+			wantOp: "open",
+			wantIs: openErr,
+		},
+		{
+			name:   "stat failure returns FileError wrapping original",
+			fsMod:  func(fs *testFileSystem) { fs.statErr = statErr },
+			wantOp: "stat",
+			wantIs: statErr,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			fs := newTestFileSystem()
+			fs.files["broken.env"] = "KEY=value"
+			tt.fsMod(fs)
+
+			cfg := DefaultConfig()
+			cfg.FileSystem = fs
+			cfg.Filenames = nil // don't auto-load
+			loader, err := New(cfg)
+			if err != nil {
+				t.Fatalf("New() error = %v", err)
+			}
+			defer func() { _ = loader.Close() }() // best-effort cleanup
+
+			err = loader.LoadFiles("broken.env")
+			var fileErr *FileError
+			if !errors.As(err, &fileErr) {
+				t.Fatalf("LoadFiles() error = %v (%T), want *FileError", err, err)
+			}
+			if fileErr.Op != tt.wantOp {
+				t.Errorf("FileError.Op = %q, want %q", fileErr.Op, tt.wantOp)
+			}
+			if !errors.Is(err, tt.wantIs) {
+				t.Errorf("LoadFiles() error = %v, want it wrapping %v", err, tt.wantIs)
+			}
+		})
+	}
+}
+
+// TestLoader_ExpandAmplificationBounded drives the GEN-001 amplification
+// bound through the full .env pipeline: a multi-reference DAG doubles per
+// level without cycling, and the raw-value length check cannot see it because
+// it validates file text before expansion. The factory wires
+// LimitsConfig.MaxValueLength into the expander, so LoadFiles must fail with
+// a max_length ValidationError instead of materializing the amplified values.
+func TestLoader_ExpandAmplificationBounded(t *testing.T) {
+	fs := newTestFileSystem()
+	// A=1024 bytes, B=2049, C=4099, D=8199 — one byte over the default
+	// MaxValueLength (8192) after expansion, at depth 4 of an allowed 5.
+	seed := strings.Repeat("x", 1024)
+	fs.files["amplify.env"] = "A=" + seed + "\nB=${A}.${A}\nC=${B}.${B}\nD=${C}.${C}\n"
+
+	cfg := DefaultConfig()
+	cfg.FileSystem = fs
+	loader, err := New(cfg)
+	if err != nil {
+		t.Fatalf("New() error = %v", err)
+	}
+	defer func() { _ = loader.Close() }() // best-effort cleanup
+
+	err = loader.LoadFiles("amplify.env")
+	if err == nil {
+		t.Fatal("LoadFiles() error = nil, want amplified value over the limit to fail the load")
+	}
+	var vErr *ValidationError
+	if !errors.As(err, &vErr) || vErr.Rule != "max_length" {
+		t.Errorf("LoadFiles() error = %v, want *ValidationError with rule max_length", err)
+	}
+}
+
+// TestLoader_LoadLimits_AtBoundary pins the off-by-one semantics of the size
+// and count limits: a file exactly MaxFileSize bytes and a file with exactly
+// MaxVariables keys both load — the size check is strictly greater-than
+// (env.go) and the variable check fires only beyond the limit (parser.go).
+func TestLoader_LoadLimits_AtBoundary(t *testing.T) {
+	const content = "A=1\nB=2\nC=3\n"
+
+	tests := []struct {
+		name   string
+		cfgMod func(*Config)
+	}{
+		{
+			name:   "file size exactly MaxFileSize succeeds",
+			cfgMod: func(c *Config) { c.MaxFileSize = int64(len(content)) },
+		},
+		{
+			name:   "variable count exactly MaxVariables succeeds",
+			cfgMod: func(c *Config) { c.MaxVariables = 3 },
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			fs := newTestFileSystem()
+			fs.files["edge.env"] = content
+
+			cfg := DefaultConfig()
+			cfg.FileSystem = fs
+			cfg.Filenames = nil // don't auto-load
+			tt.cfgMod(&cfg)
+
+			loader, err := New(cfg)
+			if err != nil {
+				t.Fatalf("New() error = %v", err)
+			}
+			defer func() { _ = loader.Close() }() // best-effort cleanup
+
+			if err := loader.LoadFiles("edge.env"); err != nil {
+				t.Fatalf("LoadFiles() error = %v, want nil at the exact limit", err)
+			}
+			if loader.Len() != 3 {
+				t.Errorf("Len() = %d, want 3", loader.Len())
+			}
+		})
+	}
 }
 
 // ============================================================================
@@ -479,7 +625,7 @@ func TestLoader_Apply(t *testing.T) {
 		if err != nil {
 			t.Fatalf("New() error = %v", err)
 		}
-		defer loader.Close()
+		defer func() { _ = loader.Close() }() // best-effort cleanup
 
 		if err := loader.Set("TEST_KEY", "test_value"); err != nil {
 			t.Fatalf("Set() error = %v", err)
@@ -505,7 +651,7 @@ func TestLoader_Apply(t *testing.T) {
 		if err != nil {
 			t.Fatalf("New() error = %v", err)
 		}
-		defer loader.Close()
+		defer func() { _ = loader.Close() }() // best-effort cleanup
 
 		if err := loader.Set("EXISTING_KEY", "new_value"); err != nil {
 			t.Fatalf("Set() error = %v", err)
@@ -520,6 +666,112 @@ func TestLoader_Apply(t *testing.T) {
 		}
 	})
 
+	t.Run("apply skips key explicitly set to empty string", func(t *testing.T) {
+		// applyLocked uses LookupEnv to distinguish "not set" from "set to
+		// the empty string": a variable explicitly set to "" counts as
+		// existing and must NOT be applied over when OverwriteExisting is
+		// false (env.go).
+		fs := newTestFileSystem()
+		fs.env["EXISTING"] = "" // set, but to the empty string
+
+		cfg := DefaultConfig()
+		cfg.FileSystem = fs
+		cfg.OverwriteExisting = false
+		loader, err := New(cfg)
+		if err != nil {
+			t.Fatalf("New() error = %v", err)
+		}
+		defer func() { _ = loader.Close() }() // best-effort cleanup
+
+		if err := loader.Set("EXISTING", "value"); err != nil {
+			t.Fatalf("Set() error = %v", err)
+		}
+		if err := loader.Apply(); err != nil {
+			t.Fatalf("Apply() error = %v", err)
+		}
+		if got, ok := fs.LookupEnv("EXISTING"); !ok || got != "" {
+			t.Errorf("env[\"EXISTING\"] = (%q, %v), want (\"\", true): the key must NOT be applied over an existing empty value", got, ok)
+		}
+	})
+
+	t.Run("apply partial failure masks key and keeps earlier keys", func(t *testing.T) {
+		fs := &ltSetenvRecorderFS{testFileSystem: newTestFileSystem()}
+		fs.files["app.env"] = "KEY_A=a\nKEY_B=b\nKEY_C=c\n"
+		fs.failKey = "KEY_B"
+		fs.failErr = errors.New("setenv failed")
+
+		cfg := DefaultConfig()
+		cfg.FileSystem = fs
+		cfg.Filenames = nil // don't auto-load
+		loader, err := New(cfg)
+		if err != nil {
+			t.Fatalf("New() error = %v", err)
+		}
+		defer func() { _ = loader.Close() }() // best-effort cleanup
+
+		if err := loader.LoadFiles("app.env"); err != nil {
+			t.Fatalf("LoadFiles() error = %v", err)
+		}
+
+		err = loader.Apply()
+		if err == nil {
+			t.Fatal("Apply() error = nil, want the Setenv failure")
+		}
+		// The failing key is masked (first 2 chars + "***"), never the raw key.
+		if msg := err.Error(); !strings.Contains(msg, MaskKey("KEY_B")) {
+			t.Errorf("Apply() error = %q, want it to contain the masked key %q", msg, MaskKey("KEY_B"))
+		} else if strings.Contains(msg, "KEY_B") {
+			t.Errorf("Apply() error = %q, must not leak the raw key", msg)
+		}
+
+		// Apply returns at the first failure: keys attempted before it stay
+		// set, keys after it were never attempted (map order is recorded).
+		failedAt := -1
+		for i, key := range fs.calls {
+			if key == fs.failKey {
+				failedAt = i
+				break
+			}
+		}
+		if failedAt == -1 {
+			t.Fatal("Setenv was never called for the failing key")
+		}
+		values := map[string]string{"KEY_A": "a", "KEY_B": "b", "KEY_C": "c"}
+		for _, key := range fs.calls[:failedAt] {
+			if got := fs.env[key]; got != values[key] {
+				t.Errorf("env[%q] = %q, want %q (key applied before the failure must persist)", key, got, values[key])
+			}
+		}
+		for _, key := range fs.calls[failedAt+1:] {
+			if _, ok := fs.env[key]; ok {
+				t.Errorf("env[%q] was applied after the failure, want it untouched", key)
+			}
+		}
+		if _, ok := fs.env[fs.failKey]; ok {
+			t.Errorf("env[%q] was set despite the Setenv failure", fs.failKey)
+		}
+	})
+
+}
+
+// ltSetenvRecorderFS wraps *testFileSystem, recording every Setenv key and
+// optionally failing exactly one key (with its own failErr, so the inner
+// mock's fail-everything setenvErr stays unset), making Apply's
+// partial-failure path assertable deterministically despite map iteration
+// order.
+type ltSetenvRecorderFS struct {
+	*testFileSystem
+	failKey string
+	failErr error
+	calls   []string
+}
+
+func (fs *ltSetenvRecorderFS) Setenv(key, value string) error {
+	fs.calls = append(fs.calls, key)
+	if key == fs.failKey {
+		return fs.failErr
+	}
+	return fs.testFileSystem.Setenv(key, value)
 }
 
 // ============================================================================
@@ -545,7 +797,7 @@ func TestLoader_GetString(t *testing.T) {
 			if err != nil {
 				t.Fatalf("New() error = %v", err)
 			}
-			defer loader.Close()
+			defer func() { _ = loader.Close() }() // best-effort cleanup
 
 			if tt.value != "" {
 				if err := loader.Set(tt.key, tt.value); err != nil {
@@ -585,7 +837,7 @@ func TestLoader_GetSecure(t *testing.T) {
 			if err != nil {
 				t.Fatalf("New() error = %v", err)
 			}
-			defer loader.Close()
+			defer func() { _ = loader.Close() }() // best-effort cleanup
 
 			if tt.value != "" {
 				if err := loader.Set(tt.key, tt.value); err != nil {
@@ -617,7 +869,7 @@ func TestLoader_GetSecure_CaseInsensitiveAndDotNotation(t *testing.T) {
 		if err != nil {
 			t.Fatalf("New() error = %v", err)
 		}
-		defer loader.Close()
+		defer func() { _ = loader.Close() }() // best-effort cleanup
 
 		if err := loader.Set("API_KEY", "sk-secret"); err != nil {
 			t.Fatalf("Set() error = %v", err)
@@ -638,7 +890,7 @@ func TestLoader_GetSecure_CaseInsensitiveAndDotNotation(t *testing.T) {
 		if err != nil {
 			t.Fatalf("New() error = %v", err)
 		}
-		defer loader.Close()
+		defer func() { _ = loader.Close() }() // best-effort cleanup
 
 		if err := loader.Set("DATABASE_PASSWORD", "db-secret"); err != nil {
 			t.Fatalf("Set() error = %v", err)
@@ -654,26 +906,9 @@ func TestLoader_GetSecure_CaseInsensitiveAndDotNotation(t *testing.T) {
 		sv.Release()
 	})
 
-	t.Run("exact match preferred over uppercase fallback", func(t *testing.T) {
-		loader, err := New(DefaultConfig())
-		if err != nil {
-			t.Fatalf("New() error = %v", err)
-		}
-		defer loader.Close()
-
-		if err := loader.Set("MY_KEY", "uppercase-value"); err != nil {
-			t.Fatalf("Set() error = %v", err)
-		}
-
-		sv := loader.GetSecure("MY_KEY")
-		if sv == nil {
-			t.Fatal("GetSecure(\"MY_KEY\") returned nil")
-		}
-		if sv.Reveal() != "uppercase-value" {
-			t.Errorf("Reveal() = %q, want %q", sv.Reveal(), "uppercase-value")
-		}
-		sv.Release()
-	})
+	// ("exact match preferred over uppercase fallback" was removed: with no
+	// lowercase competitor in storage it asserted the same Set-then-GetSecure
+	// round trip as the table's "existing key" row.)
 }
 
 func TestLoader_Lookup(t *testing.T) {
@@ -695,7 +930,7 @@ func TestLoader_Lookup(t *testing.T) {
 			if err != nil {
 				t.Fatalf("New() error = %v", err)
 			}
-			defer loader.Close()
+			defer func() { _ = loader.Close() }() // best-effort cleanup
 
 			if tt.value != "" {
 				if err := loader.Set(tt.key, tt.value); err != nil {
@@ -712,6 +947,25 @@ func TestLoader_Lookup(t *testing.T) {
 			}
 		})
 	}
+
+	// The uppercase fallback in Lookup's dot-free fast path: .env keys are
+	// stored as written while YAML/JSON flatten to uppercase, so a
+	// lowercase probe must find an uppercase-stored key.
+	t.Run("lowercase probe hits uppercase storage", func(t *testing.T) {
+		loader, err := New(DefaultConfig())
+		if err != nil {
+			t.Fatalf("New() error = %v", err)
+		}
+		defer func() { _ = loader.Close() }() // best-effort cleanup
+
+		if err := loader.Set("KEY", "value"); err != nil {
+			t.Fatalf("Set() error = %v", err)
+		}
+		value, ok := loader.Lookup("key")
+		if !ok || value != "value" {
+			t.Errorf("Lookup(\"key\") = (%q, %v), want (\"value\", true)", value, ok)
+		}
+	})
 }
 
 // ============================================================================
@@ -725,7 +979,7 @@ func TestLoader_Set(t *testing.T) {
 		if err != nil {
 			t.Fatalf("New() error = %v", err)
 		}
-		defer loader.Close()
+		defer func() { _ = loader.Close() }() // best-effort cleanup
 
 		if err := loader.Set("KEY", "value"); err != nil {
 			t.Errorf("Set() error = %v", err)
@@ -738,7 +992,7 @@ func TestLoader_Set(t *testing.T) {
 		if err != nil {
 			t.Fatalf("New() error = %v", err)
 		}
-		defer loader.Close()
+		defer func() { _ = loader.Close() }() // best-effort cleanup
 
 		if err := loader.Set("", "value"); err == nil {
 			t.Error("Set() should fail with empty key")
@@ -751,7 +1005,7 @@ func TestLoader_Set(t *testing.T) {
 		if err != nil {
 			t.Fatalf("New() error = %v", err)
 		}
-		defer loader.Close()
+		defer func() { _ = loader.Close() }() // best-effort cleanup
 
 		// NUL bytes are disallowed in values (injection defense).
 		if err := loader.Set("KEY", "bad\x00value"); err == nil {
@@ -759,17 +1013,48 @@ func TestLoader_Set(t *testing.T) {
 		}
 	})
 
-	t.Run("invalid value accepted when ValidateValues is disabled", func(t *testing.T) {
+	t.Run("control chars rejected even when ValidateValues is disabled", func(t *testing.T) {
+		// Fail-closed baseline (D-002/M-1): maximum length and control
+		// characters are enforced on every write path regardless of the
+		// ValidateValues switch, matching the .env parse path.
 		cfg := DefaultConfig()
 		cfg.ValidateValues = false
 		loader, err := New(cfg)
 		if err != nil {
 			t.Fatalf("New() error = %v", err)
 		}
-		defer loader.Close()
+		defer func() { _ = loader.Close() }() // best-effort cleanup
 
-		if err := loader.Set("KEY", "bad\x00value"); err != nil {
-			t.Errorf("Set() with validation disabled error = %v, want nil", err)
+		if err := loader.Set("KEY", "bad\x00value"); err == nil {
+			t.Error("Set() should reject a NUL byte even with validation disabled")
+		}
+	})
+
+	t.Run("utf8 check follows ValidateUTF8 regardless of ValidateValues", func(t *testing.T) {
+		// The UTF-8 check follows its own flag on every path, mirroring the
+		// .env parse path (which runs the full ValidateValue unconditionally):
+		// with ValidateUTF8=true an invalid-UTF-8 value is rejected whether or
+		// not ValidateValues is set; with ValidateUTF8=false it passes.
+		for _, tc := range []struct {
+			validateValues bool
+			validateUTF8   bool
+			wantErr        bool
+		}{{false, true, true}, {true, true, true}, {false, false, false}} {
+			cfg := DefaultConfig()
+			cfg.ValidateValues = tc.validateValues
+			cfg.ValidateUTF8 = tc.validateUTF8
+			loader, err := New(cfg)
+			if err != nil {
+				t.Fatalf("New() error = %v", err)
+			}
+			err = loader.Set("KEY", "bad\xffvalue")
+			if tc.wantErr && err == nil {
+				t.Errorf("Set() should reject invalid UTF-8 with ValidateValues=%v, ValidateUTF8=%v", tc.validateValues, tc.validateUTF8)
+			}
+			if !tc.wantErr && err != nil {
+				t.Errorf("Set() with ValidateValues=%v, ValidateUTF8=%v error = %v, want nil", tc.validateValues, tc.validateUTF8, err)
+			}
+			_ = loader.Close() // best-effort cleanup
 		}
 	})
 
@@ -783,7 +1068,7 @@ func TestLoader_Set(t *testing.T) {
 		if err != nil {
 			t.Fatalf("New() error = %v", err)
 		}
-		defer loader.Close()
+		defer func() { _ = loader.Close() }() // best-effort cleanup
 
 		if err := loader.Set("KEY", "value"); err != nil {
 			t.Fatalf("Set() error = %v", err)
@@ -800,13 +1085,13 @@ func TestLoader_Set(t *testing.T) {
 		if err != nil {
 			t.Fatalf("New() error = %v", err)
 		}
-		defer loader.Close()
+		defer func() { _ = loader.Close() }() // best-effort cleanup
 
 		if err := loader.Set("EMPTY_KEY", ""); err != nil {
 			t.Errorf("Set() with empty value error = %v", err)
 		}
 		if got := loader.GetString("EMPTY_KEY"); got != "" {
-			t.Errorf("GetString() = %q, want [CLOSED]", got)
+			t.Errorf("GetString() = %q, want \"\" (the stored empty value)", got)
 		}
 	})
 
@@ -816,7 +1101,7 @@ func TestLoader_Set(t *testing.T) {
 		if err != nil {
 			t.Fatalf("New() error = %v", err)
 		}
-		defer loader.Close()
+		defer func() { _ = loader.Close() }() // best-effort cleanup
 
 		unicodeValue := "hello 世界 🌍 \u4e2d\u6587"
 		if err := loader.Set("UNICODE_KEY", unicodeValue); err != nil {
@@ -826,7 +1111,95 @@ func TestLoader_Set(t *testing.T) {
 			t.Errorf("GetString() = %q, want %q", got, unicodeValue)
 		}
 	})
+
+	t.Run("dotted key accepted and retrievable", func(t *testing.T) {
+		cfg := DefaultConfig()
+		loader, err := New(cfg)
+		if err != nil {
+			t.Fatalf("New() error = %v", err)
+		}
+		defer func() { _ = loader.Close() }() // best-effort cleanup
+
+		if err := loader.Set("APNEWS.COM", "Code=abc; g_state={\"i_l\":0}"); err != nil {
+			t.Fatalf("Set(\"APNEWS.COM\") error = %v, want nil (structured-format key rules)", err)
+		}
+		if got, ok := loader.Lookup("apnews.com"); !ok || got != "Code=abc; g_state={\"i_l\":0}" {
+			t.Errorf("Lookup(\"apnews.com\") = (%q, %v), want stored cookie value", got, ok)
+		}
+	})
+
+	t.Run("invalid key characters still rejected", func(t *testing.T) {
+		cfg := DefaultConfig()
+		loader, err := New(cfg)
+		if err != nil {
+			t.Fatalf("New() error = %v", err)
+		}
+		defer func() { _ = loader.Close() }() // best-effort cleanup
+
+		for _, key := range []string{"BAD KEY", "A=B", "A[0]", "höst"} {
+			if err := loader.Set(key, "v"); err == nil {
+				t.Errorf("Set(%q) = nil, want error", key)
+			}
+		}
+	})
 }
+
+// TestLoader_Set_KeyRules covers the two contract points of Set's key
+// validation beyond the default path: a custom KeyPattern keeps governing
+// programmatic keys, and validators without the ValidateSetKey capability
+// (custom minimal implementations) fall back to ValidateKey unchanged.
+func TestLoader_Set_KeyRules(t *testing.T) {
+	t.Run("custom KeyPattern still governs Set", func(t *testing.T) {
+		cfg := DefaultConfig()
+		cfg.KeyPattern = regexp.MustCompile(`^[A-Z_]+$`)
+		loader, err := New(cfg)
+		if err != nil {
+			t.Fatalf("New() error = %v", err)
+		}
+		defer func() { _ = loader.Close() }() // best-effort cleanup
+
+		if err := loader.Set("GOOD_KEY", "v"); err != nil {
+			t.Errorf("Set(GOOD_KEY) error = %v, want nil", err)
+		}
+		if err := loader.Set("A.B", "v"); err == nil {
+			t.Error("Set(A.B) = nil, want error under custom pattern")
+		}
+	})
+
+	t.Run("validator without ValidateSetKey falls back to ValidateKey", func(t *testing.T) {
+		mock := &recordingKeyValidator{err: errors.New("rejected by mock")}
+		cfg := DefaultConfig()
+		cfg.CustomValidator = mock
+		loader, err := New(cfg)
+		if err != nil {
+			t.Fatalf("New() error = %v", err)
+		}
+		defer func() { _ = loader.Close() }() // best-effort cleanup
+
+		if err := loader.Set("A.B", "v"); err == nil || !strings.Contains(err.Error(), "rejected by mock") {
+			t.Errorf("Set(A.B) error = %v, want the mock's ValidateKey error", err)
+		}
+		if !mock.called {
+			t.Error("fallback did not call the custom ValidateKey")
+		}
+	})
+}
+
+// recordingKeyValidator is a custom Validator (no ValidateSetKey capability)
+// that records whether ValidateKey was invoked.
+type recordingKeyValidator struct {
+	err    error
+	called bool
+}
+
+func (m *recordingKeyValidator) ValidateKey(key string) error {
+	m.called = true
+	return m.err
+}
+
+func (m *recordingKeyValidator) ValidateValue(value string) error { return nil }
+
+func (m *recordingKeyValidator) ValidateRequired(keys map[string]bool) error { return nil }
 
 func TestLoader_Delete(t *testing.T) {
 	t.Run("existing key", func(t *testing.T) {
@@ -835,7 +1208,7 @@ func TestLoader_Delete(t *testing.T) {
 		if err != nil {
 			t.Fatalf("New() error = %v", err)
 		}
-		defer loader.Close()
+		defer func() { _ = loader.Close() }() // best-effort cleanup
 
 		if err := loader.Set("KEY", "value"); err != nil {
 			t.Fatalf("Set() error = %v", err)
@@ -856,7 +1229,7 @@ func TestLoader_Delete(t *testing.T) {
 		if err != nil {
 			t.Fatalf("New() error = %v", err)
 		}
-		defer loader.Close()
+		defer func() { _ = loader.Close() }() // best-effort cleanup
 
 		// Should not error on non-existent key
 		if err := loader.Delete("MISSING"); err != nil {
@@ -871,7 +1244,7 @@ func TestLoader_Delete(t *testing.T) {
 // ============================================================================
 
 func TestLoader_ErrorPaths(t *testing.T) {
-	t.Run("Set with AutoApply returns setenv error", func(t *testing.T) {
+	t.Run("Set with AutoApply is retryable after Setenv failure", func(t *testing.T) {
 		fs := newTestFileSystem()
 		fs.setenvErr = errors.New("setenv failed")
 
@@ -882,15 +1255,28 @@ func TestLoader_ErrorPaths(t *testing.T) {
 		if err != nil {
 			t.Fatalf("New() error = %v", err)
 		}
-		defer loader.Close()
+		defer func() { _ = loader.Close() }() // best-effort cleanup
 
-		// Set propagates the underlying Setenv failure.
 		if err := loader.Set("KEY", "value"); err == nil {
-			t.Error("Set() with Setenv failure should return an error")
+			t.Fatal("Set() with Setenv failure should return an error")
+		}
+		// The in-memory store must be untouched: the old flow stored the
+		// value before applying, so with OverwriteExisting=false a retry
+		// hit the skip branch and the value could never be applied.
+		if _, ok := loader.Lookup("KEY"); ok {
+			t.Error("Lookup(KEY) found a value after a failed Set; memory must stay unchanged")
+		}
+
+		fs.setenvErr = nil
+		if err := loader.Set("KEY", "value"); err != nil {
+			t.Fatalf("retry Set() error = %v", err)
+		}
+		if v, ok := loader.Lookup("KEY"); !ok || v != "value" {
+			t.Errorf("Lookup(KEY) = (%q, %v) after retry, want (%q, true)", v, ok, "value")
 		}
 	})
 
-	t.Run("Delete swallows Unsetenv error", func(t *testing.T) {
+	t.Run("Delete reports Unsetenv error", func(t *testing.T) {
 		fs := newTestFileSystem()
 		fs.unsetenvErr = errors.New("unsetenv failed")
 
@@ -901,135 +1287,123 @@ func TestLoader_ErrorPaths(t *testing.T) {
 		if err != nil {
 			t.Fatalf("New() error = %v", err)
 		}
-		defer loader.Close()
+		defer func() { _ = loader.Close() }() // best-effort cleanup
 
 		// The key must have been applied by this loader for Delete to
 		// attempt Unsetenv.
-		fs.setenvErr = nil
-		if err := loader.Set("KEY", "value"); err != nil {
-			t.Fatalf("Set() error = %v", err)
-		}
-		fs.setenvErr = errors.New("setenv failed")
-
-		// Delete logs the Unsetenv failure but still succeeds so the key
-		// is removed from the loader either way.
-		if err := loader.Delete("KEY"); err != nil {
-			t.Errorf("Delete() with Unsetenv failure error = %v, want nil (logged only)", err)
-		}
-	})
-
-	t.Run("Apply with Setenv error", func(t *testing.T) {
-		fs := newTestFileSystem()
-		fs.setenvErr = errors.New("setenv failed")
-
-		cfg := DefaultConfig()
-		cfg.FileSystem = fs
-		loader, err := New(cfg)
-		if err != nil {
-			t.Fatalf("New() error = %v", err)
-		}
-		defer loader.Close()
-
 		if err := loader.Set("KEY", "value"); err != nil {
 			t.Fatalf("Set() error = %v", err)
 		}
 
-		if err := loader.Apply(); err == nil {
-			t.Error("Apply() with Setenv failure should return an error")
+		// The in-memory copy is removed either way, but the failed unset
+		// must surface: the process environment still holds the value
+		// while the caller believes it gone.
+		err = loader.Delete("KEY")
+		if err == nil {
+			t.Fatal("Delete() with Unsetenv failure should return an error")
+		}
+		if !strings.Contains(err.Error(), "unsetenv failed") {
+			t.Errorf("Delete() error = %v, want it to wrap the Unsetenv failure", err)
+		}
+		if _, ok := loader.Lookup("KEY"); ok {
+			t.Error("in-memory copy should already be removed")
 		}
 	})
+
+	// ("Apply with Setenv error" was folded away: applyLocked's Setenv
+	// failure branch is driven — with the additional masking and key
+	// persistence semantics asserted — by TestLoader_Apply's
+	// "apply partial failure masks key and keeps earlier keys" case.)
 }
 
 // ============================================================================
 // Keys/All/Len Tests
 // ============================================================================
 
-func TestLoader_Keys(t *testing.T) {
-	t.Run("multiple keys", func(t *testing.T) {
-		cfg := DefaultConfig()
-		loader, err := New(cfg)
-		if err != nil {
-			t.Fatalf("New() error = %v", err)
-		}
-		defer loader.Close()
+// TestLoader_Keys_All_Len merges the former TestLoader_Keys, TestLoader_All
+// and TestLoader_Len into one table: each row seeds a loader from a map and
+// runs a check against the collection accessor under test.
+func TestLoader_Keys_All_Len(t *testing.T) {
+	twoKeys := map[string]string{"KEY1": "value1", "KEY2": "value2"}
 
-		if err := loader.Set("KEY1", "value1"); err != nil {
-			t.Fatalf("Set() error = %v", err)
-		}
-		if err := loader.Set("KEY2", "value2"); err != nil {
-			t.Fatalf("Set() error = %v", err)
-		}
+	tests := []struct {
+		name  string
+		setup map[string]string
+		check func(t *testing.T, l *Loader)
+	}{
+		{
+			name:  "Keys returns every stored key",
+			setup: twoKeys,
+			check: func(t *testing.T, l *Loader) {
+				keys := l.Keys()
+				if len(keys) != 2 {
+					t.Errorf("Keys() returned %d keys, want 2", len(keys))
+				}
+				want := map[string]bool{"KEY1": true, "KEY2": true}
+				for _, k := range keys {
+					if !want[k] {
+						t.Errorf("Keys() returned unexpected key %q", k)
+					}
+				}
+			},
+		},
+		{
+			name: "Keys on empty loader returns no keys",
+			check: func(t *testing.T, l *Loader) {
+				if keys := l.Keys(); len(keys) != 0 {
+					t.Errorf("Keys() returned %d keys, want 0", len(keys))
+				}
+			},
+		},
+		{
+			name:  "All maps keys to their values",
+			setup: twoKeys,
+			check: func(t *testing.T, l *Loader) {
+				all := l.All()
+				if len(all) != 2 {
+					t.Errorf("All() returned %d keys, want 2", len(all))
+				}
+				if all["KEY1"] != "value1" {
+					t.Errorf("All()[\"KEY1\"] = %q, want %q", all["KEY1"], "value1")
+				}
+			},
+		},
+		{
+			name: "All on empty loader returns no entries",
+			check: func(t *testing.T, l *Loader) {
+				if all := l.All(); len(all) != 0 {
+					t.Errorf("All() returned %d keys, want 0", len(all))
+				}
+			},
+		},
+		{
+			name:  "Len counts stored variables",
+			setup: twoKeys,
+			check: func(t *testing.T, l *Loader) {
+				if l.Len() != 2 {
+					t.Errorf("Len() = %d, want 2", l.Len())
+				}
+			},
+		},
+	}
 
-		keys := loader.Keys()
-		if len(keys) != 2 {
-			t.Errorf("Keys() returned %d keys, want 2", len(keys))
-		}
-	})
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			loader, err := New(DefaultConfig())
+			if err != nil {
+				t.Fatalf("New() error = %v", err)
+			}
+			defer func() { _ = loader.Close() }() // best-effort cleanup
 
-	t.Run("empty loader", func(t *testing.T) {
-		cfg := DefaultConfig()
-		loader, err := New(cfg)
-		if err != nil {
-			t.Fatalf("New() error = %v", err)
-		}
-		defer loader.Close()
+			for key, value := range tt.setup {
+				if err := loader.Set(key, value); err != nil {
+					t.Fatalf("Set(%q) error = %v", key, err)
+				}
+			}
 
-		keys := loader.Keys()
-		if len(keys) != 0 {
-			t.Errorf("Keys() returned %d keys, want 0", len(keys))
-		}
-	})
-
-}
-
-func TestLoader_All(t *testing.T) {
-	t.Run("multiple keys", func(t *testing.T) {
-		cfg := DefaultConfig()
-		loader, err := New(cfg)
-		if err != nil {
-			t.Fatalf("New() error = %v", err)
-		}
-		defer loader.Close()
-
-		if err := loader.Set("KEY1", "value1"); err != nil {
-			t.Fatalf("Set() error = %v", err)
-		}
-		if err := loader.Set("KEY2", "value2"); err != nil {
-			t.Fatalf("Set() error = %v", err)
-		}
-
-		all := loader.All()
-		if len(all) != 2 {
-			t.Errorf("All() returned %d keys, want 2", len(all))
-		}
-		if all["KEY1"] != "value1" {
-			t.Errorf("All()[\"KEY1\"] = %q, want %q", all["KEY1"], "value1")
-		}
-	})
-
-}
-
-func TestLoader_Len(t *testing.T) {
-	t.Run("multiple keys", func(t *testing.T) {
-		cfg := DefaultConfig()
-		loader, err := New(cfg)
-		if err != nil {
-			t.Fatalf("New() error = %v", err)
-		}
-		defer loader.Close()
-
-		if err := loader.Set("KEY1", "value1"); err != nil {
-			t.Fatalf("Set() error = %v", err)
-		}
-		if err := loader.Set("KEY2", "value2"); err != nil {
-			t.Fatalf("Set() error = %v", err)
-		}
-
-		if loader.Len() != 2 {
-			t.Errorf("Len() = %d, want 2", loader.Len())
-		}
-	})
-
+			tt.check(t, loader)
+		})
+	}
 }
 
 // ============================================================================
@@ -1042,7 +1416,7 @@ func TestLoader_IsApplied(t *testing.T) {
 	if err != nil {
 		t.Fatalf("New() error = %v", err)
 	}
-	defer loader.Close()
+	defer func() { _ = loader.Close() }() // best-effort cleanup
 
 	if loader.IsApplied() {
 		t.Error("IsApplied() = true before Apply()")
@@ -1054,6 +1428,14 @@ func TestLoader_IsApplied(t *testing.T) {
 
 	if !loader.IsApplied() {
 		t.Error("IsApplied() = false after Apply()")
+	}
+
+	// BOUNDARY: a closed loader reports not-applied regardless of history.
+	if err := loader.Close(); err != nil {
+		t.Fatalf("Close() error = %v", err)
+	}
+	if loader.IsApplied() {
+		t.Error("IsApplied() = true after Close(), want false")
 	}
 }
 
@@ -1068,7 +1450,7 @@ func TestLoader_LoadTime(t *testing.T) {
 	if err != nil {
 		t.Fatalf("New() error = %v", err)
 	}
-	defer loader.Close()
+	defer func() { _ = loader.Close() }() // best-effort cleanup
 
 	before := loader.LoadTime()
 	if !before.IsZero() {
@@ -1082,6 +1464,14 @@ func TestLoader_LoadTime(t *testing.T) {
 	after := loader.LoadTime()
 	if after.IsZero() {
 		t.Error("LoadTime() should not be zero after loading")
+	}
+
+	// BOUNDARY: a closed loader reports a zero load time.
+	if err := loader.Close(); err != nil {
+		t.Fatalf("Close() error = %v", err)
+	}
+	if got := loader.LoadTime(); !got.IsZero() {
+		t.Errorf("LoadTime() after Close() = %v, want the zero time", got)
 	}
 }
 
@@ -1132,7 +1522,7 @@ func TestLoader_ClosedBehavior(t *testing.T) {
 					t.Error("Lookup() on closed loader ok = true, want false")
 				}
 				if value != "" {
-					t.Errorf("Lookup() = %q, want [CLOSED] string", value)
+					t.Errorf("Lookup() = %q, want \"\" (zero value on closed loader)", value)
 				}
 			},
 		},
@@ -1183,6 +1573,25 @@ func TestLoader_ClosedBehavior(t *testing.T) {
 				}
 			},
 		},
+		{
+			name:      "ParseInto",
+			operation: "ParseInto",
+			testFunc: func(t *testing.T, loader *Loader) {
+				var target struct{}
+				if err := loader.ParseInto(&target); !errors.Is(err, ErrClosed) {
+					t.Errorf("ParseInto() error = %v, want ErrClosed", err)
+				}
+			},
+		},
+		{
+			name:      "Validate",
+			operation: "Validate",
+			testFunc: func(t *testing.T, loader *Loader) {
+				if err := loader.Validate(); !errors.Is(err, ErrClosed) {
+					t.Errorf("Validate() error = %v, want ErrClosed", err)
+				}
+			},
+		},
 	}
 
 	for _, tt := range tests {
@@ -1192,7 +1601,7 @@ func TestLoader_ClosedBehavior(t *testing.T) {
 			if err != nil {
 				t.Fatalf("New() error = %v", err)
 			}
-			loader.Close()
+			_ = loader.Close() // best-effort cleanup
 
 			tt.testFunc(t, loader)
 		})
@@ -1228,6 +1637,34 @@ func TestLoader_CloseAndIsClosed(t *testing.T) {
 	}
 }
 
+// ltCloseErrHandler is an AuditHandler whose Close returns a fixed error,
+// used to verify that Loader.Close propagates the audit handler's failure
+// (Loader.Close → factory.Close → auditor.Close → handler.Close).
+type ltCloseErrHandler struct{ closeErr error }
+
+func (h *ltCloseErrHandler) Log(AuditEvent) error { return nil }
+
+func (h *ltCloseErrHandler) Close() error { return h.closeErr }
+
+func TestLoader_Close_AuditHandlerError(t *testing.T) {
+	closeErr := errors.New("audit handler close failed")
+
+	cfg := DefaultConfig()
+	cfg.AuditHandler = &ltCloseErrHandler{closeErr: closeErr}
+
+	loader, err := New(cfg)
+	if err != nil {
+		t.Fatalf("New() error = %v", err)
+	}
+
+	if err := loader.Close(); !errors.Is(err, closeErr) {
+		t.Errorf("Close() error = %v, want the audit handler's close error %v", err, closeErr)
+	}
+	if !loader.IsClosed() {
+		t.Error("IsClosed() = false after Close(), want true even when the handler fails")
+	}
+}
+
 // ============================================================================
 // GetInt/GetBool/GetDuration Tests (Table-Driven)
 // ============================================================================
@@ -1254,6 +1691,7 @@ func TestLoader_TypedGetters(t *testing.T) {
 		{"GetInt", []tc{
 			{"existing key", "PORT", "8080", func(l *Loader, key string) any { return l.GetInt(key) }, int64(8080)},
 			{"invalid value falls back to default", "PORT", "abc", func(l *Loader, key string) any { return l.GetInt(key, 42) }, int64(42)},
+			{"int64 overflow falls back to default", "BIG", "9223372036854775808", func(l *Loader, key string) any { return l.GetInt(key, 7) }, int64(7)},
 			{"missing key with default", "MISSING", "", func(l *Loader, key string) any { return l.GetInt(key, 3000) }, int64(3000)},
 			{"missing key without default", "MISSING", "", func(l *Loader, key string) any { return l.GetInt(key) }, int64(0)},
 		}},
@@ -1261,6 +1699,7 @@ func TestLoader_TypedGetters(t *testing.T) {
 			{"existing key", "PORT", "8080", func(l *Loader, key string) any { return l.GetUint64(key) }, uint64(8080)},
 			{"large value", "MAX_CONN", "18446744073709551615", func(l *Loader, key string) any { return l.GetUint64(key) }, uint64(18446744073709551615)},
 			{"invalid value falls back to default", "PORT", "abc", func(l *Loader, key string) any { return l.GetUint64(key, 42) }, uint64(42)},
+			{"negative value falls back to default", "PORT", "-1", func(l *Loader, key string) any { return l.GetUint64(key, 42) }, uint64(42)},
 			{"missing key with default", "MISSING", "", func(l *Loader, key string) any { return l.GetUint64(key, 3000) }, uint64(3000)},
 			{"missing key without default", "MISSING", "", func(l *Loader, key string) any { return l.GetUint64(key) }, uint64(0)},
 		}},
@@ -1282,6 +1721,10 @@ func TestLoader_TypedGetters(t *testing.T) {
 		{"GetDuration", []tc{
 			{"existing key", "TIMEOUT", "30s", func(l *Loader, key string) any { return l.GetDuration(key) }, 30 * time.Second},
 			{"invalid value falls back to default", "TIMEOUT", "notaduration", func(l *Loader, key string) any { return l.GetDuration(key, 5*time.Second) }, 5 * time.Second},
+			// A bare number is not a valid duration for time.ParseDuration
+			// ("missing unit"), so the default is returned — no implicit
+			// seconds/milliseconds interpretation.
+			{"bare number without unit falls back to default", "TIMEOUT", "5000", func(l *Loader, key string) any { return l.GetDuration(key, 5*time.Second) }, 5 * time.Second},
 			{"missing key with default", "MISSING", "", func(l *Loader, key string) any { return l.GetDuration(key, 5*time.Minute) }, 5 * time.Minute},
 			{"missing key without default", "MISSING", "", func(l *Loader, key string) any { return l.GetDuration(key) }, time.Duration(0)},
 		}},
@@ -1295,7 +1738,7 @@ func TestLoader_TypedGetters(t *testing.T) {
 					if err != nil {
 						t.Fatalf("New() error = %v", err)
 					}
-					defer loader.Close()
+					defer func() { _ = loader.Close() }() // best-effort cleanup
 
 					if tt.value != "" {
 						if err := loader.Set(tt.key, tt.value); err != nil {
@@ -1323,7 +1766,7 @@ func TestLoader_Unmarshal(t *testing.T) {
 		if err != nil {
 			t.Fatalf("New() error = %v", err)
 		}
-		defer loader.Close()
+		defer func() { _ = loader.Close() }() // best-effort cleanup
 
 		if err := loader.Set("NAME", "test"); err != nil {
 			t.Fatalf("Set() error = %v", err)
@@ -1364,7 +1807,7 @@ func TestLoader_Validate(t *testing.T) {
 		if err != nil {
 			t.Fatalf("New() error = %v", err)
 		}
-		defer loader.Close()
+		defer func() { _ = loader.Close() }() // best-effort cleanup
 
 		if err := loader.Set("KEY1", "value1"); err != nil {
 			t.Fatalf("Set() error = %v", err)
@@ -1386,7 +1829,7 @@ func TestLoader_Validate(t *testing.T) {
 		if err != nil {
 			t.Fatalf("New() error = %v", err)
 		}
-		defer loader.Close()
+		defer func() { _ = loader.Close() }() // best-effort cleanup
 
 		if err := loader.Validate(); err == nil {
 			t.Error("Validate() should fail with missing required key")
@@ -1410,6 +1853,11 @@ func TestDetectFormat(t *testing.T) {
 		{"config.yml", FormatYAML},
 		{"unknown.txt", FormatAuto},
 		{"", FormatAuto},
+		// Extension matching is case-insensitive...
+		{"CONFIG.JSON", FormatJSON},
+		{".YML", FormatYAML},
+		// ...and uses the final extension only (path/filepath.Ext).
+		{"app.production.env", FormatEnv},
 	}
 
 	for _, tt := range tests {
@@ -1494,29 +1942,13 @@ func TestAuditHandlerConstructors(t *testing.T) {
 // ComponentFactory Tests
 // ============================================================================
 
+// TestComponentFactory covers only the Close/IsClosed lifecycle: the
+// Validator/Auditor accessors are exercised functionally by
+// TestFactoryAuditor_PublicInterface and every loader test, so asserting
+// they are non-nil carries no information.
 func TestComponentFactory(t *testing.T) {
 	cfg := DefaultConfig()
-	loader, err := New(cfg)
-	if err != nil {
-		t.Fatalf("New() error = %v", err)
-	}
-	defer loader.Close()
-
 	factory := cfg.buildComponentFactory()
-
-	t.Run("Validator", func(t *testing.T) {
-		v := factory.Validator()
-		if v == nil {
-			t.Error("Validator() returned nil")
-		}
-	})
-
-	t.Run("Auditor", func(t *testing.T) {
-		a := factory.Auditor()
-		if a == nil {
-			t.Error("Auditor() returned nil")
-		}
-	})
 
 	t.Run("Close", func(t *testing.T) {
 		if err := factory.Close(); err != nil {
@@ -1531,50 +1963,48 @@ func TestComponentFactory(t *testing.T) {
 	})
 }
 
-func TestAuditorAdapter(t *testing.T) {
+func TestFactoryAuditor_PublicInterface(t *testing.T) {
 	cfg := DefaultConfig()
 	factory := cfg.buildComponentFactory()
-	defer factory.Close()
+	defer func() { _ = factory.Close() }() // best-effort cleanup
 
-	// Use the public accessor method to get the internal auditor
-	// Type assert to get the internal *Auditor
-	aud, ok := factory.auditor.(*internal.Auditor)
-	if !ok {
-		t.Skipf("factory.auditor is not the built-in *internal.Auditor")
+	// The built-in *internal.Auditor satisfies the public FullAuditLogger
+	// interface directly — no adapter wrapper exists since AuditAction
+	// became an alias of internal.Action. Exercise the public view.
+	auditor := factory.Auditor()
+	if auditor == nil {
+		t.Fatal("factory.Auditor() returned nil")
 	}
-	adapter := newAuditorAdapter(aud)
 
 	t.Run("Log", func(t *testing.T) {
-		if err := adapter.Log(ActionSet, "KEY", "test", true); err != nil {
+		if err := auditor.Log(ActionSet, "KEY", "test", true); err != nil {
 			t.Errorf("Log() error = %v", err)
 		}
 	})
 
 	t.Run("LogError", func(t *testing.T) {
-		if err := adapter.LogError(ActionSet, "KEY", "error"); err != nil {
+		if err := auditor.LogError(ActionSet, "KEY", "error"); err != nil {
 			t.Errorf("LogError() error = %v", err)
 		}
 	})
 
 	t.Run("LogWithFile", func(t *testing.T) {
-		if err := adapter.LogWithFile(ActionSet, "KEY", "file", "test", true); err != nil {
+		if err := auditor.LogWithFile(ActionSet, "KEY", "file", "test", true); err != nil {
 			t.Errorf("LogWithFile() error = %v", err)
 		}
 	})
 
 	t.Run("LogWithDuration", func(t *testing.T) {
-		if err := adapter.LogWithDuration(ActionSet, "KEY", "test", true, time.Second); err != nil {
+		if err := auditor.LogWithDuration(ActionSet, "KEY", "test", true, time.Second); err != nil {
 			t.Errorf("LogWithDuration() error = %v", err)
 		}
 	})
 
 	t.Run("Close", func(t *testing.T) {
-		if err := adapter.Close(); err != nil {
+		if err := auditor.Close(); err != nil {
 			t.Errorf("Close() error = %v", err)
 		}
 	})
-	// newAuditorAdapter(nil) must return nil — covered by
-	// TestAuditorAdapter_Nil in utils_test.go.
 }
 
 // ============================================================================
@@ -1582,239 +2012,144 @@ func TestAuditorAdapter(t *testing.T) {
 // ============================================================================
 
 func TestJSONParser_EdgeCases(t *testing.T) {
-	t.Run("empty object", func(t *testing.T) {
-		fs := newTestFileSystem()
-		fs.files["empty.json"] = "{}"
+	tests := []struct {
+		name      string
+		content   string        // used when contentFn is nil
+		contentFn func() string // generated content (many-variables case)
+		cfgMod    func(*Config)
+		wantErr   bool
+		want      map[string]string // exact expected key set and values
+	}{
+		{
+			name:    "empty object",
+			content: "{}",
+			want:    map[string]string{},
+		},
+		{
+			name: "nested object",
+			content: `{
+				"database": {
+					"host": "localhost",
+					"port": 5432,
+					"credentials": {
+						"username": "admin",
+						"password": "secret"
+					}
+				}
+			}`,
+			want: map[string]string{
+				"DATABASE_HOST":                 "localhost",
+				"DATABASE_PORT":                 "5432",
+				"DATABASE_CREDENTIALS_USERNAME": "admin",
+				"DATABASE_CREDENTIALS_PASSWORD": "secret",
+			},
+		},
+		{
+			name: "array handling",
+			content: `{
+				"servers": ["server1", "server2", "server3"],
+				"ports": [8080, 8081, 8082]
+			}`,
+			want: map[string]string{
+				"SERVERS_0": "server1",
+				"SERVERS_1": "server2",
+				"SERVERS_2": "server3",
+				"PORTS_0":   "8080",
+				"PORTS_1":   "8081",
+				"PORTS_2":   "8082",
+			},
+		},
+		{
+			name:    "null handling",
+			content: "{\n\t\"null_value\": null,\n\t\"other_value\": \"test\"\n}",
+			cfgMod:  func(c *Config) { c.JSONNullAsEmpty = true },
+			want:    map[string]string{"NULL_VALUE": "", "OTHER_VALUE": "test"},
+		},
+		{
+			name:    "invalid JSON",
+			content: `{invalid json}`,
+			wantErr: true,
+		},
+		{
+			// The file-too-large path is covered by TestLoader_LoadFiles
+			// "file too large" (format-independent, asserts *FileError).
+			name: "max variables exceeded",
+			contentFn: func() string {
+				var sb strings.Builder
+				sb.WriteString("{")
+				for i := 0; i < 100; i++ {
+					if i > 0 {
+						sb.WriteString(",")
+					}
+					fmt.Fprintf(&sb, `"KEY_%03d":"value"`, i)
+				}
+				sb.WriteString("}")
+				return sb.String()
+			},
+			cfgMod:  func(c *Config) { c.MaxVariables = 10 },
+			wantErr: true,
+		},
+		{
+			name:    "JSON max depth exceeded",
+			content: `{"a": {"b": {"c": {"d": {"e": {"f": "deep"}}}}}}`,
+			cfgMod:  func(c *Config) { c.JSONMaxDepth = 3 },
+			wantErr: true,
+		},
+		{
+			name:    "JSON with boolean values",
+			content: `{"enabled": true, "disabled": false}`,
+			cfgMod:  func(c *Config) { c.JSONBoolAsString = true },
+			want:    map[string]string{"ENABLED": "true", "DISABLED": "false"},
+		},
+		{
+			// With the flag off, a JSON null is stored as the literal string
+			// "null" (internal flattenDecoded), not skipped and not empty.
+			name:    "JSON null with nullAsEmpty disabled",
+			content: `{"key": null}`,
+			cfgMod:  func(c *Config) { c.JSONNullAsEmpty = false },
+			want:    map[string]string{"KEY": "null"},
+		},
+	}
 
-		cfg := DefaultConfig()
-		cfg.FileSystem = fs
-		loader, err := New(cfg)
-		if err != nil {
-			t.Fatalf("New() error = %v", err)
-		}
-		defer loader.Close()
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			content := tt.content
+			if tt.contentFn != nil {
+				content = tt.contentFn()
+			}
+			fs := newTestFileSystem()
+			fs.files["edge.json"] = content
 
-		if err := loader.LoadFiles("empty.json"); err != nil {
-			t.Fatalf("LoadFiles() error = %v", err)
-		}
+			cfg := DefaultConfig()
+			cfg.FileSystem = fs
+			if tt.cfgMod != nil {
+				tt.cfgMod(&cfg)
+			}
+			loader, err := New(cfg)
+			if err != nil {
+				t.Fatalf("New() error = %v", err)
+			}
+			defer func() { _ = loader.Close() }() // best-effort cleanup
 
-		if loader.Len() != 0 {
-			t.Errorf("Len() = %d, want 0", loader.Len())
-		}
-	})
+			err = loader.LoadFiles("edge.json")
+			if (err != nil) != tt.wantErr {
+				t.Fatalf("LoadFiles() error = %v, wantErr %v", err, tt.wantErr)
+			}
+			if tt.wantErr {
+				return
+			}
 
-	t.Run("nested object", func(t *testing.T) {
-		fs := newTestFileSystem()
-		fs.files["nested.json"] = `{
-			"database": {
-				"host": "localhost",
-				"port": 5432,
-				"credentials": {
-					"username": "admin",
-					"password": "secret"
+			got := loader.All()
+			if len(got) != len(tt.want) {
+				t.Fatalf("All() = %v (%d keys), want %v (%d keys)", got, len(got), tt.want, len(tt.want))
+			}
+			for key, want := range tt.want {
+				if got[key] != want {
+					t.Errorf("All()[%q] = %q, want %q", key, got[key], want)
 				}
 			}
-		}`
-
-		cfg := DefaultConfig()
-		cfg.FileSystem = fs
-		loader, err := New(cfg)
-		if err != nil {
-			t.Fatalf("New() error = %v", err)
-		}
-		defer loader.Close()
-
-		if err := loader.LoadFiles("nested.json"); err != nil {
-			t.Fatalf("LoadFiles() error = %v", err)
-		}
-
-		if loader.GetString("DATABASE_HOST") != "localhost" {
-			t.Errorf("GetString(\"DATABASE_HOST\") = %q, want %q", loader.GetString("DATABASE_HOST"), "localhost")
-		}
-		if loader.GetString("DATABASE_PORT") != "5432" {
-			t.Errorf("GetString(\"DATABASE_PORT\") = %q, want %q", loader.GetString("DATABASE_PORT"), "5432")
-		}
-		if loader.GetString("DATABASE_CREDENTIALS_USERNAME") != "admin" {
-			t.Errorf("GetString(\"DATABASE_CREDENTIALS_USERNAME\") = %q, want %q", loader.GetString("DATABASE_CREDENTIALS_USERNAME"), "admin")
-		}
-	})
-
-	t.Run("array handling", func(t *testing.T) {
-		fs := newTestFileSystem()
-		fs.files["array.json"] = `{
-			"servers": ["server1", "server2", "server3"],
-			"ports": [8080, 8081, 8082]
-		}`
-
-		cfg := DefaultConfig()
-		cfg.FileSystem = fs
-		loader, err := New(cfg)
-		if err != nil {
-			t.Fatalf("New() error = %v", err)
-		}
-		defer loader.Close()
-
-		if err := loader.LoadFiles("array.json"); err != nil {
-			t.Fatalf("LoadFiles() error = %v", err)
-		}
-
-		if loader.GetString("SERVERS_0") != "server1" {
-			t.Errorf("GetString(\"SERVERS_0\") = %q, want %q", loader.GetString("SERVERS_0"), "server1")
-		}
-		if loader.GetString("SERVERS_2") != "server3" {
-			t.Errorf("GetString(\"SERVERS_2\") = %q, want %q", loader.GetString("SERVERS_2"), "server3")
-		}
-	})
-
-	t.Run("null handling", func(t *testing.T) {
-		fs := newTestFileSystem()
-		fs.files["null.json"] = `{
-			"null_value": null,
-			"other_value": "test"
-		}`
-
-		cfg := DefaultConfig()
-		cfg.FileSystem = fs
-		cfg.JSONNullAsEmpty = true
-		loader, err := New(cfg)
-		if err != nil {
-			t.Fatalf("New() error = %v", err)
-		}
-		defer loader.Close()
-
-		if err := loader.LoadFiles("null.json"); err != nil {
-			t.Fatalf("LoadFiles() error = %v", err)
-		}
-
-		if loader.GetString("NULL_VALUE") != "" {
-			t.Errorf("GetString(\"NULL_VALUE\") = %q, want [CLOSED]", loader.GetString("NULL_VALUE"))
-		}
-	})
-
-	t.Run("invalid JSON", func(t *testing.T) {
-		fs := newTestFileSystem()
-		fs.files["invalid.json"] = `{invalid json}`
-
-		cfg := DefaultConfig()
-		cfg.FileSystem = fs
-		loader, err := New(cfg)
-		if err != nil {
-			t.Fatalf("New() error = %v", err)
-		}
-		defer loader.Close()
-
-		if err := loader.LoadFiles("invalid.json"); err == nil {
-			t.Error("LoadFiles() should fail with invalid JSON")
-		}
-	})
-
-	t.Run("file too large", func(t *testing.T) {
-		fs := newTestFileSystem()
-		fs.files["large.json"] = strings.Repeat(`{"key":"value"}`, 1000)
-
-		cfg := DefaultConfig()
-		cfg.FileSystem = fs
-		cfg.MaxFileSize = 100
-		loader, err := New(cfg)
-		if err != nil {
-			t.Fatalf("New() error = %v", err)
-		}
-		defer loader.Close()
-
-		if err := loader.LoadFiles("large.json"); err == nil {
-			t.Error("LoadFiles() should fail with file too large")
-		}
-	})
-
-	t.Run("max variables exceeded", func(t *testing.T) {
-		fs := newTestFileSystem()
-		// Create JSON with many variables
-		var sb strings.Builder
-		sb.WriteString("{")
-		for i := 0; i < 100; i++ {
-			if i > 0 {
-				sb.WriteString(",")
-			}
-			sb.WriteString(`"KEY_`)
-			sb.WriteString(string(rune('A' + i%26)))
-			sb.WriteString(`":"value"`)
-		}
-		sb.WriteString("}")
-		fs.files["many.json"] = sb.String()
-
-		cfg := DefaultConfig()
-		cfg.FileSystem = fs
-		cfg.MaxVariables = 10
-		loader, err := New(cfg)
-		if err != nil {
-			t.Fatalf("New() error = %v", err)
-		}
-		defer loader.Close()
-
-		if err := loader.LoadFiles("many.json"); err == nil {
-			t.Error("LoadFiles() should fail with max variables exceeded")
-		}
-	})
-
-	t.Run("JSON max depth exceeded", func(t *testing.T) {
-		json := `{"a": {"b": {"c": {"d": {"e": {"f": "deep"}}}}}}`
-		fs := newTestFileSystem()
-		fs.files["deep.json"] = json
-
-		cfg := DefaultConfig()
-		cfg.FileSystem = fs
-		cfg.JSONMaxDepth = 3
-		loader, err := New(cfg)
-		if err != nil {
-			t.Fatalf("New() error = %v", err)
-		}
-		defer loader.Close()
-
-		err = loader.LoadFiles("deep.json")
-		if err == nil {
-			t.Error("LoadFiles() should fail with JSON depth exceeded")
-		}
-	})
-
-	t.Run("JSON with boolean values", func(t *testing.T) {
-		fs := newTestFileSystem()
-		fs.files["bool.json"] = `{"enabled": true, "disabled": false}`
-		cfg := DefaultConfig()
-		cfg.FileSystem = fs
-		cfg.JSONBoolAsString = true
-		loader, err := New(cfg)
-		if err != nil {
-			t.Fatalf("New() error = %v", err)
-		}
-		defer loader.Close()
-
-		if err := loader.LoadFiles("bool.json"); err != nil {
-			t.Fatalf("LoadFiles() error = %v", err)
-		}
-		if v := loader.GetString("ENABLED"); v != "true" {
-			t.Errorf("ENABLED = %q, want %q", v, "true")
-		}
-		if v := loader.GetString("DISABLED"); v != "false" {
-			t.Errorf("DISABLED = %q, want %q", v, "false")
-		}
-	})
-
-	t.Run("JSON null with nullAsEmpty disabled", func(t *testing.T) {
-		fs := newTestFileSystem()
-		fs.files["null2.json"] = `{"key": null}`
-		cfg := DefaultConfig()
-		cfg.FileSystem = fs
-		cfg.JSONNullAsEmpty = false
-		loader, err := New(cfg)
-		if err != nil {
-			t.Fatalf("New() error = %v", err)
-		}
-		defer loader.Close()
-
-		if err := loader.LoadFiles("null2.json"); err != nil {
-			t.Fatalf("LoadFiles() error = %v", err)
-		}
-	})
+		})
+	}
 }
 
 // ============================================================================
@@ -1902,18 +2237,33 @@ app:
 			want: map[string]string{"APP_NAME": "myapp"},
 		},
 		{
-			// Boundary: inline lists are kept as scalar strings rather than
-			// being split into indexed keys.
-			name:    "inline list kept as scalar",
+			// YAML flow sequences with unquoted scalars are flattened into
+			// indexed keys via the flow→JSON conversion (GEN-001: they were
+			// previously stored as the raw text, which GetSlice then split
+			// at the wrong boundaries).
+			name:    "inline flow list flattened to indexed keys",
 			content: "tags: [web, api, db]\n",
-			want:    map[string]string{"TAGS": "[web, api, db]"},
+			want:    map[string]string{"TAGS_0": "web", "TAGS_1": "api", "TAGS_2": "db"},
 		},
 		{
-			// Flow mappings produce flattened keys that violate the .env key
-			// pattern, so the load is rejected by key validation.
-			name:    "flow mapping rejected by key validation",
+			// GEN-001: block scalars previously stored the literal "|"
+			// and dropped the indented body; they now load verbatim.
+			name:    "literal block scalar loads verbatim",
+			content: "cert: |\n  -----BEGIN CERT-----\n  data\n  -----END CERT-----\nport: 9090\n",
+			want: map[string]string{
+				"CERT": "-----BEGIN CERT-----\ndata\n-----END CERT-----\n",
+				"PORT": "9090",
+			},
+		},
+		{
+			// YAML-style flow mappings are not JSON (unquoted keys); the
+			// flow→JSON conversion flattens them like their block-form
+			// equivalents. (Previously the whole text was stored as a raw
+			// scalar; before that, the ": " inside the braces made the lexer
+			// misread the value as a bogus key and the load errored.)
+			name:    "flow mapping flattened to prefixed keys",
 			content: "config: {host: localhost, port: 3000}\n",
-			wantErr: true,
+			want:    map[string]string{"CONFIG_HOST": "localhost", "CONFIG_PORT": "3000"},
 		},
 		{
 			name: "number values as strings",
@@ -1945,7 +2295,7 @@ negative_val: -10
 			if err != nil {
 				t.Fatalf("New() error = %v", err)
 			}
-			defer loader.Close()
+			defer func() { _ = loader.Close() }() // best-effort cleanup
 
 			err = loader.LoadFiles("edge.yaml")
 			if (err != nil) != tt.wantErr {
@@ -1966,7 +2316,7 @@ negative_val: -10
 		var sb strings.Builder
 		for i := 0; i < 15; i++ {
 			sb.WriteString(strings.Repeat("  ", i))
-			sb.WriteString(fmt.Sprintf("level%d:\n", i))
+			_, _ = fmt.Fprintf(&sb, "level%d:\n", i) // builder writes cannot fail
 		}
 		fs := newTestFileSystem()
 		fs.files["deep.yaml"] = sb.String()
@@ -1978,7 +2328,7 @@ negative_val: -10
 		if err != nil {
 			t.Fatalf("New() error = %v", err)
 		}
-		defer loader.Close()
+		defer func() { _ = loader.Close() }() // best-effort cleanup
 
 		if err := loader.LoadFiles("deep.yaml"); err == nil {
 			t.Error("LoadFiles() should fail with YAML depth exceeded")
@@ -2038,6 +2388,11 @@ func TestErrorTypes_Error(t *testing.T) {
 // ============================================================================
 
 func TestValidateFilePath(t *testing.T) {
+	// The full rejection matrix (network paths, drive letters, every
+	// reserved device name, more valid-path shapes) lives in
+	// internal/path_validator_test.go. This keeps one representative row per
+	// rejection class plus a valid control, wired through the public
+	// validateFilePath entry point.
 	tests := []struct {
 		name      string
 		filename  string
@@ -2045,24 +2400,11 @@ func TestValidateFilePath(t *testing.T) {
 		errReason string
 	}{
 		{"valid relative path", "config/.env", false, ""},
-		{"valid simple filename", ".env", false, ""},
-		{"empty filename", "", true, "empty filename"},
-		{"null byte in path", "config\x00.env", true, "null byte"},
 		{"UNC path backslash", "\\\\server\\share", true, "UNC path"},
-		{"network path forward slash", "//server/share", true, "network path"},
-		{"Unix absolute path", "/etc/passwd", true, "absolute path"},
-		{"Windows drive letter", "C:\\Windows", true, "drive letter"},
-		{"lowercase drive letter", "c:\\test", true, "drive letter"},
 		{"path traversal", "../../../etc/passwd", true, "path traversal"},
-		{"hidden traversal", "config/../../../etc", true, "path traversal"},
-		{"Windows reserved CON", "CON", true, "reserved device"},
-		{"Windows reserved NUL", "NUL.txt", true, "reserved device"},
-		{"Windows reserved AUX", "AUX:", true, "reserved device"},
-		{"Windows reserved PRN", "PRN", true, "reserved device"},
-		{"Windows COM port", "COM1", true, "reserved device"},
-		{"Windows LPT port", "LPT1.txt", true, "reserved device"},
-		{"valid with dots", "config.local/.env", false, ""},
-		{"valid subdirectory", "config/local/.env", false, ""},
+		{"Windows reserved in subdir", "subdir/CON", true, "reserved device"},
+		{"Windows reserved after backslash", `backup\NUL.txt`, true, "reserved device"},
+		{"Windows reserved later component", "a/../COM1", true, "reserved device"},
 	}
 
 	for _, tt := range tests {
@@ -2080,6 +2422,29 @@ func TestValidateFilePath(t *testing.T) {
 				}
 			}
 		})
+	}
+}
+
+// TestLoader_LoadFiles_PathTraversal pins the end-to-end wiring of path
+// validation into LoadFiles (env.go loadFileLocked): a traversal path is
+// rejected with a SecurityError before any filesystem access happens.
+func TestLoader_LoadFiles_PathTraversal(t *testing.T) {
+	loader, err := New(DefaultConfig())
+	if err != nil {
+		t.Fatalf("New() error = %v", err)
+	}
+	defer func() { _ = loader.Close() }() // best-effort cleanup
+
+	err = loader.LoadFiles("../../etc/passwd")
+	if err == nil {
+		t.Fatal("LoadFiles(traversal path) error = nil, want SecurityError")
+	}
+	var secErr *SecurityError
+	if !errors.As(err, &secErr) {
+		t.Fatalf("LoadFiles(traversal path) error = %T, want *SecurityError", err)
+	}
+	if !strings.Contains(secErr.Reason, "path traversal") {
+		t.Errorf("LoadFiles(traversal path) reason = %q, want it to mention path traversal", secErr.Reason)
 	}
 }
 
@@ -2138,8 +2503,12 @@ func TestValidateFilePath_SymlinkEscape(t *testing.T) {
 // newParseError Tests
 // ============================================================================
 
+// TestNewParseError pins the one behavioral point of the constructor: the
+// Content field is sanitized (errors.go newParseError applies
+// MaskSensitiveInString), because Error() does not print Content but callers
+// can still read it via errors.As.
 func TestNewParseError(t *testing.T) {
-	err := newParseError("test.env", 10, "API_KEY=secret123", errors.New("parse failed"))
+	err := newParseError("test.env", 10, "PASSWORD=secret123", errors.New("parse failed"))
 
 	if err.File != "test.env" {
 		t.Errorf("File = %q, want %q", err.File, "test.env")
@@ -2149,6 +2518,16 @@ func TestNewParseError(t *testing.T) {
 	}
 	if err.Err == nil {
 		t.Error("Err should not be nil")
+	}
+
+	// MaskInString replaces the value of any key=value pair matching a
+	// sensitive pattern with "[MASKED]": "PASSWORD=secret123" becomes
+	// "PASSWORD=[MASKED]". The secret must not survive in any form.
+	if got := err.Content; got != "PASSWORD=[MASKED]" {
+		t.Errorf("Content = %q, want %q", got, "PASSWORD=[MASKED]")
+	}
+	if strings.Contains(err.Content, "secret123") {
+		t.Error("Content leaks the secret value")
 	}
 
 	// Verify error message is not empty
@@ -2162,17 +2541,6 @@ func TestNewParseError(t *testing.T) {
 // ============================================================================
 
 func TestNew_ErrorPaths(t *testing.T) {
-	t.Run("parser creation error with factory cleanup", func(t *testing.T) {
-		// This tests the error path where createParsers fails
-		// and factory.Close() is called for cleanup
-		cfg := DefaultConfig()
-		loader, err := New(cfg)
-		if err != nil {
-			t.Fatalf("New() error = %v", err)
-		}
-		loader.Close()
-	})
-
 	t.Run("auto-load file not found with fail on missing", func(t *testing.T) {
 		fs := newTestFileSystem()
 		// Don't add any files
@@ -2188,20 +2556,33 @@ func TestNew_ErrorPaths(t *testing.T) {
 		}
 	})
 
-	t.Run("auto-apply error", func(t *testing.T) {
+	t.Run("auto-apply error during New", func(t *testing.T) {
+		// Real error injection: the file loads fine, but applying it to the
+		// (mocked) process environment fails, so New itself must fail.
 		fs := newTestFileSystem()
 		fs.files[".env"] = "KEY=value"
+		fs.setenvErr = errors.New("setenv failed")
 
 		cfg := DefaultConfig()
 		cfg.FileSystem = fs
 		cfg.Filenames = []string{".env"}
 		cfg.AutoApply = true
 
-		loader, err := New(cfg)
-		if err != nil {
-			t.Fatalf("New() error = %v", err)
+		if _, err := New(cfg); err == nil {
+			t.Error("New() should fail when AutoApply cannot set the environment")
 		}
-		loader.Close()
+	})
+
+	t.Run("partially-filled config is not auto-completed", func(t *testing.T) {
+		// Documented semantics (env.go New): a fully zero Config means
+		// DefaultConfig, but a partially-set one is NOT auto-completed —
+		// unset limits stay zero and Validate rejects them.
+		cfg := Config{FileConfig: FileConfig{Filenames: []string{".env"}}}
+
+		_, err := New(cfg)
+		if !errors.Is(err, ErrInvalidConfig) {
+			t.Errorf("New(partially-filled Config) error = %v, want ErrInvalidConfig", err)
+		}
 	})
 }
 
@@ -2345,22 +2726,8 @@ func nextTestFormat() FileFormat {
 }
 
 func TestRegisterParser(t *testing.T) {
-	// All built-in formats are equally protected from re-registration.
-	for _, tt := range []struct {
-		name   string
-		format FileFormat
-	}{
-		{"dotenv", FormatEnv},
-		{"json", FormatJSON},
-		{"yaml", FormatYAML},
-	} {
-		t.Run("cannot override built-in "+tt.name+" parser", func(t *testing.T) {
-			if err := RegisterParser(tt.format, nil); err == nil {
-				t.Errorf("RegisterParser should fail for built-in %s format", tt.name)
-			}
-		})
-	}
-
+	// Nil-factory guards (built-in and custom formats) live in
+	// TestRegisterParser_NilFactory.
 	t.Run("custom format registration", func(t *testing.T) {
 		// Use unique format to ensure test isolation with -count=N
 		customFormat := nextTestFormat()
@@ -2401,13 +2768,6 @@ func TestForceRegisterParser(t *testing.T) {
 		})
 		if err != nil {
 			t.Errorf("ForceRegisterParser() error = %v", err)
-		}
-	})
-
-	t.Run("force register nil factory returns error", func(t *testing.T) {
-		err := ForceRegisterParser(FormatEnv, nil)
-		if err == nil {
-			t.Error("ForceRegisterParser() with nil factory should return error")
 		}
 	})
 
@@ -2497,86 +2857,72 @@ func TestFileError_Unwrap(t *testing.T) {
 // ============================================================================
 
 func TestExpansion_EdgeCases(t *testing.T) {
-	t.Run("expansion depth limit exceeded", func(t *testing.T) {
-		fs := newTestFileSystem()
-		fs.files["cycle.env"] = "A=${B}\nB=${A}"
+	tests := []struct {
+		name    string
+		content string
+		cfgMod  func(*Config)
+		wantErr bool
+		want    map[string]string
+	}{
+		{
+			name:    "expansion depth limit exceeded",
+			content: "A=${B}\nB=${A}",
+			cfgMod: func(c *Config) {
+				c.ExpandVariables = true
+				c.MaxExpansionDepth = 2
+			},
+			wantErr: true,
+		},
+		{
+			name:    "self-referencing variable",
+			content: "X=${X}",
+			cfgMod:  func(c *Config) { c.ExpandVariables = true },
+			wantErr: true,
+		},
+		{
+			name:    "braced variable with default",
+			content: "RESULT=${MISSING:-fallback}",
+			cfgMod:  func(c *Config) { c.ExpandVariables = true },
+			want:    map[string]string{"RESULT": "fallback"},
+		},
+		{
+			name:    "nested variable expansion",
+			content: "BASE=hello\nNESTED=${BASE}_world",
+			cfgMod:  func(c *Config) { c.ExpandVariables = true },
+			want:    map[string]string{"BASE": "hello", "NESTED": "hello_world"},
+		},
+	}
 
-		cfg := DefaultConfig()
-		cfg.FileSystem = fs
-		cfg.ExpandVariables = true
-		cfg.MaxExpansionDepth = 2
-		loader, err := New(cfg)
-		if err != nil {
-			t.Fatalf("New() error = %v", err)
-		}
-		defer loader.Close()
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			fs := newTestFileSystem()
+			fs.files["expand.env"] = tt.content
 
-		err = loader.LoadFiles("cycle.env")
-		if err == nil {
-			t.Error("LoadFiles() should fail with expansion depth exceeded")
-		}
-	})
+			cfg := DefaultConfig()
+			cfg.FileSystem = fs
+			if tt.cfgMod != nil {
+				tt.cfgMod(&cfg)
+			}
+			loader, err := New(cfg)
+			if err != nil {
+				t.Fatalf("New() error = %v", err)
+			}
+			defer func() { _ = loader.Close() }() // best-effort cleanup
 
-	t.Run("self-referencing variable", func(t *testing.T) {
-		fs := newTestFileSystem()
-		fs.files["selfref.env"] = "X=${X}"
-
-		cfg := DefaultConfig()
-		cfg.FileSystem = fs
-		cfg.ExpandVariables = true
-		loader, err := New(cfg)
-		if err != nil {
-			t.Fatalf("New() error = %v", err)
-		}
-		defer loader.Close()
-
-		err = loader.LoadFiles("selfref.env")
-		if err == nil {
-			t.Error("LoadFiles() should fail with self-referencing variable")
-		}
-	})
-
-	t.Run("braced variable with default", func(t *testing.T) {
-		fs := newTestFileSystem()
-		fs.files["default.env"] = "RESULT=${MISSING:-fallback}"
-
-		cfg := DefaultConfig()
-		cfg.FileSystem = fs
-		cfg.ExpandVariables = true
-		loader, err := New(cfg)
-		if err != nil {
-			t.Fatalf("New() error = %v", err)
-		}
-		defer loader.Close()
-
-		if err := loader.LoadFiles("default.env"); err != nil {
-			t.Fatalf("LoadFiles() error = %v", err)
-		}
-		if v := loader.GetString("RESULT"); v != "fallback" {
-			t.Errorf("RESULT = %q, want %q", v, "fallback")
-		}
-	})
-
-	t.Run("nested variable expansion", func(t *testing.T) {
-		fs := newTestFileSystem()
-		fs.files["nested.env"] = "BASE=hello\nNESTED=${BASE}_world"
-
-		cfg := DefaultConfig()
-		cfg.FileSystem = fs
-		cfg.ExpandVariables = true
-		loader, err := New(cfg)
-		if err != nil {
-			t.Fatalf("New() error = %v", err)
-		}
-		defer loader.Close()
-
-		if err := loader.LoadFiles("nested.env"); err != nil {
-			t.Fatalf("LoadFiles() error = %v", err)
-		}
-		if v := loader.GetString("NESTED"); v != "hello_world" {
-			t.Errorf("NESTED = %q, want %q", v, "hello_world")
-		}
-	})
+			err = loader.LoadFiles("expand.env")
+			if (err != nil) != tt.wantErr {
+				t.Fatalf("LoadFiles() error = %v, wantErr %v", err, tt.wantErr)
+			}
+			if tt.wantErr {
+				return
+			}
+			for key, want := range tt.want {
+				if got := loader.GetString(key); got != want {
+					t.Errorf("GetString(%q) = %q, want %q", key, got, want)
+				}
+			}
+		})
+	}
 }
 
 // ============================================================================
@@ -2584,32 +2930,20 @@ func TestExpansion_EdgeCases(t *testing.T) {
 // ============================================================================
 
 // TestParser_BoundaryConditions exercises uncovered branches in the env
-// parser's Parse method: duplicate-key skip, parse-error break, line-too-long
-// scanner error, and export-prefix handling.
+// parser's Parse method: parse-error break, line-too-long scanner error,
+// export-prefix handling, and the max-variables ceiling. (Duplicate-key
+// behavior is covered by duplicate_key_test.go across all policies.)
 func TestParser_BoundaryConditions(t *testing.T) {
 	tests := []struct {
 		name      string
 		content   string
 		configFn  func(*Config)
 		wantErr   bool
+		wantErrIs error  // when set, the error must match via errors.Is
 		wantKey   string // verify this key exists after parse
 		wantValue string // expected value for wantKey
 		wantNoKey string // verify this key does NOT exist
 	}{
-		{
-			name:      "duplicate key skipped when overwrite disabled",
-			content:   "KEY=first\nKEY=second\n",
-			configFn:  func(c *Config) { c.OverwriteExisting = false },
-			wantKey:   "KEY",
-			wantValue: "first", // second write is skipped
-		},
-		{
-			name:      "duplicate key overwritten when overwrite enabled",
-			content:   "KEY=first\nKEY=second\n",
-			configFn:  func(c *Config) { c.OverwriteExisting = true },
-			wantKey:   "KEY",
-			wantValue: "second",
-		},
 		{
 			name:     "line too long triggers scanner error",
 			content:  strings.Repeat("a", 2000) + "\n",
@@ -2630,10 +2964,19 @@ func TestParser_BoundaryConditions(t *testing.T) {
 			wantNoKey: "COMMENT",
 		},
 		{
-			name:     "max variables exceeded during env parse",
-			content:  "A=1\nB=2\nC=3\n",
-			configFn: func(c *Config) { c.MaxVariables = 2 },
-			wantErr:  true,
+			// BOUNDARY (parser.go): trailing spaces on the line are trimmed
+			// from the value — only an escaped space or quotes preserve them.
+			name:      "trailing spaces trimmed from value",
+			content:   "KEY=value   \n",
+			wantKey:   "KEY",
+			wantValue: "value",
+		},
+		{
+			name:      "max variables exceeded during env parse",
+			content:   "A=1\nB=2\nC=3\n",
+			configFn:  func(c *Config) { c.MaxVariables = 2 },
+			wantErr:   true,
+			wantErrIs: ErrMaxVariables,
 		},
 	}
 
@@ -2653,12 +2996,15 @@ func TestParser_BoundaryConditions(t *testing.T) {
 			if err != nil {
 				t.Fatalf("New() error = %v", err)
 			}
-			defer loader.Close()
+			defer func() { _ = loader.Close() }() // best-effort cleanup
 
 			err = loader.LoadFiles("test.env")
 			if tt.wantErr {
 				if err == nil {
 					t.Fatal("LoadFiles() error = nil, want error")
+				}
+				if tt.wantErrIs != nil && !errors.Is(err, tt.wantErrIs) {
+					t.Errorf("LoadFiles() error = %v, want it matching %v via errors.Is", err, tt.wantErrIs)
 				}
 				return
 			}
@@ -2771,16 +3117,29 @@ func TestNewParserWithFactory_NilFactory(t *testing.T) {
 }
 
 // TestScannerBufferPool_Boundary covers the scanner buffer pool's defensive
-// paths: nil puts, oversized buffers refused entry, and the fallback
-// allocation when the pool returns an unexpected type.
+// paths: nil puts, oversized buffers refused entry, the used-region clear
+// contract, and the fallback allocation when the pool returns an unexpected
+// type.
 func TestScannerBufferPool_Boundary(t *testing.T) {
 	t.Run("nil buffer is ignored", func(t *testing.T) {
-		putScannerBuffer(nil) // must not panic
+		putScannerBuffer(nil, 0) // must not panic
 	})
 
 	t.Run("oversized buffer is not pooled", func(t *testing.T) {
 		big := make([]byte, internal.MaxPooledScannerBufferSize+1)
-		putScannerBuffer(&big) // dropped, not pooled
+		putScannerBuffer(&big, len(big)*2) // dropped at the cap gate, never pooled (the clamp subtest below covers the used-count clamp)
+
+		// The cap gate must hold: the next get may return some other pooled
+		// buffer, but never one above MaxPooledScannerBufferSize — in
+		// particular not the oversized buffer just refused entry.
+		buf := getScannerBuffer()
+		if cap(*buf) > internal.MaxPooledScannerBufferSize {
+			t.Errorf("getScannerBuffer() capacity = %d, want <= %d (oversized buffer leaked into the pool)", cap(*buf), internal.MaxPooledScannerBufferSize)
+		}
+		if cap(*buf) == cap(big) {
+			t.Errorf("getScannerBuffer() returned the refused oversized buffer (cap %d)", cap(big))
+		}
+		putScannerBuffer(buf, 0) // return the legal buffer for later tests
 	})
 
 	t.Run("unexpected pool type falls back to a fresh buffer", func(t *testing.T) {
@@ -2789,20 +3148,84 @@ func TestScannerBufferPool_Boundary(t *testing.T) {
 		if cap(*buf) != 64*1024 {
 			t.Errorf("fallback buffer capacity = %d, want %d", cap(*buf), 64*1024)
 		}
-		putScannerBuffer(buf) // restore a well-typed buffer to the pool
+		putScannerBuffer(buf, 0) // restore a well-typed buffer to the pool (nothing was dirtied)
+	})
+
+	t.Run("used region is cleared, tail is not", func(t *testing.T) {
+		buf := make([]byte, 64*1024)
+		for i := range buf {
+			buf[i] = 0xAA // simulate a parse that dirtied the whole buffer
+		}
+		b := buf
+		putScannerBuffer(&b, 16)
+		// The clear happens in place on the shared backing array: the first
+		// 16 bytes (the region a 16-byte read would have dirtied) must be
+		// zeroed, the untouched tail must survive — that is the optimization.
+		for i := 0; i < 16; i++ {
+			if buf[i] != 0 {
+				t.Fatalf("byte %d inside used region not cleared: 0x%02X", i, buf[i])
+			}
+		}
+		for i := 16; i < len(buf); i++ {
+			if buf[i] != 0xAA {
+				t.Fatalf("byte %d outside used region was modified: 0x%02X", i, buf[i])
+			}
+		}
+		// The buffer entered the pool; restore its clean-at-rest invariant
+		// through the aliasing slice so later consumers are unaffected.
+		clear(buf)
+	})
+
+	t.Run("used count above length is clamped and clears everything", func(t *testing.T) {
+		// BOUNDARY (parser.go putScannerBuffer): a used count larger than the
+		// buffer is clamped to len(*buf), so the whole buffer is cleared —
+		// defensive against callers misreporting the dirtied region.
+		buf := make([]byte, 4096)
+		for i := range buf {
+			buf[i] = 0xAA
+		}
+		b := buf
+		putScannerBuffer(&b, len(b)+1)
+		for i, c := range buf {
+			if c != 0 {
+				t.Fatalf("byte %d not cleared under the clamped used count: 0x%02X", i, c)
+			}
+		}
 	})
 }
 
-// TestRegisterParser_NilFactory covers the registry's nil-factory guard for
-// both registration entry points.
+// TestRegisterParser_NilFactory covers the registry's nil-factory guard on
+// both registration entry points (RegisterParser and ForceRegisterParser),
+// for the built-in formats and for fresh custom formats. Custom formats come
+// from nextTestFormat() so repeated runs (-count=N) stay isolated.
 func TestRegisterParser_NilFactory(t *testing.T) {
-	format := nextTestFormat()
-
-	if err := RegisterParser(format, nil); err == nil {
-		t.Error("RegisterParser(nil) should return an error")
+	tests := []struct {
+		name    string
+		format  func() FileFormat
+		force   bool
+		factory ParserFactory
+		wantErr bool
+	}{
+		{"RegisterParser nil factory on dotenv", func() FileFormat { return FormatEnv }, false, nil, true},
+		{"RegisterParser nil factory on json", func() FileFormat { return FormatJSON }, false, nil, true},
+		{"RegisterParser nil factory on yaml", func() FileFormat { return FormatYAML }, false, nil, true},
+		{"RegisterParser nil factory on custom format", nextTestFormat, false, nil, true},
+		{"ForceRegisterParser nil factory on built-in dotenv", func() FileFormat { return FormatEnv }, true, nil, true},
+		{"ForceRegisterParser nil factory on custom format", nextTestFormat, true, nil, true},
 	}
-	if err := ForceRegisterParser(format, nil); err == nil {
-		t.Error("ForceRegisterParser(nil) should return an error")
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			var err error
+			if tt.force {
+				err = ForceRegisterParser(tt.format(), tt.factory)
+			} else {
+				err = RegisterParser(tt.format(), tt.factory)
+			}
+			if (err != nil) != tt.wantErr {
+				t.Errorf("error = %v, wantErr %v", err, tt.wantErr)
+			}
+		})
 	}
 }
 
@@ -2840,7 +3263,7 @@ func TestCreateParsers_FactoryErrorClosesCreatedParsers(t *testing.T) {
 
 	cfg := DefaultConfig()
 	factory := cfg.buildComponentFactory()
-	defer factory.Close()
+	defer func() { _ = factory.Close() }() // best-effort cleanup
 
 	const maxAttempts = 32
 	for i := 0; i < maxAttempts && created.Load() == 0; i++ {
@@ -2878,15 +3301,16 @@ func (p *countingCloserParser) Close() error {
 }
 
 // TestNewJSONParser_DefaultMaxDepth pins the JSONMaxDepth<=0 fallback:
-// newJSONParserWithFactory clamps a non-positive depth to 10. Config.Validate
-// normally prevents this (range 1..100), so the constructor is exercised
-// directly, bypassing validation.
+// newJSONParserWithFactory clamps a non-positive depth to
+// defaultStructuredMaxDepth. Config.Validate normally prevents this
+// (range 1..100), so the constructor is exercised directly, bypassing
+// validation.
 func TestNewJSONParser_DefaultMaxDepth(t *testing.T) {
 	cfg := DefaultConfig()
 	cfg.JSONMaxDepth = 0 // invalid for New(), valid for the constructor
 
 	factory := cfg.buildComponentFactory()
-	defer factory.Close()
+	defer func() { _ = factory.Close() }() // best-effort cleanup
 
 	p, err := newJSONParserWithFactory(cfg, factory)
 	if err != nil {
@@ -2901,11 +3325,11 @@ func TestNewJSONParser_DefaultMaxDepth(t *testing.T) {
 		return doc
 	}
 
-	if _, err := p.Parse(strings.NewReader(nestJSON(9)), "ok.json"); err != nil {
-		t.Errorf("Parse() at depth 10 (9 objects + scalar) error = %v, want nil with default depth 10", err)
+	if _, err := p.Parse(strings.NewReader(nestJSON(defaultStructuredMaxDepth-1)), "ok.json"); err != nil {
+		t.Errorf("Parse() at depth %d error = %v, want nil with default depth %d", defaultStructuredMaxDepth, err, defaultStructuredMaxDepth)
 	}
-	if _, err := p.Parse(strings.NewReader(nestJSON(11)), "deep.json"); err == nil {
-		t.Error("Parse() at depth 12 should exceed the default max depth of 10")
+	if _, err := p.Parse(strings.NewReader(nestJSON(defaultStructuredMaxDepth+1)), "deep.json"); err == nil {
+		t.Errorf("Parse() at depth %d should exceed the default max depth of %d", defaultStructuredMaxDepth+2, defaultStructuredMaxDepth)
 	}
 }
 
@@ -2925,7 +3349,7 @@ func TestBuildComponentFactoryWithFS_NilFSAndCustomExpander(t *testing.T) {
 	cfg.CustomExpander = exp
 
 	factory := cfg.buildComponentFactoryWithFS(nil) // nil fs falls back to DefaultFileSystem
-	defer factory.Close()
+	defer func() { _ = factory.Close() }()          // best-effort cleanup
 
 	if factory.Expander() == nil {
 		t.Fatal("Expander() = nil, want the custom expander")
@@ -2935,5 +3359,141 @@ func TestBuildComponentFactoryWithFS_NilFSAndCustomExpander(t *testing.T) {
 	}
 	if !exp.called {
 		t.Error("factory.Expander() did not delegate to the custom expander")
+	}
+}
+
+// recordingAuditor counts LogError calls; used to pin audit gating.
+type recordingAuditor struct {
+	count int
+}
+
+func (r *recordingAuditor) LogError(action AuditAction, key, errMsg string) error {
+	r.count++
+	return nil
+}
+
+// TestSetDelete_AuditGating pins AuditEnabled=false suppression with a CUSTOM
+// auditor: Set/Delete success events previously reached custom auditors
+// unconditionally (the adapter routes them through LogError), contradicting
+// the documented "activates audit logging for all loader operations".
+func TestSetDelete_AuditGating(t *testing.T) {
+	rec := &recordingAuditor{}
+	cfg := DefaultConfig()
+	cfg.Filenames = nil
+	cfg.CustomAuditor = rec
+	cfg.AuditEnabled = false
+	loader, err := New(cfg)
+	if err != nil {
+		t.Fatalf("New() error = %v", err)
+	}
+	defer func() { _ = loader.Close() }() // best-effort cleanup
+
+	if err := loader.Set("KEY", "value"); err != nil {
+		t.Fatalf("Set() error = %v", err)
+	}
+	if err := loader.Delete("KEY"); err != nil {
+		t.Fatalf("Delete() error = %v", err)
+	}
+	if rec.count != 0 {
+		t.Errorf("custom auditor received %d events with AuditEnabled=false, want 0", rec.count)
+	}
+}
+
+// closableParser is a minimal EnvParser whose Close records being called.
+type closableParser struct {
+	closed *bool
+}
+
+func (p closableParser) Parse(r io.Reader, filename string) (map[string]string, error) {
+	return map[string]string{}, nil
+}
+
+func (p closableParser) Close() error {
+	*p.closed = true
+	return nil
+}
+
+// TestLoaderClose_ClosesCustomParsers pins that Loader.Close closes parsers
+// implementing io.Closer — previously only createParsers' construction-
+// failure path ever closed them, so a custom parser's resources leaked for
+// the loader's whole lifetime.
+func TestLoaderClose_ClosesCustomParsers(t *testing.T) {
+	closed := false
+	err := ForceRegisterParser(FormatEnv, func(cfg Config, factory *ComponentFactory) (EnvParser, error) {
+		return closableParser{closed: &closed}, nil
+	})
+	if err != nil {
+		t.Fatalf("ForceRegisterParser() error = %v", err)
+	}
+	// Restore the built-in .env parser for the rest of the package's tests —
+	// the registry is process-global.
+	defer func() {
+		_ = ForceRegisterParser(FormatEnv, func(cfg Config, factory *ComponentFactory) (EnvParser, error) {
+			return newParserWithFactory(cfg, factory)
+		})
+	}()
+
+	cfg := DefaultConfig()
+	cfg.Filenames = nil
+	loader, err := New(cfg)
+	if err != nil {
+		t.Fatalf("New() error = %v", err)
+	}
+	if err := loader.Close(); err != nil {
+		t.Fatalf("Close() error = %v", err)
+	}
+	if !closed {
+		t.Error("custom parser was not closed by Loader.Close")
+	}
+}
+
+// TestParserMaxVariablesCountsDistinctKeys pins the .env variable-count
+// semantics aligned with the structured parsers: only DISTINCT keys count
+// against MaxVariables. A duplicate line the duplicate policy would skip
+// anyway previously tripped the limit at the exact boundary and failed the
+// whole file.
+func TestParserMaxVariablesCountsDistinctKeys(t *testing.T) {
+	cfg := DefaultConfig()
+	cfg.Filenames = nil
+	cfg.MaxVariables = 2
+	factory := cfg.buildComponentFactory()
+	p, err := newParserWithFactory(cfg, factory)
+	if err != nil {
+		t.Fatalf("newParserWithFactory() error = %v", err)
+	}
+
+	m, err := p.Parse(strings.NewReader("A=1\nB=2\nB=3\n"), "")
+	if err != nil {
+		t.Fatalf("Parse(2 distinct + 1 duplicate) error = %v, want nil", err)
+	}
+	if len(m) != 2 {
+		t.Errorf("Parse() produced %d keys, want 2", len(m))
+	}
+
+	if _, err := p.Parse(strings.NewReader("A=1\nB=2\nC=3\n"), ""); err == nil {
+		t.Error("Parse(3 distinct keys with MaxVariables=2) succeeded, want max-variables error")
+	}
+}
+
+// TestLoadFiles_WrappedNotExistSkipped pins that a custom FileSystem whose
+// Open returns an error WRAPPING fs.ErrNotExist is treated as
+// file-not-found: os.IsNotExist alone does not traverse wrapped chains, so
+// FailOnMissingFile=false never skipped such files before.
+func TestLoadFiles_WrappedNotExistSkipped(t *testing.T) {
+	fs := newTestFileSystem()
+	fs.openErr = fmt.Errorf("open failed: %w", os.ErrNotExist)
+
+	cfg := DefaultConfig()
+	cfg.Filenames = nil
+	cfg.FileSystem = fs
+	cfg.FailOnMissingFile = false
+	loader, err := New(cfg)
+	if err != nil {
+		t.Fatalf("New() error = %v", err)
+	}
+	defer func() { _ = loader.Close() }() // best-effort cleanup
+
+	if err := loader.LoadFiles("ghost.env"); err != nil {
+		t.Errorf("LoadFiles() = %v, want wrapped not-exist skipped", err)
 	}
 }

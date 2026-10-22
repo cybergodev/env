@@ -25,6 +25,9 @@ func TestIsValidJSONKey(t *testing.T) {
 		// key confusion attacks and ambiguity with array indexing
 		{"key[0]", false},
 		{"123", false},          // pure numeric keys are rejected
+		{"12345", false},        // any length: index-like up to maxSafeIndex
+		{"999999999", false},    // nine digits, same array-index ambiguity class
+		{"1a2b", true},          // digits mixed with letters are fine
 		{"a_b-c.d@e[1]", false}, // contains brackets
 
 		// Invalid keys
@@ -65,6 +68,30 @@ func TestIsValidJSONKey(t *testing.T) {
 	}
 }
 
+// TestHashKey pins HashKey's empty-input contract (keyutil.go ~L54): the
+// empty key short-circuits to 0 before any hashing or shard-range arithmetic
+// runs, for every shard count. Non-positive shard counts with non-empty keys
+// are already covered by TestSEC003_HashKeyNonPositiveShards.
+func TestHashKey(t *testing.T) {
+	tests := []struct {
+		name   string
+		shards int
+	}{
+		{"empty key with typical shard count", numShards},
+		{"empty key with single shard", 1},
+		{"empty key with non-power-of-two shards", 7},
+		{"empty key with non-positive shards", 0},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := HashKey("", tt.shards); got != 0 {
+				t.Errorf("HashKey(\"\", %d) = %d, want 0", tt.shards, got)
+			}
+		})
+	}
+}
+
 func TestTrimSpace(t *testing.T) {
 	tests := []struct {
 		name     string
@@ -83,6 +110,12 @@ func TestTrimSpace(t *testing.T) {
 		{"inner whitespace preserved", "hello world", "hello world"},
 		{"single space", " ", ""},
 		{"single char", "a", "a"},
+		// Contract difference vs strings.TrimSpace (pinned): this TrimSpace
+		// only removes " \t\n\r", so other whitespace that strings.TrimSpace
+		// would strip is preserved.
+		{"vertical tab not trimmed", "\vhello\v", "\vhello\v"},
+		{"form feed not trimmed", "\fhello\f", "\fhello\f"},
+		{"non-breaking space not trimmed", "\u00a0hi\u00a0", "\u00a0hi\u00a0"},
 	}
 
 	for _, tt := range tests {
@@ -90,6 +123,39 @@ func TestTrimSpace(t *testing.T) {
 			result := TrimSpace(tt.input)
 			if result != tt.expected {
 				t.Errorf("TrimSpace(%q) = %q, want %q", tt.input, result, tt.expected)
+			}
+		})
+	}
+}
+
+// TestSplitAndTrimAt_SkipsBlankSegments pins the blank-segment contract of
+// SplitAndTrimAt (defined in lookup.go): empty and whitespace-only comma
+// segments are skipped rather than consuming an index. It is exercised here
+// alongside its TrimSpace building block per the audit.
+func TestSplitAndTrimAt_SkipsBlankSegments(t *testing.T) {
+	tests := []struct {
+		name      string
+		input     string
+		index     int
+		wantVal   string
+		wantFound bool
+	}{
+		{"whitespace-only segments are skipped", ",  ,a", 0, "a", true},
+		{"index counts only non-blank segments", ",  ,a", 1, "", false},
+		{"all segments blank", " , , ", 0, "", false},
+		{"adjacent commas collapse", "a,,b", 1, "b", true},
+		{"inner segment whitespace trimmed", " x , y ", 1, "y", true},
+		{"negative index finds nothing", "a,b", -1, "", false},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			gotVal, gotFound := SplitAndTrimAt(tt.input, tt.index)
+			if gotFound != tt.wantFound {
+				t.Errorf("SplitAndTrimAt(%q, %d) found = %v, want %v", tt.input, tt.index, gotFound, tt.wantFound)
+			}
+			if gotVal != tt.wantVal {
+				t.Errorf("SplitAndTrimAt(%q, %d) = %q, want %q", tt.input, tt.index, gotVal, tt.wantVal)
 			}
 		})
 	}
@@ -115,44 +181,6 @@ func TestInternKeyBytes_EdgeCases(t *testing.T) {
 				t.Errorf("InternKeyBytes(%q) = %q, want %q", tt.key, got, tt.want)
 			}
 		})
-	}
-}
-
-func TestInternKeyBytes_Eviction(t *testing.T) {
-	ClearInternCache()
-
-	// Fill the cache to trigger eviction
-	for i := 0; i < maxInternSize*2; i++ {
-		key := "EVICT_KEY_" + strings.Repeat("x", i%20+1)
-		InternKeyBytes([]byte(key))
-	}
-
-	// Verify cache still works after eviction
-	key := "POST_EVICT_KEY"
-	if got := InternKeyBytes([]byte(key)); got != key {
-		t.Errorf("InternKeyBytes after eviction = %q, want %q", got, key)
-	}
-}
-
-func TestInternKeyBytes_Consistency(t *testing.T) {
-	// Clear cache before test
-	ClearInternCache()
-
-	// Test that cache and order slice remain consistent
-	// Fill cache beyond capacity to trigger eviction
-	for i := 0; i < maxInternSize+50; i++ {
-		key := "KEY_" + strings.Repeat("A", i%10)
-		interned := InternKeyBytes([]byte(key))
-		if interned != key {
-			t.Errorf("InternKeyBytes(%q) = %q, want %q", key, interned, key)
-		}
-	}
-
-	// Verify we can still intern new keys after eviction
-	newKey := "NEW_TEST_KEY"
-	interned := InternKeyBytes([]byte(newKey))
-	if interned != newKey {
-		t.Errorf("InternKeyBytes(%q) = %q, want %q", newKey, interned, newKey)
 	}
 }
 
@@ -198,6 +226,12 @@ func TestEqualFoldASCII(t *testing.T) {
 		{"abc", "ab", false},
 		{"", "", true},
 		{"a", "A", true},
+		// Non-ASCII bytes compare literally (no Unicode case folding):
+		// identical non-ASCII strings are equal, Unicode case variants are
+		// not — see the EqualFoldASCII doc comment.
+		{"ü", "ü", true},
+		{"Ü", "ü", false},
+		{"aü", "aÜ", false},
 	}
 
 	for _, tt := range tests {
@@ -261,6 +295,52 @@ func TestInternKeyBytes_HitIsZeroAlloc(t *testing.T) {
 	}
 }
 
+// TestInternKeyBytes_SwappedSuffixKeys pins the front-cache slot hash's
+// position dependence: the short-key multiplicative hash XORs position-4..7
+// bytes against the same multiplier, so byte-swapped keys ("VAR_19"/"VAR_91")
+// collide in it. A slot hash reusing it would make the pair evict each other
+// forever and return one key's string for the other; each key must intern to
+// its own content.
+func TestInternKeyBytes_SwappedSuffixKeys(t *testing.T) {
+	ClearInternCache()
+	for i := 0; i < 100; i++ {
+		a := InternKeyBytes([]byte(fmt.Sprintf("VAR_%d", i)))
+		b := InternKeyBytes([]byte(fmt.Sprintf("VAR_%d", i)))
+		if a != b {
+			t.Fatalf("re-interning VAR_%d changed the string", i)
+		}
+	}
+	for i := 0; i < 100; i++ {
+		key := fmt.Sprintf("VAR_%d", i)
+		if got := InternKeyBytes([]byte(key)); got != key {
+			t.Errorf("InternKeyBytes(%q) = %q, want the key itself", key, got)
+		}
+	}
+}
+
+// TestInternKeyBytes_FrontCacheSurvivesShardEviction pins the contract that a
+// front-cache entry remains a valid stable string even after the sharded map
+// has evicted it: interning must return content-equal strings, not panic or
+// diverge, and a fresh miss (same key, new shard entry) must still answer
+// correctly through a now-stale slot.
+func TestInternKeyBytes_FrontCacheSurvivesShardEviction(t *testing.T) {
+	ClearInternCache()
+	const key = "EVICT_ME"
+	first := InternKeyBytes([]byte(key))
+
+	// Force eviction pressure inside the owning shard: fill it past
+	// maxInternSize with keys that hash to the same shard (raw hash & 7 is
+	// preserved by the "shard_N_" prefix length trick — brute force instead).
+	for i := 0; i < maxInternSize*2; i++ {
+		_ = InternKeyBytes([]byte(fmt.Sprintf("PRESSURE_%d", i)))
+	}
+
+	again := InternKeyBytes([]byte(key))
+	if again != key || again != first {
+		t.Errorf("intern after eviction pressure = %q (first %q), want %q", again, first, key)
+	}
+}
+
 func TestToUpperASCII(t *testing.T) {
 	tests := []struct {
 		input string
@@ -281,25 +361,65 @@ func TestToUpperASCII(t *testing.T) {
 	}
 }
 
-// TestStoreInterned_EvictsWhenFull pins the bounded-eviction contract: when a
-// shard is at maxInternSize, inserting one more key evicts exactly one
-// existing entry rather than growing the cache.
+// TestStoreInterned_EvictsWhenFull pins the bounded-eviction contract. The
+// first half drives storeInterned directly on a synthetic shard; the second
+// half drives the real shard table through InternKeyBytes with more distinct
+// keys than one shard can hold (HashKey is deterministic, so the keys are
+// chosen to all land in the same shard) and asserts the shard stays bounded
+// while interning keeps returning correct values.
 func TestStoreInterned_EvictsWhenFull(t *testing.T) {
-	shard := &internShard{cache: make(map[string]string, maxInternSize)}
+	shard := &internShard{cache: make(map[string]*internEntry, maxInternSize)}
 
 	for i := 0; i < maxInternSize; i++ {
-		shard.cache[fmt.Sprintf("KEY_%d", i)] = fmt.Sprintf("KEY_%d", i)
+		k := fmt.Sprintf("KEY_%d", i)
+		shard.cache[k] = &internEntry{key: k}
 	}
 
 	got := storeInterned(shard, "NEW_KEY")
 
-	if got != "NEW_KEY" {
-		t.Errorf("storeInterned() = %q, want %q", got, "NEW_KEY")
+	if got.key != "NEW_KEY" {
+		t.Errorf("storeInterned() = %q, want %q", got.key, "NEW_KEY")
 	}
-	if shard.cache["NEW_KEY"] != "NEW_KEY" {
+	if shard.cache["NEW_KEY"].key != "NEW_KEY" {
 		t.Error("storeInterned() should store the new key in the shard")
 	}
 	if len(shard.cache) != maxInternSize {
 		t.Errorf("len(cache) = %d after insert into a full shard, want %d (one eviction)", len(shard.cache), maxInternSize)
+	}
+
+	// Real-shard integration: collect more than maxInternSize distinct keys
+	// that all hash to the same shard and intern every one of them.
+	ClearInternCache()
+	const extra = 8
+	target := HashKey("SHARD_SEED", numShards)
+	keys := make([]string, 0, maxInternSize+extra)
+	for i := 0; len(keys) < maxInternSize+extra; i++ {
+		k := fmt.Sprintf("SHARD_KEY_%05d", i)
+		if HashKey(k, numShards) == target {
+			keys = append(keys, k)
+		}
+	}
+
+	for _, k := range keys {
+		if got := InternKeyBytes([]byte(k)); got != k {
+			t.Fatalf("InternKeyBytes(%q) = %q, want %q", k, got, k)
+		}
+	}
+
+	real := &internShards[target]
+	real.mu.Lock()
+	size := len(real.cache)
+	real.mu.Unlock()
+	if size > maxInternSize {
+		t.Errorf("shard %d holds %d keys after %d same-shard inserts, want <= %d (bounded eviction)",
+			target, size, len(keys), maxInternSize)
+	}
+
+	// Interning must still return correct values under eviction pressure:
+	// the newest key (cache hit) and the oldest key (evicted, re-interned).
+	for _, k := range []string{keys[len(keys)-1], keys[0]} {
+		if got := InternKeyBytes([]byte(k)); got != k {
+			t.Errorf("InternKeyBytes(%q) after eviction = %q, want %q", k, got, k)
+		}
 	}
 }

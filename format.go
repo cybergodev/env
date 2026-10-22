@@ -9,7 +9,11 @@ import (
 type FileFormat int
 
 const (
-	// FormatAuto automatically detects the format based on file extension.
+	// FormatAuto selects the format automatically; its meaning depends on the
+	// API. For file loading, DetectFormat returns it for unknown extensions
+	// and LoadFiles falls back to the .env parser (or a parser explicitly
+	// registered for FormatAuto via RegisterParser). For UnmarshalMap and
+	// UnmarshalStruct, the format is detected from the data itself.
 	FormatAuto FileFormat = iota
 	// FormatEnv represents the .env file format.
 	FormatEnv

@@ -3,6 +3,7 @@ package env
 import (
 	"bytes"
 	"errors"
+	"fmt"
 	"io"
 	"strconv"
 	"strings"
@@ -27,6 +28,27 @@ func makeManyYAML(n int) string {
 		sb.WriteString(": v\n")
 	}
 	return sb.String()
+}
+
+// rmLoad loads one file (name + content) through the public API with a
+// DefaultConfig over the in-memory file system, failing the test on any load
+// error. Shared by the default-limits and colon-space suites.
+func rmLoad(t *testing.T, filename, content string) *Loader {
+	t.Helper()
+	fs := newTestFileSystem()
+	fs.files[filename] = content
+
+	cfg := DefaultConfig()
+	cfg.FileSystem = fs
+	loader, err := New(cfg)
+	if err != nil {
+		t.Fatalf("New() error = %v", err)
+	}
+	t.Cleanup(func() { _ = loader.Close() })
+	if err := loader.LoadFiles(filename); err != nil {
+		t.Fatalf("LoadFiles(%q) error = %v", filename, err)
+	}
+	return loader
 }
 
 func TestStructuredParser_ValidateResult(t *testing.T) {
@@ -72,6 +94,25 @@ func TestStructuredParser_ValidateResult(t *testing.T) {
 			wantField: "value",
 		},
 		{
+			// Fail-closed baseline (D-002/M-1): control characters are
+			// rejected even with ValidateValues disabled — the .env parse
+			// path has never had a switch for them.
+			name:      "json control char rejected with ValidateValues disabled",
+			filename:  "nulval.json",
+			content:   "{\"K\": \"bad\\u0000value\"}",
+			configFn:  func(c *Config) { c.ValidateValues = false },
+			wantErr:   true,
+			wantField: "value",
+		},
+		{
+			name:      "yaml control char rejected with ValidateValues disabled",
+			filename:  "nulval.yaml",
+			content:   "K: \"bad\x01value\"\n",
+			configFn:  func(c *Config) { c.ValidateValues = false },
+			wantErr:   true,
+			wantField: "value",
+		},
+		{
 			name:     "json required key missing",
 			filename: "reqmissing.json",
 			content:  `{"PRESENT": "v"}`,
@@ -107,7 +148,7 @@ func TestStructuredParser_ValidateResult(t *testing.T) {
 			if err != nil {
 				t.Fatalf("New() error = %v", err)
 			}
-			defer loader.Close()
+			defer func() { _ = loader.Close() }() // best-effort cleanup
 
 			err = loader.LoadFiles(tt.filename)
 			if tt.wantErr {
@@ -131,6 +172,134 @@ func TestStructuredParser_ValidateResult(t *testing.T) {
 	}
 }
 
+// TestStructuredParser_DefaultLimitsAccommodateRealisticConfigs pins the
+// DefaultConfig limits sized in FIX-008: structured configs flatten into
+// compound keys (65-128 chars), nest 10-20 levels (OpenAPI-style documents),
+// and credential-export files reach hundreds of entries at 2-8KB each. Every
+// case below failed under the previous defaults (64-char keys, depth 10,
+// 500 variables, 2MB files). The long-credential subtest additionally pins
+// the DefaultConfig line limit: single-line credential values (browser
+// cookie exports, JWTs) commonly reach 2-8KB and must load under DefaultConfig
+// without custom limits — its ~2119-char line would have been rejected by a
+// 1024-char default.
+func TestStructuredParser_DefaultLimitsAccommodateRealisticConfigs(t *testing.T) {
+	t.Run("89-char flattened key from nested map", func(t *testing.T) {
+		loader := rmLoad(t, "keylen.yaml",
+			"providers:\n  gateway:\n    upstream:\n      pools:\n        primary:\n          connection:\n            max_idle_seconds: 30\n")
+		if got := loader.GetString("providers.gateway.upstream.pools.primary.connection.max_idle_seconds"); got != "30" {
+			t.Errorf("GetString(long flattened key) = %q, want %q", got, "30")
+		}
+	})
+
+	t.Run("12-level nesting", func(t *testing.T) {
+		var sb strings.Builder
+		for i := 0; i < 12; i++ {
+			sb.WriteString(strings.Repeat("  ", i))
+			fmt.Fprintf(&sb, "level%d:\n", i)
+		}
+		sb.WriteString(strings.Repeat("  ", 12) + "leaf: value\n")
+
+		loader := rmLoad(t, "deep.yaml", sb.String())
+		if got := loader.GetString("level0.level1.level2.level3.level4.level5.level6.level7.level8.level9.level10.level11.leaf"); got != "value" {
+			t.Errorf("GetString(deep leaf) = %q, want %q", got, "value")
+		}
+	})
+
+	t.Run("600 variables", func(t *testing.T) {
+		var sb strings.Builder
+		for i := 0; i < 600; i++ {
+			fmt.Fprintf(&sb, "domain%03d.com: cookie-value-%d\n", i, i)
+		}
+		loader := rmLoad(t, "many.yaml", sb.String())
+		if got := loader.Len(); got != 600 {
+			t.Errorf("Len() = %d, want 600", got)
+		}
+	})
+
+	t.Run("2.25MB file of credential-sized values", func(t *testing.T) {
+		var sb strings.Builder
+		filler := strings.Repeat("x", 5000)
+		for i := 0; i < 450; i++ {
+			fmt.Fprintf(&sb, "domain%03d.com: %s\n", i, filler)
+		}
+		loader := rmLoad(t, "big.yaml", sb.String())
+		if got := loader.Len(); got != 450 {
+			t.Errorf("Len() = %d, want 450", got)
+		}
+	})
+
+	t.Run("single-line credential value fits default line limit", func(t *testing.T) {
+		value := "session=" + strings.Repeat("a", 2100) + "; flag=1"
+		loader := rmLoad(t, "config.yaml", "apnews.com: "+value)
+		if got := loader.GetString("apnews.com"); got != value {
+			t.Errorf("GetString(\"apnews.com\") length = %d, want %d", len(got), len(value))
+		}
+	})
+}
+
+// TestYAMLParser_ColonSpaceInValues verifies end-to-end that a colon+space
+// inside a value — most commonly an embedded JSON blob with ": " separators,
+// like a cookie carrying g_state={"i_l": 0} — no longer breaks parsing.
+// Previously the lexer misread the value as a key and the resulting bogus
+// key failed validation, rejecting the whole file.
+func TestYAMLParser_ColonSpaceInValues(t *testing.T) {
+	t.Run("cookie string embedding spaced JSON stays one value", func(t *testing.T) {
+		want := `Code=abc; Visitor=v; g_state={"i_l": 0, "i_e": {"enable_itp_optimization": 24}, "i_t": 1792402790803}`
+		loader := rmLoad(t, "config.yaml", "apnews.com: "+want+"\n")
+		if got := loader.GetString("apnews.com"); got != want {
+			t.Errorf("GetString(\"apnews.com\") = %q, want %q", got, want)
+		}
+	})
+
+	t.Run("value that is spaced JSON flattens inline", func(t *testing.T) {
+		loader := rmLoad(t, "config.yaml", "g_state: {\"i_l\": 0, \"i_e\": {\"x\": 1}, \"list\": [1, 2]}\n")
+		want := map[string]string{
+			"G_STATE_I_L":    "0",
+			"G_STATE_I_E_X":  "1",
+			"G_STATE_LIST_0": "1",
+			"G_STATE_LIST_1": "2",
+		}
+		for k, w := range want {
+			if got := loader.GetString(k); got != w {
+				t.Errorf("GetString(%q) = %q, want %q", k, got, w)
+			}
+		}
+	})
+
+	t.Run("colon and hash inside JSON strings are preserved", func(t *testing.T) {
+		want := `{"note": "a: b # c", "brace": "}"}`
+		loader := rmLoad(t, "config.yaml", "cfg: "+want+"\n")
+		if got := loader.GetString("CFG_NOTE"); got != "a: b # c" {
+			t.Errorf("GetString(\"CFG_NOTE\") = %q, want %q", got, "a: b # c")
+		}
+		if got := loader.GetString("CFG_BRACE"); got != "}" {
+			t.Errorf("GetString(\"CFG_BRACE\") = %q, want %q", got, "}")
+		}
+	})
+
+	t.Run("comment after closed flow region", func(t *testing.T) {
+		loader := rmLoad(t, "config.yaml", "g_state: {\"i_l\": 0} # trailing note\n")
+		if got := loader.GetString("G_STATE_I_L"); got != "0" {
+			t.Errorf("GetString(\"G_STATE_I_L\") = %q, want %q", got, "0")
+		}
+	})
+
+	t.Run("depth-0 colon-space still splits (pre-existing behavior)", func(t *testing.T) {
+		// A ": " at flow depth 0 still terminates the scalar. For same-line
+		// "outer: inner: value" the real lexer emits the inner key at indent 0,
+		// so the inner pair is parsed as a root-level sibling and outer ends up
+		// empty — pre-existing semantics, pinned here to prove the flow-depth
+		// rule does not change them.
+		loader := rmLoad(t, "config.yaml", "outer: inner: value\n")
+		if got := loader.GetString("INNER"); got != "value" {
+			t.Errorf("GetString(\"INNER\") = %q, want %q", got, "value")
+		}
+		if got := loader.GetString("OUTER"); got != "" {
+			t.Errorf("GetString(\"OUTER\") = %q, want %q", got, "")
+		}
+	})
+}
+
 // TestReadAllInto covers the buffer-growth and read-error paths of the
 // structured-parser file reader directly.
 func TestReadAllInto(t *testing.T) {
@@ -147,6 +316,8 @@ func TestReadAllInto(t *testing.T) {
 
 	t.Run("read error is returned", func(t *testing.T) {
 		wantErr := errors.New("disk failure")
+		// Same contract as "returns partially-filled buffer on error" below,
+		// kept for the plain errors.Is path with a non-nil partial prefix.
 		_, err := readAllInto(make([]byte, 0, 64), io.MultiReader(strings.NewReader("partial"), iotest.ErrReader(wantErr)))
 		if !errors.Is(err, wantErr) {
 			t.Errorf("readAllInto() error = %v, want %v", err, wantErr)
@@ -170,6 +341,29 @@ func TestReadAllInto(t *testing.T) {
 		}
 		if string(buf) != "hello" {
 			t.Errorf("readAllInto() = %q, want %q", buf, "hello")
+		}
+	})
+
+	// Pins the readAllInto contract the structured-parse error path relies
+	// on: on error it must return the partially-filled buffer, not nil, so
+	// the caller can clear it before pooling. Regression: the error path in
+	// structuredParseResult previously pooled the untouched original pointer,
+	// whose zero length made clear() a no-op and left raw file contents
+	// resident in readerBufferPool.
+	t.Run("returns partially-filled buffer on error", func(t *testing.T) {
+		secret := []byte("PASSWORD=supersecret-value")
+		wantErr := errors.New("read failed")
+		buf := make([]byte, 0, 64)
+
+		data, err := readAllInto(buf, &partialReader{data: secret, err: wantErr})
+		if !errors.Is(err, wantErr) {
+			t.Fatalf("readAllInto() error = %v, want %v", err, wantErr)
+		}
+		if data == nil {
+			t.Fatal("readAllInto() returned nil buffer on error; caller cannot clear pooled memory")
+		}
+		if string(data) != string(secret) {
+			t.Errorf("partial data = %q, want %q", data, secret)
 		}
 	})
 }
@@ -201,6 +395,7 @@ func TestReaderBufferPool_Boundary(t *testing.T) {
 
 // TestStructuredParseResult_Boundaries drives the remaining structured-parse
 // branches directly: generic (non-limit) read errors passed through unwrapped,
+// the ErrLineTooLong branch (minified single-line JSON above MaxLineLength),
 // MaxKeyLength enforcement, and the audit-enabled duration log on success.
 func TestStructuredParseResult_Boundaries(t *testing.T) {
 	t.Run("generic read error is returned as-is", func(t *testing.T) {
@@ -211,6 +406,35 @@ func TestStructuredParseResult_Boundaries(t *testing.T) {
 			func([]byte) (map[string]string, error) { return nil, nil })
 		if !errors.Is(err, wantErr) {
 			t.Errorf("structuredParseResult() error = %v, want the raw %v", err, wantErr)
+		}
+	})
+
+	// The ErrLineTooLong branch of structuredParseResult was previously
+	// untested (only ErrFileTooLarge was). A minified JSON document is ONE
+	// line for the MaxLineLength check regardless of format; the failure is
+	// wrapped in a FileError with Op "size_check" whose chain carries
+	// ErrLineTooLong (the sentinel-level wiring of this same path is pinned
+	// in errors_test.go TestSentinelErrorWiring).
+	t.Run("minified single-line JSON above MaxLineLength wraps ErrLineTooLong", func(t *testing.T) {
+		cfg := DefaultConfig()
+		cfg.MaxLineLength = 64
+		c := &structuredParserConfig{config: cfg, auditor: &mockFullAuditLogger{}}
+
+		minified := `{"KEY":"` + strings.Repeat("x", 200) + `"}` // one line, > MaxLineLength
+		_, err := c.structuredParseResult(strings.NewReader(minified), "f.json", "JSON",
+			func([]byte) (map[string]string, error) { return nil, nil })
+		if err == nil {
+			t.Fatal("structuredParseResult() error = nil, want ErrLineTooLong")
+		}
+		var fe *FileError
+		if !errors.As(err, &fe) {
+			t.Fatalf("structuredParseResult() error = %T (%v), want *FileError", err, err)
+		}
+		if fe.Op != "size_check" {
+			t.Errorf("FileError.Op = %q, want %q", fe.Op, "size_check")
+		}
+		if !errors.Is(err, ErrLineTooLong) {
+			t.Errorf("errors.Is(err, ErrLineTooLong) = false, err = %v", err)
 		}
 	})
 
@@ -231,7 +455,7 @@ func TestStructuredParseResult_Boundaries(t *testing.T) {
 		cfg := DefaultConfig()
 		cfg.AuditEnabled = true
 		factory := cfg.buildComponentFactory()
-		defer factory.Close()
+		defer func() { _ = factory.Close() }() // best-effort cleanup
 		auditor := &mockFullAuditLogger{}
 		c := &structuredParserConfig{config: cfg, validator: factory.Validator(), auditor: auditor}
 
@@ -271,29 +495,6 @@ func (r *partialReader) Read(p []byte) (int, error) {
 	return n, r.err
 }
 
-// TestReadAllIntoReturnsPartialBufferOnError pins the readAllInto contract the
-// structured-parse error path relies on: on error it must return the
-// partially-filled buffer, not nil, so the caller can clear it before pooling.
-// Regression: the error path in structuredParseResult previously pooled the
-// untouched original pointer, whose zero length made clear() a no-op and left
-// raw file contents resident in readerBufferPool.
-func TestReadAllIntoReturnsPartialBufferOnError(t *testing.T) {
-	secret := []byte("PASSWORD=supersecret-value")
-	wantErr := errors.New("read failed")
-	buf := make([]byte, 0, 64)
-
-	data, err := readAllInto(buf, &partialReader{data: secret, err: wantErr})
-	if !errors.Is(err, wantErr) {
-		t.Fatalf("readAllInto() error = %v, want %v", err, wantErr)
-	}
-	if data == nil {
-		t.Fatal("readAllInto() returned nil buffer on error; caller cannot clear pooled memory")
-	}
-	if string(data) != string(secret) {
-		t.Errorf("partial data = %q, want %q", data, secret)
-	}
-}
-
 // TestStructuredParseErrorPathClearsPooledBuffer verifies end to end that a
 // failing structured parse leaves no raw file contents in the reader buffer
 // pool: after the error, the next pooled buffer contains only zeroes.
@@ -321,5 +522,54 @@ func TestStructuredParseErrorPathClearsPooledBuffer(t *testing.T) {
 		if b != 0 {
 			t.Fatalf("pooled buffer dirty at byte %d after read error; raw file contents would persist in the pool", i)
 		}
+	}
+}
+
+// TestStructuredParser_MaxKeyLengthBoundary pins the e2e MaxKeyLength check in
+// validateResult at its exact boundary: the comparison is
+// len(key) > MaxKeyLength (strict), so a flattened key of exactly
+// DefaultMaxKeyLength (128) bytes loads and one byte more is rejected with a
+// key/max_length ValidationError. Existing coverage sat far from the boundary
+// (an 89-char key and a unit row with the cap shrunk to 4).
+func TestStructuredParser_MaxKeyLengthBoundary(t *testing.T) {
+	tests := []struct {
+		name    string
+		keyLen  int
+		wantErr bool
+	}{
+		{name: "key of exactly MaxKeyLength bytes loads", keyLen: DefaultMaxKeyLength, wantErr: false},
+		{name: "key one byte beyond MaxKeyLength is rejected", keyLen: DefaultMaxKeyLength + 1, wantErr: true},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			key := strings.Repeat("A", tt.keyLen)
+			fs := newTestFileSystem()
+			fs.files["keylen.json"] = `{"` + key + `": "v"}`
+
+			cfg := DefaultConfig()
+			cfg.FileSystem = fs
+			cfg.Filenames = nil
+			loader, err := New(cfg)
+			if err != nil {
+				t.Fatalf("New() error = %v", err)
+			}
+			defer func() { _ = loader.Close() }()
+
+			err = loader.LoadFiles("keylen.json")
+			if !tt.wantErr {
+				if err != nil {
+					t.Fatalf("LoadFiles() error = %v, want nil", err)
+				}
+				if got := loader.GetString(key); got != "v" {
+					t.Errorf("GetString(%d-byte key) = %q, want %q", tt.keyLen, got, "v")
+				}
+				return
+			}
+			var ve *ValidationError
+			if !errors.As(err, &ve) || ve.Field != "key" || ve.Rule != "max_length" {
+				t.Errorf("LoadFiles() error = %v, want ValidationError{Field: %q, Rule: %q}", err, "key", "max_length")
+			}
+		})
 	}
 }

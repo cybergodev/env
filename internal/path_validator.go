@@ -1,8 +1,10 @@
-// Package internal provides path validation utilities for secure file access.
+// Provides path validation utilities for secure file access.
+
 package internal
 
 import (
 	"path/filepath"
+	"runtime"
 	"strings"
 )
 
@@ -57,12 +59,27 @@ func (v *PathValidator) Validate(filename string) error {
 		}
 	}
 
-	// SECURITY: Check for URL encoding which could be used to bypass path checks
+	// SECURITY: Reject URL encoding which could be used to bypass path checks
 	// Examples: %2e%2e for .., %5c for \, etc.
 	if strings.Contains(filename, "%") {
 		return &SecurityError{
 			Action: "file_access",
 			Reason: "URL encoded path not allowed",
+		}
+	}
+
+	// SECURITY (SEC-007): reject control characters other than tab in the
+	// path. A newline (or other control byte) in a filename reaches the audit
+	// log verbatim and lets a crafted name inject forged log records
+	// (CWE-117). Tab is allowed (a legal filename character); everything else
+	// below 0x20 is rejected here so no caller can route one into a log line.
+	for i := 0; i < len(filename); i++ {
+		c := filename[i]
+		if c < 0x20 && c != '\t' {
+			return &SecurityError{
+				Action: "file_access",
+				Reason: "control character in path not allowed",
+			}
 		}
 	}
 
@@ -84,18 +101,27 @@ func (v *PathValidator) Validate(filename string) error {
 		}
 	}
 
-	// SECURITY: Check for Unix-style absolute paths starting with /
-	// Only allow relative paths for safety
-	if len(filename) > 0 && filename[0] == '/' {
+	// SECURITY: Reject any path that starts with a path separator. '/' is
+	// the Unix absolute form; a leading '\' is a drive-rooted path on
+	// Windows ("\Windows\win.ini" resolves against the root of the current
+	// drive even though filepath.IsAbs reports false for it — the path has
+	// no volume name, and EvalSymlinks preserves the form). The check also
+	// covers the root-local device spellings "\??\..." and "\.\...".
+	// Rejected on every platform: '\'-leading names are exotic on Unix and
+	// suspect in configuration paths regardless. Only allow relative paths
+	// for safety.
+	if len(filename) > 0 && (filename[0] == '/' || filename[0] == '\\') {
 		return &SecurityError{
 			Action: "file_access",
-			Reason: "absolute path not allowed",
+			Reason: "rooted path not allowed",
 		}
 	}
 
 	// SECURITY: Check for Windows drive letters (C:, D:, etc.)
-	// This prevents access to system files via absolute paths
-	if len(filename) >= 2 && filename[1] == ':' {
+	// This prevents access to system files via absolute paths.
+	// Drive letters are a Windows concept: on Unix "c:config" is a legal
+	// relative filename and must not be rejected.
+	if runtime.GOOS == "windows" && len(filename) >= 2 && filename[1] == ':' {
 		c := filename[0]
 		if (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') {
 			return &SecurityError{
@@ -106,10 +132,13 @@ func (v *PathValidator) Validate(filename string) error {
 	}
 
 	// Check for path traversal attempts using filepath.Clean
-	// This is more precise than just checking for ".." in the raw string
-	// filepath.Clean normalizes the path by resolving ".." and removing redundant separators
+	// filepath.Clean normalizes the path by resolving interior ".." and
+	// removing redundant separators, so any ".." component that survives is
+	// a genuine traversal. The comparison is per component, not a substring
+	// test: "my..file.env" and "a..b/c.env" are legitimate names that a
+	// Contains("..") check rejected (Clean keeps interior dots).
 	cleanPath := filepath.Clean(filename)
-	if strings.Contains(cleanPath, "..") {
+	if hasDotDotComponent(cleanPath) {
 		return &SecurityError{
 			Action: "file_access",
 			Reason: "path traversal detected",
@@ -122,6 +151,19 @@ func (v *PathValidator) Validate(filename string) error {
 	// See: https://learn.microsoft.com/en-us/windows/win32/fileio/naming-a-file
 	if err := v.checkReservedDeviceNames(filename); err != nil {
 		return err
+	}
+
+	// SECURITY: On Windows a colon inside a path component denotes an NTFS
+	// alternate data stream ("config/app.env:hidden") — a different file
+	// identity than the one validated, and one whose trailing extension
+	// (".env:hidden") misleads DetectFormat into the wrong parser. Drive
+	// prefixes were already rejected above, so any remaining colon is
+	// stream syntax; ':' remains a legal filename character on Unix.
+	if runtime.GOOS == "windows" && hasComponentColon(cleanPath) {
+		return &SecurityError{
+			Action: "file_access",
+			Reason: "alternate data stream path not allowed",
+		}
 	}
 
 	// SECURITY: Resolve and validate symlinks to prevent symlink escape attacks
@@ -138,36 +180,75 @@ var (
 	reservedPseudoDevices = []string{"CONIN$", "CONOUT$", "CLOCK$"}
 )
 
-// checkReservedDeviceNames checks for Windows reserved device names.
+// checkReservedDeviceNames checks every path component for Windows reserved
+// device names. Reserved names apply in ANY directory, so checking only the
+// leading component let later components through ("subdir/CON",
+// "backup/NUL.txt"); the per-component walk closes that gap while leaving
+// ordinary names that merely start with a reserved prefix ("config") valid.
 // Comparisons are ASCII case-insensitive and allocation-free (EqualFoldASCII
-// on filename slices). This is equivalent to the previous strings.ToUpper
-// approach for these all-ASCII names: ToUpper never maps a non-ASCII byte to
-// one of these letters, so a fold mismatch here implies a mismatch there too.
+// on component slices); ToUpper never maps a non-ASCII byte to one of these
+// letters, so a fold mismatch here implies a mismatch there too.
 func (v *PathValidator) checkReservedDeviceNames(filename string) error {
-	if len(filename) < 3 {
-		return nil
-	}
-
-	// Check for CON, PRN, AUX, NUL
-	for _, r := range reservedDeviceNames {
-		if EqualFoldASCII(filename[:3], r) &&
-			(len(filename) == 3 || filename[3] == '.' || filename[3] == ':') {
-			return &SecurityError{
-				Action: "file_access",
-				Reason: "reserved device name",
+	for len(filename) > 0 {
+		comp := filename
+		if idx := indexByte2(filename, '/', '\\'); idx >= 0 {
+			comp = filename[:idx]
+			filename = filename[idx+1:]
+		} else {
+			filename = ""
+		}
+		if len(comp) >= 3 {
+			if err := checkReservedComponent(comp); err != nil {
+				return err
 			}
 		}
 	}
+	return nil
+}
 
-	// Check COM and LPT ports (COM1-COM9, LPT1-LPT9)
-	// These are 4-character names like "COM1", "LPT9", etc.
-	// Digits are case-invariant, so filename[3] compares directly.
-	if len(filename) >= 4 &&
-		(EqualFoldASCII(filename[:3], "COM") || EqualFoldASCII(filename[:3], "LPT")) {
-		if c := filename[3]; c >= '1' && c <= '9' {
-			// Match: exactly 4 chars (e.g., "COM1") or followed by separator
-			rest := filename[4:]
-			if len(rest) == 0 || rest[0] == '.' || rest[0] == ':' {
+// indexByte2 returns the index of the first occurrence of a or b in s, or -1.
+func indexByte2(s string, a, b byte) int {
+	for i := 0; i < len(s); i++ {
+		if s[i] == a || s[i] == b {
+			return i
+		}
+	}
+	return -1
+}
+
+// checkReservedComponent reports whether comp, a single path component, is a
+// Windows reserved device name: CON/PRN/AUX/NUL (with or without an
+// extension), COM1-COM9 / LPT1-LPT9, or the pseudo devices CONIN$/CONOUT$/
+// CLOCK$. The caller guarantees len(comp) >= 3.
+func checkReservedComponent(comp string) error {
+	// Windows strips trailing spaces and dots from each path component
+	// before resolving names, so "CON ", "CON." and "CON .txt" all address
+	// the CON device. Reduce the component to its base name — everything
+	// before the first '.' or ':', with trailing spaces and dots trimmed —
+	// and match the reserved lists against that base.
+	base := comp
+	if i := strings.IndexAny(comp, ".:"); i >= 0 {
+		base = comp[:i]
+	}
+	base = strings.TrimRight(base, " .")
+
+	if len(base) >= 3 {
+		// CON, PRN, AUX, NUL — exactly the base name ("CONfig" keeps its
+		// longer base and stays an ordinary filename).
+		for _, r := range reservedDeviceNames {
+			if EqualFoldASCII(base, r) {
+				return &SecurityError{
+					Action: "file_access",
+					Reason: "reserved device name",
+				}
+			}
+		}
+
+		// COM and LPT ports (COM1-COM9, LPT1-LPT9): 4-character bases.
+		// Digits are case-invariant, so base[3] compares directly.
+		if len(base) == 4 &&
+			(EqualFoldASCII(base[:3], "COM") || EqualFoldASCII(base[:3], "LPT")) {
+			if c := base[3]; c >= '1' && c <= '9' {
 				return &SecurityError{
 					Action: "file_access",
 					Reason: "reserved device name",
@@ -176,21 +257,13 @@ func (v *PathValidator) checkReservedDeviceNames(filename string) error {
 		}
 	}
 
-	// Check for pseudo-device names: CONIN$, CONOUT$, CLOCK$
+	// Pseudo-device names: CONIN$, CONOUT$, CLOCK$ — the base reduction
+	// above already covers "CONIN$", "CONIN$.txt" and "CONIN$ :x".
 	for _, pd := range reservedPseudoDevices {
-		if EqualFoldASCII(filename, pd) {
+		if EqualFoldASCII(base, pd) {
 			return &SecurityError{
 				Action: "file_access",
 				Reason: "reserved pseudo-device name",
-			}
-		}
-		if len(filename) > len(pd) {
-			withSep := filename[:len(pd)+1]
-			if EqualFoldASCII(withSep, pd+".") || EqualFoldASCII(withSep, pd+":") {
-				return &SecurityError{
-					Action: "file_access",
-					Reason: "reserved pseudo-device name",
-				}
 			}
 		}
 	}
@@ -233,9 +306,10 @@ func (v *PathValidator) validateResolvedPath(resolved string) error {
 		}
 	}
 
-	// Double-check for path traversal in resolved path
+	// Double-check for path traversal in resolved path (per component —
+	// see hasDotDotComponent for why a substring test over-blocks)
 	cleanResolved := filepath.Clean(resolved)
-	if strings.Contains(cleanResolved, "..") {
+	if hasDotDotComponent(cleanResolved) {
 		return &SecurityError{
 			Action: "file_access",
 			Reason: "symlink escapes allowed directory",
@@ -245,8 +319,54 @@ func (v *PathValidator) validateResolvedPath(resolved string) error {
 	return nil
 }
 
+// hasComponentColon reports whether any single path component contains a
+// colon (components split on both separators, mirroring the
+// checkReservedDeviceNames walk).
+func hasComponentColon(path string) bool {
+	for len(path) > 0 {
+		comp := path
+		if idx := indexByte2(path, '/', '\\'); idx >= 0 {
+			comp = path[:idx]
+			path = path[idx+1:]
+		} else {
+			path = ""
+		}
+		if strings.IndexByte(comp, ':') >= 0 {
+			return true
+		}
+	}
+	return false
+}
+
+// hasDotDotComponent reports whether any single component of path is exactly
+// ".." (components split on both separators, mirroring the
+// checkReservedDeviceNames walk). After filepath.Clean, surviving ".."
+// components are the leading-parent forms ("../x"); interior parents have
+// already been resolved away, and interior DOTS inside a name ("a..b") are
+// not components and never were traversal.
+func hasDotDotComponent(path string) bool {
+	for len(path) > 0 {
+		comp := path
+		if idx := indexByte2(path, '/', '\\'); idx >= 0 {
+			comp = path[:idx]
+			path = path[idx+1:]
+		} else {
+			path = ""
+		}
+		if comp == ".." {
+			return true
+		}
+	}
+	return false
+}
+
 // DefaultPathValidator is the default path validator instance.
 // It uses the default key masking function.
+//
+// It is a process-global knob rather than a Config setting: ValidateFilePath
+// reads it without locking, so assign it at program init, before concurrent
+// use of this package — mutating it concurrently with Load is a data race
+// (the same contract DefaultFileSystem documents).
 var DefaultPathValidator = NewPathValidator(PathValidatorConfig{})
 
 // ValidateFilePath validates a file path using the default validator.
