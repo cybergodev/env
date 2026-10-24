@@ -238,9 +238,28 @@ func (p *Parser) parseMap(depth, expectedIndent int) (*Value, error) {
 		if p.current().Type == TokenKey {
 			key := p.current().Value
 			keyLine := p.current().Line
+			keyColumn := p.current().Column
 			p.advance()
 
-			// Skip newlines after colon
+			// An empty key ("": v, or a fragment left by a line that lost its
+			// own key) would be stored under an empty name and then rejected
+			// by key validation with a message that names neither the line nor
+			// the cause. YAML requires a non-empty key; fail here, where the
+			// position is still known.
+			if key == "" {
+				return nil, &YAMLError{
+					Line:    keyLine,
+					Column:  keyColumn,
+					Message: "mapping key is empty (expected 'key: value')",
+				}
+			}
+
+			// Skip newlines after colon. Whether one was skipped decides how a
+			// following key token is interpreted: after a newline it is the
+			// next sibling entry ("key:" with an empty value), while on the
+			// same line the scalar itself carried a ": " and the mapping is
+			// malformed (see the TokenKey branch below).
+			sawNewline := !p.isEOF() && p.current().Type == TokenNewline
 			p.skipNewlines()
 
 			var value *Value
@@ -267,8 +286,29 @@ func (p *Parser) parseMap(depth, expectedIndent int) (*Value, error) {
 				// Array as value
 				value, err = p.parseArray(depth+1, currentIndent+1)
 			} else if p.current().Type == TokenKey {
-				// Inline nested map
-				value, err = p.parseMap(depth+1, currentIndent+1)
+				// A key after a newline is the next sibling entry: the value
+				// here is empty ("key:" followed by "other: v"). The token is
+				// left in place for the loop to consume as that entry.
+				if !sawNewline {
+					// A second key on the SAME line as this one: the plain
+					// scalar contained a ':' that the lexer read as a
+					// separator (for example "k: a: b"). YAML rejects a
+					// block-mapping value that itself contains ": " — PyYAML
+					// reports "mapping values are not allowed here". Building
+					// an inline nested map here (the previous behavior)
+					// silently turned one value into two entries: a Set-Cookie
+					// such as "apnews.com: sid=1; Expires: Wed, ..." became
+					// APNEWS.COM="" plus EXPIRES="Wed, ...". Fail loudly
+					// instead; the fix at the call site is to quote the value.
+					return nil, &YAMLError{
+						Line:   keyLine,
+						Column: keyColumn,
+						Path:   key,
+						Message: "a plain value may not contain ': ' (a colon followed by whitespace); " +
+							"quote the value ('...' or \"...\") to keep it literal",
+					}
+				}
+				value = NewScalarValue("", keyLine, p.current().Column)
 			} else {
 				value = NewScalarValue("", p.currentLine(), p.currentColumn())
 			}
@@ -313,8 +353,21 @@ func (p *Parser) parseMap(depth, expectedIndent int) (*Value, error) {
 		} else if p.current().Type == TokenComment {
 			p.advance()
 		} else {
-			// Unknown token, skip
-			p.advance()
+			// A line in mapping context that opened no mapping entry: a bare
+			// scalar line ("hello") or a fragment left after a value was
+			// terminated early. parseMap used to advance past it, so the data
+			// disappeared with no error while the load reported success and
+			// the audit trail recorded a clean parse — whereas the .env
+			// parser audits every separator-less line it drops. Fail loudly:
+			// a line that is not part of the mapping makes the document
+			// malformed, and silently loading a fraction of it is worse.
+			tok := p.current()
+			return nil, &YAMLError{
+				Line:   tok.Line,
+				Column: tok.Column,
+				Message: "line is not part of a mapping entry (expected 'key: value'); " +
+					"quote a value that is meant to be a bare scalar",
+			}
 		}
 	}
 

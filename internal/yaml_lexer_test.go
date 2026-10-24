@@ -520,6 +520,9 @@ func TestYAMLLexer_ColonSpaceInsideValue(t *testing.T) {
 // TestYAMLLexer_ColonSpaceAtDepthZeroStillSplitsKeys pins the unchanged
 // counterpart of the flow-depth rule: at brace depth 0 a colon+space still
 // terminates the scalar, preserving "outer: inner: value" inline maps.
+// (The parser rejects that shape — a plain value may not contain ": " — but
+// the lexer keeps producing the separator tokens; see
+// TestYAMLParser_Structure.)
 func TestYAMLLexer_ColonSpaceAtDepthZeroStillSplitsKeys(t *testing.T) {
 	tokens := iyTokenize(t, `outer: inner: value`)
 
@@ -544,6 +547,53 @@ func TestYAMLLexer_ColonSpaceAtDepthZeroStillSplitsKeys(t *testing.T) {
 		if got[i].Type != w.typ || got[i].Value != w.value {
 			t.Errorf("token %d = (%v, %q), want (%v, %q)", i, got[i].Type, got[i].Value, w.typ, w.value)
 		}
+	}
+}
+
+// TestYAMLLexer_GluedColonStaysInKey pins the key-separator scan: only a
+// colon followed by whitespace (or end of input) opens the mapping value, and
+// the scan continues past colons that are glued to data. Returning false at
+// the first glued colon made "localhost:8080: Code=abc" a value line; its
+// pieces then vanished in the parser's mapping loop.
+func TestYAMLLexer_GluedColonStaysInKey(t *testing.T) {
+	tests := []struct {
+		name    string
+		input   string
+		wantKey string
+		wantVal string
+	}{
+		{"port in key", `localhost:8080: Code=abc`, "localhost:8080", "Code=abc"},
+		{"time in key", `12:30:00: late`, "12:30:00", "late"},
+		{"url value", `url: https://example.com:8443/x`, "url", "https://example.com:8443/x"},
+		{"time value", `at: 12:30:45`, "at", "12:30:45"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			tokens := iyTokenize(t, tt.input)
+			var key, val *Token
+			for i := range tokens {
+				switch tokens[i].Type {
+				case TokenKey:
+					if key == nil {
+						key = &tokens[i]
+					}
+				case TokenValue:
+					if val == nil {
+						val = &tokens[i]
+					}
+				}
+			}
+			if key == nil || val == nil {
+				t.Fatalf("expected a key and a value token, got %d tokens", len(tokens))
+			}
+			if key.Value != tt.wantKey {
+				t.Errorf("key = %q, want %q", key.Value, tt.wantKey)
+			}
+			if val.Value != tt.wantVal {
+				t.Errorf("value = %q, want %q", val.Value, tt.wantVal)
+			}
+		})
 	}
 }
 
@@ -612,11 +662,14 @@ func TestYAMLLexer_EscapeSequences(t *testing.T) {
 		{"single-quoted doubled quote folds", `'it''s'`, `it's`},
 		{
 			// Unknown escapes hit scanQuotedString's default branch, which
-			// writes ONLY the escaped character: the backslash is dropped,
-			// so "\x" renders as "x" (not "\x" and not an error).
-			"unknown escape drops the backslash",
+			// keeps the backslash and the escaped character verbatim: "\x"
+			// renders as "\x" (matching the .env double-quoted parser, whose
+			// escapeTable falls back to the same "keep the backslash" rule).
+			// Dropping the backslash corrupted Windows paths ("C:\Users\x"
+			// became "C:Usersx").
+			"unknown escape keeps the backslash",
 			`"a\xz"`,
-			"axz",
+			`a\xz`,
 		},
 	}
 

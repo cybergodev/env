@@ -6,6 +6,7 @@
 //
 // The factory uses adapters (defined in adapters.go) to bridge between public interfaces
 // and internal interfaces, allowing both built-in and custom components to work seamlessly.
+
 package env
 
 import (
@@ -98,9 +99,15 @@ func (f *ComponentFactory) Expander() VariableExpander {
 // If fs is nil, DefaultFileSystem is used.
 // If custom components are provided in Config, they will be used instead of built-in ones.
 func (c *Config) buildComponentFactoryWithFS(fs FileSystem) *ComponentFactory {
-	// Use default file system if not provided
+	// Use default file system if not provided; custom file systems are
+	// wrapped for panic containment (SEC-003, see recovering.go). New passes
+	// an already-wrapped fs; other callers (UnmarshalMapWithConfig, the test
+	// helper) may pass a raw custom implementation, which is wrapped here so
+	// the expander's captured lookup (fs.LookupEnv below) is contained too.
 	if fs == nil {
-		fs = DefaultFileSystem
+		fs = resolveComponentFileSystem(c.FileSystem)
+	} else if _, ok := fs.(*recoveringFileSystem); !ok {
+		fs = &recoveringFileSystem{FileSystem: fs}
 	}
 
 	handler := c.AuditHandler
@@ -127,11 +134,11 @@ func (c *Config) buildComponentFactoryWithFS(fs FileSystem) *ComponentFactory {
 
 	factory := &ComponentFactory{}
 
-	// Use custom validator if provided, otherwise create default
+	// Use custom validator if provided, otherwise create default.
+	// SEC-003: customs are wrapped for panic containment (see recovering.go)
+	// — the wrapper preserves every optional capability the library probes.
 	if c.CustomValidator != nil {
-		// KeyValidator and internal.LineKeyValidator are the same type via
-		// aliases, so the custom validator is assigned directly.
-		factory.validator = c.CustomValidator
+		factory.validator = newRecoveringValidator(c.CustomValidator)
 	} else {
 		factory.validator = internal.NewValidator(internal.ValidatorConfig{
 			KeyPattern:     c.KeyPattern,
@@ -147,11 +154,11 @@ func (c *Config) buildComponentFactoryWithFS(fs FileSystem) *ComponentFactory {
 		})
 	}
 
-	// Use custom auditor if provided, otherwise create default
+	// Use custom auditor if provided, otherwise create default.
+	// SEC-003: customs are wrapped for panic containment (see recovering.go);
+	// the built-in *internal.Auditor already contains handler panics itself.
 	if c.CustomAuditor != nil {
-		// AuditLogger and internal.LineAuditLogger are the same type via
-		// aliases, so the custom auditor is assigned directly.
-		factory.auditor = c.CustomAuditor
+		factory.auditor = newRecoveringAuditLogger(c.CustomAuditor)
 	} else {
 		auditor := internal.NewAuditor(handler, IsSensitiveKey, MaskValue, c.AuditEnabled)
 		// GEN-001 fail-closed auditing: arm the sticky failure latch so the
@@ -160,11 +167,10 @@ func (c *Config) buildComponentFactoryWithFS(fs FileSystem) *ComponentFactory {
 		factory.auditor = auditor
 	}
 
-	// Use custom expander if provided, otherwise create default
+	// Use custom expander if provided, otherwise create default.
+	// SEC-003: customs are wrapped for panic containment (see recovering.go).
 	if c.CustomExpander != nil {
-		// VariableExpander and internal.LineExpander are the same type via
-		// aliases, so the custom expander is assigned directly.
-		factory.expander = c.CustomExpander
+		factory.expander = &recoveringExpander{VariableExpander: c.CustomExpander}
 	} else {
 		factory.expander = internal.NewExpander(internal.ExpanderConfig{
 			MaxDepth:   c.MaxExpansionDepth,

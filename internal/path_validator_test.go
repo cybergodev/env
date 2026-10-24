@@ -394,3 +394,51 @@ func TestPathValidator_SymlinkResolution(t *testing.T) {
 		}
 	})
 }
+
+// TestValidateStatic pins the disk-free half of Validate (D-002/MAJ-2):
+// every lexical rule fires exactly as in Validate, and the check makes no
+// syscalls (the symlink leg belongs to Validate alone). Injected file
+// systems validate through this rule set, so their outcomes must not depend
+// on host-disk state.
+func TestValidateStatic(t *testing.T) {
+	v := NewPathValidator(PathValidatorConfig{})
+
+	tests := []struct {
+		name       string
+		filename   string
+		wantReason string // substring of SecurityError.Reason; "" means accept
+	}{
+		{"valid relative path", "config/.env", ""},
+		{"empty filename", "", "empty filename"},
+		{"null byte", "a\x00.env", "null byte"},
+		{"url encoding", "a%2e.env", "URL encoded"},
+		{"control character", "a\nb.env", "control character"},
+		{"unc path", `\\server\share`, "UNC path"},
+		{"network path", "//server/share", "network path"},
+		{"rooted path", "/etc/passwd", "rooted path"},
+		{"backslash-rooted path", `\Windows\win.ini`, "rooted path"},
+		{"traversal", "../escape.env", "path traversal"},
+		{"reserved device in subdir", "subdir/CON", "reserved device"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			err := v.ValidateStatic(tt.filename)
+			if tt.wantReason == "" {
+				if err != nil {
+					t.Errorf("ValidateStatic(%q) error = %v, want nil", tt.filename, err)
+				}
+				return
+			}
+			if err == nil {
+				t.Fatalf("ValidateStatic(%q) error = nil, want SecurityError", tt.filename)
+			}
+			var secErr *SecurityError
+			if !errors.As(err, &secErr) {
+				t.Fatalf("ValidateStatic(%q) error = %T, want *SecurityError", tt.filename, err)
+			}
+			if !strings.Contains(secErr.Reason, tt.wantReason) {
+				t.Errorf("ValidateStatic(%q) reason = %q, want containing %q", tt.filename, secErr.Reason, tt.wantReason)
+			}
+		})
+	}
+}

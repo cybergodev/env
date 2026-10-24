@@ -10,7 +10,6 @@ import (
 type yamlParser struct {
 	structuredParserConfig
 	flatten internal.YAMLFlattenConfig
-	dup     internal.DuplicateKeyPolicy
 }
 
 // Compile-time check that yamlParser implements EnvParser.
@@ -31,7 +30,6 @@ func newYAMLParserWithFactory(cfg Config, factory *ComponentFactory) (*yamlParse
 	return &yamlParser{
 		structuredParserConfig: newStructuredParserConfig(cfg, factory),
 		flatten:                flattenCfg,
-		dup:                    cfg.DuplicateKeyPolicy,
 	}, nil
 }
 
@@ -42,7 +40,7 @@ func newYAMLParserWithFactory(cfg Config, factory *ComponentFactory) (*yamlParse
 // paths always error (see internal.FlattenYAML).
 func (p *yamlParser) Parse(r io.Reader, filename string) (map[string]string, error) {
 	return p.structuredParseResult(r, filename, "YAML", func(data []byte) (map[string]string, error) {
-		value, err := internal.ParseYAMLWithPolicy(data, p.flatten.MaxDepth, p.dup)
+		value, err := internal.ParseYAMLWithPolicy(data, p.flatten.MaxDepth, p.flatten.DuplicateKey)
 		if err != nil {
 			return nil, err
 		}

@@ -307,6 +307,17 @@ countLoop:
 	// widths alias the enclosing level: a 1-space child became a sibling
 	// of its 0-space parent and a 3-space child a sibling of its 2-space
 	// parent, silently re-parenting keys in hand-edited files.
+	//
+	// Comment-only lines never change the indent level. A comment carries no
+	// structure, but the indent stack used to push for one anyway — a single
+	// "  # note" between two root keys emitted INDENT followed by DEDENT,
+	// the DEDENT ended the enclosing map, and every later key was dropped
+	// without an error. Skipping the push/pop here keeps the comment
+	// attached to the level it is written at.
+	if l.pos < len(l.input) && l.input[l.pos] == '#' {
+		return Token{Type: TokenNewline, Line: startLine, Column: l.column}, nil
+	}
+
 	currentColumn := l.indents[len(l.indents)-1]
 
 	if newIndent > currentColumn {
@@ -438,13 +449,22 @@ func (l *Lexer) isKeyStart() bool {
 			continue
 		}
 		if ch == ':' {
-			// Check if colon is followed by space, newline, or end
+			// Only a colon followed by whitespace (or end of input) is the
+			// key separator; the scan stops at the FIRST such colon. A colon
+			// glued to a following character — a port ("localhost:8080"), a
+			// clock time ("12:30"), a URL path — is plain data, so the scan
+			// must continue past it. Returning false there misclassified
+			// "localhost:8080: Code=abc" as a value line; its fragments then
+			// fell into parseMap's drop branch and the entry vanished with no
+			// error (see the parser's mapping-context checks).
 			if braceDepth == 0 {
 				if i+1 >= len(l.input) {
 					return true
 				}
 				next := l.input[i+1]
-				return next == ' ' || next == '\t' || next == '\n' || next == '\r'
+				if next == ' ' || next == '\t' || next == '\n' || next == '\r' {
+					return true
+				}
 			}
 			continue
 		}
@@ -963,6 +983,14 @@ func (l *Lexer) scanQuotedString(quote byte) (string, error) {
 					Message: "null byte escape (\\0) is not allowed in YAML values",
 				}
 			default:
+				// Unknown escape: keep the backslash instead of writing only
+				// the escaped character. Dropping it corrupted Windows paths
+				// ("C:\Users\x" became "C:Usersx") and any other literal
+				// backslash — the same data loss the .env double-quoted
+				// parser already avoids by keeping unknown escapes verbatim
+				// (see escapeTable's fallback in parser.go). One grammar
+				// across both parsers; nothing is silently discarded.
+				buf.WriteByte('\\')
 				buf.WriteByte(escaped)
 			}
 			l.pos++

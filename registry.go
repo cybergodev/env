@@ -134,9 +134,17 @@ func (r *parserRegistry) registerBuiltin(format FileFormat, factory ParserFactor
 // write-lock acquisition inside would block on the read lock held by this
 // same goroutine. It would also serialize unrelated Loader constructions
 // behind potentially slow factory code.
+//
+// SEC-003: in the general path every produced parser is wrapped for panic
+// containment (see recovering.go) — invokeParserFactory already contains a
+// panicking FACTORY; the wrapper extends that to a panicking Parse. The fast
+// path (nothing custom ever registered) leaves the built-in parsers
+// unwrapped: they are trusted library code, and the fast path exists to keep
+// default Loader construction allocation-free.
 func createParsers(cfg Config, factory *ComponentFactory) (map[FileFormat]EnvParser, error) {
 	snapshot := builtinParsers
-	if globalParserRegistry.hasCustom.Load() {
+	customRegistered := globalParserRegistry.hasCustom.Load()
+	if customRegistered {
 		globalParserRegistry.mu.RLock()
 		snapshot = make(map[FileFormat]ParserFactory, len(globalParserRegistry.factories))
 		for format, parserFactory := range globalParserRegistry.factories {
@@ -157,6 +165,9 @@ func createParsers(cfg Config, factory *ComponentFactory) (map[FileFormat]EnvPar
 				}
 			}
 			return nil, fmt.Errorf("failed to create %s parser: %w", format.String(), err)
+		}
+		if customRegistered {
+			parser = newRecoveringParser(parser)
 		}
 		parsers[format] = parser
 	}

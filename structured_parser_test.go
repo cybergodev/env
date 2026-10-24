@@ -284,18 +284,32 @@ func TestYAMLParser_ColonSpaceInValues(t *testing.T) {
 		}
 	})
 
-	t.Run("depth-0 colon-space still splits (pre-existing behavior)", func(t *testing.T) {
-		// A ": " at flow depth 0 still terminates the scalar. For same-line
-		// "outer: inner: value" the real lexer emits the inner key at indent 0,
-		// so the inner pair is parsed as a root-level sibling and outer ends up
-		// empty — pre-existing semantics, pinned here to prove the flow-depth
-		// rule does not change them.
-		loader := rmLoad(t, "config.yaml", "outer: inner: value\n")
-		if got := loader.GetString("INNER"); got != "value" {
-			t.Errorf("GetString(\"INNER\") = %q, want %q", got, "value")
+	t.Run("depth-0 colon-space is rejected, not split", func(t *testing.T) {
+		// A ": " at flow depth 0 still terminates the scalar, but the line no
+		// longer splits into two entries: a plain value may not carry ": ",
+		// so "outer: inner: value" is a mapping error (PyYAML reports
+		// "mapping values are not allowed here"). Previously OUTER silently
+		// became "" and INNER "value" — one entry's data split across two
+		// keys with no error. Quoting keeps the value literal.
+		cfg := DefaultConfig()
+		fs := newTestFileSystem()
+		fs.files["config.yaml"] = "outer: inner: value\n"
+		cfg.FileSystem = fs
+		loader, err := New(cfg)
+		if err != nil {
+			t.Fatalf("New() error = %v", err)
 		}
-		if got := loader.GetString("OUTER"); got != "" {
-			t.Errorf("GetString(\"OUTER\") = %q, want %q", got, "")
+		defer func() { _ = loader.Close() }() // best-effort cleanup
+		if err := loader.LoadFiles("config.yaml"); err == nil {
+			t.Fatal("LoadFiles() error = nil, want an error for an unquoted ': ' in a plain value")
+		}
+
+		quoted := rmLoad(t, "config.yaml", "outer: 'inner: value'\n")
+		if got := quoted.GetString("OUTER"); got != "inner: value" {
+			t.Errorf("GetString(\"OUTER\") = %q, want %q", got, "inner: value")
+		}
+		if got := quoted.GetString("INNER"); got != "" {
+			t.Errorf("GetString(\"INNER\") = %q, want empty (a quoted value must not split)", got)
 		}
 	})
 }

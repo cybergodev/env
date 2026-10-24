@@ -383,6 +383,11 @@ func UnmarshalMapWithConfig(cfg Config, data string, format ...FileFormat) (map[
 	if err != nil {
 		return nil, err
 	}
+	// One-shot counterpart of Loader.Close's parser cleanup (closeParsers in
+	// env.go): a custom parser registered via RegisterParser may hold
+	// resources, and this path previously dropped them on both the success
+	// and the error path.
+	defer closeParsers(parsers)
 
 	p, ok := parsers[f]
 	if !ok || p == nil {
@@ -541,7 +546,7 @@ func UnmarshalInto(data map[string]string, v any) error {
 
 	// Check for Unmarshaler interface
 	if u, ok := v.(Unmarshaler); ok {
-		return u.UnmarshalEnv(data)
+		return safeUnmarshalEnv(u, data)
 	}
 
 	val := reflect.ValueOf(v)
@@ -668,4 +673,19 @@ func parseCommaSeparated[T sliceElement](value string, defaultValue ...[]T) []T 
 	}
 
 	return result
+}
+
+// ============================================================================
+// Process-wide Utilities
+// ============================================================================
+
+// ClearInternCache releases the memory held by the .env key-interning cache.
+// Parsing .env content interns key strings in a bounded process-wide cache
+// (see internal.InternKeyBytes); long-running applications that parse in
+// bursts can call this between bursts to drop the retained keys.
+//
+// Like the other process-wide knobs (see the package documentation), it is
+// deliberately not part of Config. Safe for concurrent use.
+func ClearInternCache() {
+	internal.ClearInternCache()
 }

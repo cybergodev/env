@@ -31,7 +31,14 @@ type ValidationConfig struct {
 	AllowedKeys []string
 	// ForbiddenKeys lists keys that are always rejected. Set returns ErrForbiddenKey if any are present.
 	ForbiddenKeys []string
-	// KeyPattern is a custom regexp for validating key names. Nil uses DefaultKeyPattern.
+	// KeyPattern is a custom regexp for validating key names. Nil uses the
+	// fast built-in check (DefaultKeyPattern). The pattern may restrict keys
+	// to any namespace or shape (e.g. ^MYAPP_[A-Z0-9_]*$) — it does not have
+	// to match any particular sample key. Validate rejects only patterns
+	// that would accept unsafe keys: ones matching the empty string, keys
+	// starting with a digit, or keys containing '=', ':', newline or control
+	// characters (the .env emitter cannot round-trip those, see
+	// validateKeyPattern).
 	KeyPattern *regexp.Regexp
 	// ValidateValues enables the validator's value checks on Set and
 	// structured (JSON/YAML) loads. With the built-in validator it no longer
@@ -86,12 +93,16 @@ type JSONConfig struct {
 	// default float formatting (fmt %v — 1e21 becomes "1e+21"). Numbers are
 	// never rejected.
 	JSONNumberAsString bool
-	// JSONBoolAsString is retained for symmetry with YAMLBoolAsString but has
-	// no effect on JSON output: a decoded JSON bool carries no raw source text
-	// to preserve, so JSON booleans always render the canonical "true"/"false"
-	// (see internal/flatten_keys.go). Do not rely on it to gate JSON bool
-	// handling.
-	JSONBoolAsString bool
+	// JSONBoolAsString is retained for API symmetry with YAMLBoolAsString but
+	// has never affected output: a decoded JSON bool carries no raw source
+	// text to preserve, so JSON booleans always render the canonical
+	// "true"/"false" (see internal/flatten_keys.go flattenDecoded's bool case).
+	// It is accepted and ignored for backward compatibility and must not be
+	// relied on to gate JSON bool handling.
+	//
+	// Deprecated: JSON bools are always rendered canonically regardless of this
+	// flag. Use YAMLBoolAsString to govern YAML boolean coercion instead.
+	JSONBoolAsString bool // Deprecated: no effect on JSON output
 	// JSONMaxDepth limits nesting depth for JSON objects. Must be between 1 and 100.
 	JSONMaxDepth int
 }
@@ -166,6 +177,14 @@ type ParsingConfig struct {
 // (concurrent Set/Get on one Loader, or several Loaders built from one
 // Config), so it must be safe for concurrent use. The built-in
 // implementations are.
+//
+// Panic contract (SEC-003): custom components are wrapped for panic
+// containment — a panic inside CustomValidator, CustomExpander, CustomAuditor,
+// FileSystem (and the File it returns), or a parser from RegisterParser
+// surfaces as an error from the public API that invoked it instead of
+// crashing the process. The same applies to struct-field UnmarshalText /
+// MarshalText / MarshalJSON callbacks and the Unmarshaler interface during
+// ParseInto/UnmarshalInto/Marshal.
 type ComponentConfig struct {
 	// CustomValidator replaces the built-in key/value validator. Nil uses the default.
 	// Must be safe for concurrent use.
@@ -177,10 +196,16 @@ type ComponentConfig struct {
 	// Must be safe for concurrent use.
 	CustomAuditor AuditLogger
 	// FileSystem overrides file system operations. Nil uses OSFileSystem. Useful for testing.
+	// Panic containment applies (see the ComponentConfig doc); LookupEnv has no
+	// error channel, so a panic there converts to ("", false) — treated as
+	// "not set".
 	FileSystem FileSystem
 	// AuditHandler receives audit events when AuditEnabled is true.
 	// Must be safe for concurrent use: Log may be invoked from concurrent
 	// goroutines (Close is serialized against Log by the built-in auditor).
+	// Reentrancy caveat: Log/Close run while the Loader may hold its lock —
+	// a callback that calls back into the SAME Loader's mutating methods
+	// (Set/Delete/Close/LoadFiles) self-deadlocks on the non-reentrant mutex.
 	AuditHandler AuditHandler
 	// AuditEnabled activates audit logging for all loader operations.
 	AuditEnabled bool
@@ -297,12 +322,12 @@ func (c *Config) validateAdvancedOptions() error {
 
 // validateKeyPattern validates a custom key pattern.
 func validateKeyPattern(pattern *regexp.Regexp) error {
-	// Test that the pattern can match a typical valid key
-	testKey := "TEST_KEY"
-	if !pattern.MatchString(testKey) {
-		return newValidationError("KeyPattern", pattern.String(), "valid_pattern",
-			"key pattern must be able to match valid keys like TEST_KEY")
-	}
+	// The pattern may target any key namespace — it is NOT required to match
+	// any particular sample key: a pattern that matches nothing makes every
+	// key fail validation (self-inflicted, no security consequence), so
+	// probing a magic key only rejected legitimate namespace patterns
+	// (^MYAPP_[A-Z0-9_]*$). The predicate probes below carry the actual
+	// security requirements.
 
 	// Test that the pattern does not match empty strings
 	if pattern.MatchString("") {
@@ -437,8 +462,11 @@ func DefaultConfig() Config {
 		JSONConfig: JSONConfig{
 			JSONNullAsEmpty:    true,
 			JSONNumberAsString: true,
-			JSONBoolAsString:   true,
-			JSONMaxDepth:       defaultStructuredMaxDepth,
+			// JSONBoolAsString is deliberately left false: it has no effect on
+			// JSON output (see its field doc), and a false default makes the
+			// field's no-op nature obvious rather than implying it does work.
+			JSONBoolAsString: false,
+			JSONMaxDepth:     defaultStructuredMaxDepth,
 		},
 		YAMLConfig: YAMLConfig{
 			YAMLNullAsEmpty:    true,

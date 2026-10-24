@@ -615,6 +615,51 @@ func TestStructSliceCommaRoundTrip(t *testing.T) {
 	}
 }
 
+// TestStructDurationSliceRoundTrip pins []time.Duration support in the
+// struct-mapping layer (D-002/MAJ-3): the element grammar must match
+// GetSlice[time.Duration], which parses duration spellings ("30s", "1m").
+// Previously the struct path rejected them as "invalid integer value" while
+// MarshalStruct called the same field "unsupported slice type".
+func TestStructDurationSliceRoundTrip(t *testing.T) {
+	type cfg struct {
+		Timeouts []time.Duration `env:"TIMEOUTS,envDefault:30s,1m0s"`
+	}
+
+	// Default value parsing takes the duration branch.
+	var c cfg
+	if err := StructInto(map[string]string{}, reflect.ValueOf(&c).Elem(), ""); err != nil {
+		t.Fatalf("StructInto(default) error = %v", err)
+	}
+	want := []time.Duration{30 * time.Second, time.Minute}
+	if !reflect.DeepEqual(c.Timeouts, want) {
+		t.Errorf("Timeouts = %v, want %v", c.Timeouts, want)
+	}
+
+	// Marshaling renders Duration.String() spellings...
+	m, err := Struct(cfg{Timeouts: want}, "")
+	if err != nil {
+		t.Fatalf("Struct() error = %v", err)
+	}
+	if m["TIMEOUTS"] != "30s,1m0s" {
+		t.Fatalf("Struct() TIMEOUTS = %q, want %q", m["TIMEOUTS"], "30s,1m0s")
+	}
+
+	// ...and the rendering round-trips back.
+	var back cfg
+	if err := StructInto(m, reflect.ValueOf(&back).Elem(), ""); err != nil {
+		t.Fatalf("StructInto(round trip) error = %v", err)
+	}
+	if !reflect.DeepEqual(back.Timeouts, want) {
+		t.Errorf("round trip Timeouts = %v, want %v", back.Timeouts, want)
+	}
+
+	// An invalid spelling fails without echoing the input (convError).
+	err = StructInto(map[string]string{"TIMEOUTS": "30s,notaduration"}, reflect.ValueOf(&back).Elem(), "")
+	if err == nil {
+		t.Fatal("StructInto(invalid duration) error = nil, want error")
+	}
+}
+
 func TestValueToString(t *testing.T) {
 	tests := []struct {
 		name    string
@@ -654,6 +699,10 @@ func TestValueToString(t *testing.T) {
 		{"TextMarshaler (time.Time)", time.Date(2026, 1, 2, 3, 4, 5, 0, time.UTC), "2026-01-02T03:04:05Z", false},
 		{"json.Marshaler", json.RawMessage(`{"a":1}`), `{"a":1}`, false},
 		{"empty string slice", []string{}, "", false},
+		// D-002/MAJ-3: []time.Duration renders via Duration.String(), the
+		// exact form setSliceValue's duration branch parses back.
+		{"duration slice", []time.Duration{30 * time.Second, time.Minute}, "30s,1m0s", false},
+		{"empty duration slice", []time.Duration{}, "", false},
 		{"unsupported slice", []int{1, 2, 3}, "", true},
 		{"unsupported map", map[string]string{"a": "b"}, "", true},
 		// BOUNDARY: the default unsupported-kind branch (previously only

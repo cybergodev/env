@@ -230,6 +230,53 @@ func TestSEC06_MarshalRejectsInjectionKeys(t *testing.T) {
 	}
 }
 
+// TestSEC06_MarshalOutputIsLoadable pins the writer/reader agreement the
+// dotted-key audit exposed: the store legitimately holds keys outside the
+// .env grammar (Loader.Set accepts the IsValidJSONKey space, and YAML/JSON
+// loads store literal dotted keys like "APNEWS.COM"), but Marshal used to
+// emit them into a file this same library then refused to load —
+// Marshal → UnmarshalMap failed on the library's own output. Keys that cannot
+// round-trip must fail the marshal instead.
+func TestSEC06_MarshalOutputIsLoadable(t *testing.T) {
+	cookie := `Code=abc; g_state={"i_l":0}`
+
+	// Keys the .env reader rejects: rejected at marshal time.
+	for _, key := range []string{"apnews.com", "api-key", "user@host"} {
+		if _, err := Marshal(map[string]string{key: cookie}, FormatEnv); err == nil {
+			t.Errorf("Marshal(.env) accepted key %q, which the .env loader rejects on reload", key)
+		}
+	}
+	// Keys the YAML reader rejects: rejected at marshal time.
+	for _, key := range []string{"a#b", "a b", "a+b"} {
+		if _, err := Marshal(map[string]string{key: cookie}, FormatYAML); err == nil {
+			t.Errorf("Marshal(YAML) accepted key %q, which the YAML loader rejects on reload", key)
+		}
+	}
+
+	// Every emitted document must reload to the same entries.
+	loadable := []struct {
+		format FileFormat
+		key    string
+	}{
+		{FormatEnv, "APNEWS_COM"},
+		{FormatYAML, "apnews.com"},
+		{FormatJSON, "apnews.com"},
+	}
+	for _, tc := range loadable {
+		out, err := Marshal(map[string]string{tc.key: cookie}, tc.format)
+		if err != nil {
+			t.Fatalf("Marshal(%v, key=%q) error = %v", tc.format, tc.key, err)
+		}
+		back, err := UnmarshalMap(out, tc.format)
+		if err != nil {
+			t.Fatalf("UnmarshalMap(Marshal(%v, key=%q)) error = %v (output: %q)", tc.format, tc.key, err, out)
+		}
+		if got := back[strings.ToUpper(tc.key)]; got != cookie {
+			t.Errorf("%v round trip = %q, want %q", tc.format, got, cookie)
+		}
+	}
+}
+
 // TestSEC03_FileOnlyScopeNotTreatedAsZeroConfig pins the IsZero fix: a Config
 // whose only non-default field is ExpansionScope used to be detected as a
 // zero-value Config and silently replaced by DefaultConfig() inside New(),
