@@ -218,18 +218,18 @@ func TestNew(t *testing.T) {
 
 	t.Run("custom key pattern accepted", func(t *testing.T) {
 		cfg := DefaultConfig()
-		// A genuinely custom pattern (stricter than the default) must be
-		// accepted — validation only requires it to still match TEST_KEY —
-		// and then be enforced when keys are validated. (The rejection side
+		// A namespace pattern need not match any particular sample key —
+		// validation only rejects patterns that would accept unsafe keys —
+		// and is then enforced when keys are validated. (The rejection side
 		// of a custom pattern is covered by TestLoader_Set_KeyRules.)
-		cfg.KeyPattern = regexp.MustCompile(`^TEST_[A-Z_]+$`)
+		cfg.KeyPattern = regexp.MustCompile(`^MYAPP_[A-Z0-9_]*$`)
 		loader, err := New(cfg)
 		if err != nil {
 			t.Fatalf("New() error = %v", err)
 		}
 		defer func() { _ = loader.Close() }() // best-effort cleanup
 
-		if err := loader.Set("TEST_KEY", "value"); err != nil {
+		if err := loader.Set("MYAPP_KEY", "value"); err != nil {
 			t.Fatalf("Set(key matching custom pattern) error = %v", err)
 		}
 	})
@@ -2499,6 +2499,132 @@ func TestValidateFilePath_SymlinkEscape(t *testing.T) {
 	}
 }
 
+// TestValidateFilePathForFS pins the FS-aware path-validation wiring
+// (D-002/MAJ-2): the OS file system (including the panic-containment
+// wrapper the loader installs) keeps the FULL rule set with symlink
+// resolution, while injected file systems get the static, disk-free rules —
+// their loads must not depend on host-disk state.
+func TestValidateFilePathForFS(t *testing.T) {
+	if !isOSFileSystem(OSFileSystem{}) {
+		t.Error("isOSFileSystem(OSFileSystem{}) = false, want true")
+	}
+	if !isOSFileSystem(resolveComponentFileSystem(nil)) {
+		t.Error("isOSFileSystem(wrapped default) = false, want true")
+	}
+	if isOSFileSystem(resolveComponentFileSystem(newTestFileSystem())) {
+		t.Error("isOSFileSystem(wrapped custom fs) = true, want false")
+	}
+
+	// Static rules still apply to injected file systems.
+	err := validateFilePathForFS("../escape.env", resolveComponentFileSystem(newTestFileSystem()))
+	if err == nil {
+		t.Fatal("validateFilePathForFS(traversal, custom fs) error = nil, want SecurityError")
+	}
+	var secErr *SecurityError
+	if !errors.As(err, &secErr) || !strings.Contains(secErr.Reason, "path traversal") {
+		t.Errorf("validateFilePathForFS(traversal, custom fs) error = %v, want path traversal SecurityError", err)
+	}
+
+	// A clean relative name passes at both fidelities.
+	if err := validateFilePathForFS("config/.env", resolveComponentFileSystem(newTestFileSystem())); err != nil {
+		t.Errorf("validateFilePathForFS(clean, custom fs) error = %v, want nil", err)
+	}
+	if err := validateFilePathForFS("config/.env", resolveComponentFileSystem(nil)); err != nil {
+		t.Errorf("validateFilePathForFS(clean, os fs) error = %v, want nil", err)
+	}
+}
+
+// TestLoader_LoadFiles_CustomFS_IgnoresHostSymlinks extends the symlink story
+// to injected file systems (D-002/MAJ-2): a name that IS a host-disk symlink
+// to an absolute location is rejected by full validation, yet a load reading
+// from an in-memory FS under the same name must succeed — previously the
+// symlink check consulted the host disk and failed the in-memory load.
+func TestLoader_LoadFiles_CustomFS_IgnoresHostSymlinks(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("symlink tests require admin privileges on Windows")
+	}
+
+	tmpDir := t.TempDir()
+	outsideFile := filepath.Join(tmpDir, "outside.txt")
+	if err := os.WriteFile(outsideFile, []byte("secret"), 0o644); err != nil {
+		t.Fatalf("failed to create outside file: %v", err)
+	}
+	if err := os.Symlink(outsideFile, filepath.Join(tmpDir, "escape.env")); err != nil {
+		t.Fatalf("failed to create symlink: %v", err)
+	}
+
+	oldWd, err := os.Getwd()
+	if err != nil {
+		t.Fatalf("failed to get working directory: %v", err)
+	}
+	if err := os.Chdir(tmpDir); err != nil {
+		t.Fatalf("failed to change directory: %v", err)
+	}
+	defer func() { _ = os.Chdir(oldWd) }() // best-effort restore of the original working directory
+
+	// Control: full validation still rejects the host-disk symlink.
+	if err := validateFilePath("escape.env"); err == nil {
+		t.Fatal("validateFilePath(symlink to absolute) error = nil, want rejection")
+	}
+
+	// The in-memory FS is unaffected by that host-disk state.
+	fs := newTestFileSystem()
+	fs.files["escape.env"] = "KEY=from-memory\n"
+	cfg := DefaultConfig()
+	cfg.Filenames = nil
+	cfg.FileSystem = fs
+	loader, err := New(cfg)
+	if err != nil {
+		t.Fatalf("New() error = %v", err)
+	}
+	defer func() { _ = loader.Close() }() // best-effort cleanup
+
+	if err := loader.LoadFiles("escape.env"); err != nil {
+		t.Fatalf("LoadFiles(symlinked name, custom fs) error = %v, want nil", err)
+	}
+	if v, ok := loader.Lookup("KEY"); !ok || v != "from-memory" {
+		t.Errorf("Lookup(KEY) = (%q, %v), want (%q, true)", v, ok, "from-memory")
+	}
+}
+
+// TestSet_AutoApply_SetenvFailure_Audited pins MIN-8: the os-level Setenv
+// failure inside Set reaches the audit stream, mirroring applyLocked's
+// failure branch.
+func TestSet_AutoApply_SetenvFailure_Audited(t *testing.T) {
+	handler := &utRecordingAuditHandler{}
+
+	fs := newTestFileSystem()
+	fs.setenvErr = errors.New("setenv failed")
+
+	cfg := DefaultConfig()
+	cfg.Filenames = nil
+	cfg.FileSystem = fs
+	cfg.AutoApply = true
+	cfg.AuditEnabled = true
+	cfg.AuditHandler = handler
+
+	loader, err := New(cfg)
+	if err != nil {
+		t.Fatalf("New() error = %v", err)
+	}
+	defer func() { _ = loader.Close() }() // best-effort cleanup
+
+	if err := loader.Set("KEY", "value"); err == nil {
+		t.Fatal("Set() with Setenv failure should return an error")
+	}
+
+	found := false
+	for _, e := range handler.recorded() {
+		if e.Action == ActionSet && !e.Success && strings.Contains(e.Reason, "setenv failed") {
+			found = true
+			break
+		}
+	}
+	if !found {
+		t.Error("no failed ActionSet audit event carrying the Setenv error; want the failure audited like applyLocked")
+	}
+}
+
 // ============================================================================
 // newParseError Tests
 // ============================================================================
@@ -2781,6 +2907,66 @@ func TestForceRegisterParser(t *testing.T) {
 			t.Errorf("ForceRegisterParser() error = %v", err)
 		}
 	})
+}
+
+// TestUnmarshalMapWithConfig_ClosesCustomParsers pins the one-shot parser
+// cleanup (D-002/MIN-2): a custom parser registered via RegisterParser gets
+// its io.Closer honored on both the success and the parse-error path, the
+// same cleanup Loader.Close performs.
+func TestUnmarshalMapWithConfig_ClosesCustomParsers(t *testing.T) {
+	t.Run("success path", func(t *testing.T) {
+		format := nextTestFormat()
+		closed := &atomic.Int32{}
+		if err := RegisterParser(format, func(cfg Config, factory *ComponentFactory) (EnvParser, error) {
+			return &closingParser{closed: closed}, nil
+		}); err != nil {
+			t.Fatalf("RegisterParser() error = %v", err)
+		}
+
+		cfg := DefaultConfig()
+		if _, err := UnmarshalMapWithConfig(cfg, "A=1", format); err != nil {
+			t.Fatalf("UnmarshalMapWithConfig() error = %v", err)
+		}
+		if got := closed.Load(); got != 1 {
+			t.Errorf("parser Close calls after success = %d, want 1", got)
+		}
+	})
+
+	t.Run("parse error path", func(t *testing.T) {
+		format := nextTestFormat()
+		closed := &atomic.Int32{}
+		if err := RegisterParser(format, func(cfg Config, factory *ComponentFactory) (EnvParser, error) {
+			return &closingParser{closed: closed, parseErr: errors.New("boom")}, nil
+		}); err != nil {
+			t.Fatalf("RegisterParser() error = %v", err)
+		}
+
+		cfg := DefaultConfig()
+		if _, err := UnmarshalMapWithConfig(cfg, "A=1", format); err == nil {
+			t.Fatal("UnmarshalMapWithConfig() error = nil, want parse error")
+		}
+		if got := closed.Load(); got != 1 {
+			t.Errorf("parser Close calls after parse error = %d, want 1", got)
+		}
+	})
+}
+
+// closingParser is a minimal EnvParser whose Close calls are counted.
+type closingParser struct {
+	closed   *atomic.Int32
+	parseErr error
+}
+
+func (p *closingParser) Parse(r io.Reader, filename string) (map[string]string, error) {
+	if p.parseErr != nil {
+		return nil, p.parseErr
+	}
+	return map[string]string{"A": "1"}, nil
+}
+
+func (p *closingParser) Close() error {
+	p.closed.Add(1)
+	return nil
 }
 
 // ============================================================================

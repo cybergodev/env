@@ -93,6 +93,14 @@ type ChannelAuditHandler = internal.ChannelHandler
 //	        fmt.Println(event)
 //	    }
 //	}()
+//
+// Close-ordering hazard: the handler does not own ch and cannot observe the
+// caller closing it, so a send racing an early close panics (send on a
+// closed channel). Close ch only after the auditor/Loader using this handler
+// is closed and no Log call can be in flight; keep a consumer draining for
+// as long as the auditor is open (a full channel otherwise blocks Log — and
+// with it Loader cleanup). For a handler-owned channel lifecycle use
+// NewCloseableChannelHandler instead.
 func NewChannelAuditHandler(ch chan<- AuditEvent) *ChannelAuditHandler {
 	return internal.NewChannelHandler(ch)
 }

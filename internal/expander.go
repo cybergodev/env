@@ -1040,8 +1040,11 @@ func (e *Expander) ExpandAllInMap(vars map[string]string, noExpand map[string]st
 	}
 	sort.Strings(keys)
 
-	// Pre-allocate result map with exact size
-	result := make(map[string]string, len(vars)+len(assignments))
+	// Pre-allocate the result map. ':=' write-backs happen inside the loop
+	// below, so assignments is still empty here — len(vars) is the honest
+	// floor, and the map grows naturally when write-backs add keys (bounded
+	// afterwards by the HardMaxVariables check).
+	result := make(map[string]string, len(vars))
 
 	// Expand all values using the cached expander
 	for _, key := range keys {

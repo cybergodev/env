@@ -8,10 +8,56 @@ import (
 	"errors"
 	"fmt"
 	"reflect"
+	"runtime/debug"
 	"strconv"
 	"strings"
 	"time"
 )
+
+// ============================================================================
+// Panic containment for struct-field (un)marshaler callbacks (SEC-003)
+// ============================================================================
+
+// The three safe* helpers mirror the root package's component wrappers (see
+// recovering.go) and internal.safeHandlerLog: struct-field marshalers are
+// user-supplied code reached reflectively, and a panic in them surfaces as an
+// error from the public API (ParseInto, UnmarshalInto, Marshal, MarshalStruct)
+// instead of crashing the process. The stack is included so the user-code
+// fault stays debuggable.
+
+func panicError(component string, r any) error {
+	return fmt.Errorf("%s panicked: %v\n%s", component, r, debug.Stack())
+}
+
+// safeMarshalText invokes a TextMarshaler with panic containment.
+func safeMarshalText(m encoding.TextMarshaler) (data []byte, err error) {
+	defer func() {
+		if r := recover(); r != nil {
+			data, err = nil, panicError("MarshalText callback", r)
+		}
+	}()
+	return m.MarshalText()
+}
+
+// safeMarshalJSON invokes a json.Marshaler with panic containment.
+func safeMarshalJSON(m json.Marshaler) (data []byte, err error) {
+	defer func() {
+		if r := recover(); r != nil {
+			data, err = nil, panicError("MarshalJSON callback", r)
+		}
+	}()
+	return m.MarshalJSON()
+}
+
+// safeUnmarshalText invokes a TextUnmarshaler with panic containment.
+func safeUnmarshalText(u encoding.TextUnmarshaler, text []byte) (err error) {
+	defer func() {
+		if r := recover(); r != nil {
+			err = panicError("UnmarshalText callback", r)
+		}
+	}()
+	return u.UnmarshalText(text)
+}
 
 // Struct converts a struct to environment variables.
 // Struct fields can be tagged with `env:"KEY"` to specify the env variable name.
@@ -87,8 +133,15 @@ func marshalStruct(v interface{}, prefix string, depth int) (map[string]string, 
 			continue
 		}
 
-		// Determine the key
+		// Determine the key. The inline default form `env:"KEY,envDefault:V"`
+		// contributes only KEY: structInto parses the same form, and emitting
+		// the full tag as the key previously produced unusable entries (and a
+		// later MarshalError at .env emission, where ',' fails the key
+		// pattern).
 		key := tag
+		if idx := strings.Index(tag, ",envDefault:"); idx >= 0 {
+			key = tag[:idx]
+		}
 		if key == "" {
 			key = ToUpperASCII(fieldType.Name)
 		}
@@ -274,7 +327,7 @@ func valueToString(v reflect.Value) (string, error) {
 	if v.CanInterface() {
 		// Check for TextMarshaler
 		if tm, ok := v.Interface().(encoding.TextMarshaler); ok {
-			data, err := tm.MarshalText()
+			data, err := safeMarshalText(tm)
 			if err != nil {
 				return "", err
 			}
@@ -283,7 +336,7 @@ func valueToString(v reflect.Value) (string, error) {
 
 		// Check for JSON marshaler for complex types
 		if jm, ok := v.Interface().(json.Marshaler); ok {
-			data, err := jm.MarshalJSON()
+			data, err := safeMarshalJSON(jm)
 			if err != nil {
 				return "", err
 			}
@@ -369,6 +422,26 @@ func valueToString(v reflect.Value) (string, error) {
 			}
 			return sb.String(), nil
 		}
+		// Handle []time.Duration — rendered via Duration.String(), the exact
+		// form setSliceValue's duration branch parses back. Previously this
+		// fell to "unsupported slice type" while GetSlice[time.Duration]
+		// parsed the same value fine (the same layer inconsistency the bool
+		// grammar unification removed).
+		if v.Type().Elem().String() == "time.Duration" {
+			n := v.Len()
+			if n == 0 {
+				return "", nil
+			}
+			sb := GetBuilder()
+			defer PutBuilder(sb)
+			for i := 0; i < n; i++ {
+				if i > 0 {
+					sb.WriteByte(',')
+				}
+				sb.WriteString(time.Duration(v.Index(i).Int()).String())
+			}
+			return sb.String(), nil
+		}
 		return "", &MarshalError{
 			Field:   "slice",
 			Message: "unsupported slice type",
@@ -451,7 +524,7 @@ func setFieldValue(field reflect.Value, value string) error {
 	// Check for TextUnmarshaler
 	if field.CanAddr() {
 		if tu, ok := field.Addr().Interface().(encoding.TextUnmarshaler); ok {
-			return tu.UnmarshalText([]byte(value))
+			return safeUnmarshalText(tu, []byte(value))
 		}
 	}
 
@@ -537,6 +610,18 @@ func setSliceValue(field reflect.Value, value string) error {
 		case reflect.String:
 			slice.Index(i).SetString(part)
 		case reflect.Int, reflect.Int8, reflect.Int16, reflect.Int32, reflect.Int64:
+			// time.Duration elements parse as durations — the same special
+			// case setFieldValue applies to scalar fields, keeping the
+			// struct-mapping layer at parity with GetSlice's element
+			// grammar.
+			if field.Type().Elem().String() == "time.Duration" {
+				d, derr := time.ParseDuration(part)
+				if derr != nil {
+					return convError("duration", derr)
+				}
+				slice.Index(i).SetInt(int64(d))
+				continue
+			}
 			// Bit width of the element type — parsing at the element's own
 			// width makes out-of-range values an error instead of a silent
 			// truncate on Set (same rationale as setFieldValue). Bits() is

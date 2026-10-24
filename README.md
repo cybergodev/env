@@ -117,8 +117,8 @@ if !exists {
 // CRUD operations
 if err := env.Set("KEY", "value"); err != nil { /* handle */ }
 if err := env.Delete("KEY"); err != nil { /* handle */ }
-keys := env.Keys()                // Get all keys
-all := env.All()                  // Get all variables as map
+keys  := env.Keys()               // Get all keys
+all   := env.All()                // Get all variables as map
 count := env.Len()                // Variable count
 ```
 
@@ -302,6 +302,7 @@ MESSAGE="Hello World"
 SINGLE='Single quotes work too'
 
 # Variable expansion
+HOST=localhost
 URL=${HOST}:${PORT:-443}
 ```
 
@@ -333,6 +334,27 @@ ports: [8080, 8081]
 
 **Access:** Same as JSON - use dot notation or uppercase underscore format.
 
+> **Values containing `": "` must be quoted.** A plain (unquoted) YAML value
+> may not contain a colon followed by whitespace — YAML reads it as a nested
+> key. Such a line is now rejected with a `YAMLError` instead of being split
+> into two entries. Quote the value (`'...'` or `"..."`) to keep it literal:
+>
+> ```yaml
+> # REJECTED: "Expires: ..." would be read as a second key
+> apnews.com: sid=1; Expires: Wed, 21 Oct 2015 07:28:00 GMT
+>
+> # OK
+> apnews.com: 'sid=1; Expires: Wed, 21 Oct 2015 07:28:00 GMT'
+> ```
+>
+> Inline JSON/flow regions (`{...}`, `[...]`) are exempt: `": "` inside them
+> is data, so `g_state={"i_l": 0}` and `{"a": "b: c"}` load as written.
+> Empty keys, bare scalar lines, and text left after a closing quote are
+> likewise rejected rather than silently dropped.
+> Values starting with `{` or `[` that form a complete flow collection
+> flatten into prefixed/indexed keys (`k: {"a": 1}` → `K_A`); quote them to
+> keep the text as one string.
+
 ---
 
 ## 🔄 Serialization / Deserialization
@@ -357,6 +379,16 @@ env.UnmarshalInto(m, &config)               // Map to struct
 // String directly to struct
 env.UnmarshalStruct("PORT=8080\nDEBUG=true", &config, env.FormatEnv)
 ```
+
+> **Marshal rejects keys the loader would reject.** Every emitted document
+> must be loadable by this library, so `Marshal` fails with `*MarshalError`
+> on a key its own reader refuses: `.env` output requires the `.env` key
+> grammar (`^[A-Za-z][A-Za-z0-9_]*$`), YAML/JSON output the flattened key
+> space (letters, digits, `_`, `@`, `-`, `.`). A store can legitimately hold
+> wider keys — `Loader.Set` accepts dotted names and YAML loads store literal
+> keys like `APNEWS.COM` — so pick a format whose reader accepts them, or
+> rename the key. Use `errors.Is(err, env.ErrInvalidKey)`-style checks via
+> `env.IsMarshalError(err)`.
 
 ---
 
@@ -630,7 +662,8 @@ cfg.ExpansionScope     = env.ExpansionFileOnly    // ${VAR} resolves from file v
 // === JSON Options (JSONConfig) ===
 cfg.JSONNullAsEmpty    = true
 cfg.JSONNumberAsString = true
-cfg.JSONBoolAsString   = true
+// cfg.JSONBoolAsString — deprecated, no effect: JSON bools always render
+// "true"/"false" canonically. Left false (the default).
 cfg.JSONMaxDepth       = 16
 
 // === YAML Options (YAMLConfig) ===
@@ -775,6 +808,7 @@ instance counterpart by design.
 | `NewSecureValueStrict(string)` | Create SecureValue with error on lock failure |
 | `ResetDefaultLoader()` | Reset singleton for testing (returns error) |
 | `ClearBytes([]byte)` | Securely zero byte slice |
+| `ClearInternCache()` | Release the .env key-interning cache (between parse bursts) |
 | `SetMemoryLockEnabled(bool)` | Enable/disable memory locking |
 | `IsMemoryLockEnabled()` | Check if memory locking is enabled |
 | `SetMemoryLockStrict(bool)` | Enable strict mode for lock failures |

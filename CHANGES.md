@@ -4,6 +4,30 @@ All notable changes to the cybergodev/env library will be documented in this fil
 
 ---
 
+## v1.3.1 - Panic Containment & YAML Correctness (2026-10-25)
+
+### Added
+- Panic containment for every config-injected component — a panic in a custom `Validator`/`Expander`/`Auditor`/`FileSystem`/parser or a struct-field (un)marshaler callback surfaces as an error instead of crashing the process
+- `ClearInternCache()` — exported release knob for long-running applications to clear the key-intern cache
+- CI fuzz job — 30s mutation fuzzing per PR for the `.env`/JSON/YAML parsers (previously an audit-time-only exercise)
+
+### Fixed
+- Custom `KeyPattern`s no longer have to match a literal sample key — namespace patterns like `^MYAPP_[A-Z0-9_]*$` are accepted; unsafe patterns (empty, numeric-start, `=`/`:`/control chars) remain rejected
+- Path validation for injected (non-OS) filesystems no longer consults the host disk, so a custom-FS load can no longer be accepted or rejected based on files outside the injected boundary
+- `[]time.Duration` struct fields round-trip through `ParseInto`/`MarshalStruct`, symmetric with `GetSlice[time.Duration]`
+- `MarshalStruct` emits only the `KEY` from `env:"KEY,envDefault:V"` tags instead of the whole tag string as the map key
+- `UnmarshalMapWithConfig` closes custom parsers (`io.Closer`) on both the success and the parse-error path
+- `Set` with `AutoApply` audit-logs `os.Setenv` failures, matching `Apply`'s failure branch
+- YAML values containing `': '` (cookie-style inline objects) no longer corrupt or drop their file; glued-colon lines (`localhost:8080`) and unknown double-quoted escapes are preserved
+
+### Changed
+- `JSONBoolAsString` is deprecated and its default is now `false` — it has never affected JSON output (JSON bools always render `"true"`/`"false"` canonically)
+- `Loader.Validate` builds its uppercase-key index through the shared pool instead of allocating a fresh map per call
+- Package and Global Mode docs clarify the uninitialized-vs-closed error split (`ErrNotInitialized` vs `ErrClosed`) and the `AutoApply` divergence between `Load`/`New`
+- `ComponentConfig` documents the panic contract for custom components; `NewChannelAuditHandler` documents the channel close-ordering hazard
+
+---
+
 ## v1.3.0 - Security Hardening, Duplicate-Key Policy & YAML Correctness (2026-10-22)
 
 ### Added

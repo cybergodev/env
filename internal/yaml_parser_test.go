@@ -522,6 +522,98 @@ func TestParseYAML_RootSequenceErrors(t *testing.T) {
 	}
 }
 
+// TestParseYAML_SilentDataLossErrors pins the four shapes that used to load a
+// fraction of the document while reporting success: a bare scalar line, an
+// unquoted ": " inside a plain value, an empty mapping key, and a value
+// followed by leftover text on the same line. Each is malformed YAML (PyYAML
+// rejects the middle three and parses the first as a non-mapping document,
+// which this library does not support), so each must fail loudly instead of
+// silently dropping data.
+func TestParseYAML_SilentDataLossErrors(t *testing.T) {
+	tests := []struct {
+		name  string
+		input string
+	}{
+		{"bare scalar line in mapping", "just text here\nother: keep\n"},
+		{"colon+space inside plain value", "apnews.com: Code=abc; note: keep\n"},
+		{"value ending with a colon", "k: abc:\n"},
+		{"empty mapping key", "\"\": v\n"},
+		{"junk after a quoted value", "k: \"abc\" junk\n"},
+		{"unquoted apostrophe truncates a quoted value", "k: 'it's fine'\n"},
+		{"root flow collection", "{a: 1, b: 2}\n"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			value, err := ParseYAML([]byte(tt.input), 10)
+			if err == nil {
+				if value != nil {
+					ReleaseValue(value)
+				}
+				t.Fatalf("ParseYAML(%q) succeeded, want an error (data would be dropped silently)", tt.input)
+			}
+		})
+	}
+}
+
+// TestParseYAML_QuotedFormsStayLoadable pins the escape hatch: every shape
+// rejected above becomes a literal value once quoted, so callers keep a
+// documented fix.
+func TestParseYAML_QuotedFormsStayLoadable(t *testing.T) {
+	tests := []struct {
+		name  string
+		input string
+		key   string
+		want  string
+	}{
+		{"single-quoted colon+space", "k: 'a: b'\n", "k", "a: b"},
+		{"double-quoted colon+space", "k: \"a: b\"\n", "k", "a: b"},
+		{"single-quoted apostrophe", "k: 'it''s fine'\n", "k", "it's fine"},
+		{"block scalar keeps content", "k: |-\n  a: b\n", "k", "a: b"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			value, err := ParseYAML([]byte(tt.input), 10)
+			if err != nil {
+				t.Fatalf("ParseYAML(%q) error = %v", tt.input, err)
+			}
+			defer ReleaseValue(value)
+			got := value.Map[tt.key]
+			if got == nil || got.Scalar != tt.want {
+				t.Errorf("%s = %v, want %q", tt.key, got, tt.want)
+			}
+		})
+	}
+}
+
+// TestParseYAML_IndentedCommentKeepsSiblings pins the comment/indent fix: a
+// comment-only line never changes the indent level, so an indented comment
+// between two keys does not close the enclosing map and drop everything after
+// it.
+func TestParseYAML_IndentedCommentKeepsSiblings(t *testing.T) {
+	for _, input := range []string{
+		"k: v\n  # note\nb: 2\n",
+		"k: v\n    # deeper note\nb: 2\n",
+		"parent:\n  a: 1\n    # note\n  b: 2\nafter: 3\n",
+	} {
+		value, err := ParseYAML([]byte(input), 10)
+		if err != nil {
+			t.Fatalf("ParseYAML(%q) error = %v", input, err)
+		}
+		ReleaseValue(value)
+	}
+
+	value, err := ParseYAML([]byte("k: v\n  # note\nb: 2\n"), 10)
+	if err != nil {
+		t.Fatalf("ParseYAML() error = %v", err)
+	}
+	defer ReleaseValue(value)
+	if value.Map["b"] == nil || value.Map["b"].Scalar != "2" {
+		t.Errorf("b = %v, want 2 (a comment line must not end the mapping)", value.Map["b"])
+	}
+}
+
 func TestParseYAML_Complex(t *testing.T) {
 	data := []byte(`
 app:
@@ -774,10 +866,11 @@ func mkKey(v string, indent int) Token {
 // inline maps and dashes as values, and depth-limit error propagation.
 func TestYAMLParser_TokenLevelBranches(t *testing.T) {
 	tests := []struct {
-		name   string
-		tokens []Token
-		maxDep int
-		check  func(t *testing.T, root *Value)
+		name    string
+		tokens  []Token
+		maxDep  int
+		wantErr bool
+		check   func(t *testing.T, root *Value)
 	}{
 		{
 			name:   "key below expected indent ends nested map",
@@ -816,14 +909,12 @@ func TestYAMLParser_TokenLevelBranches(t *testing.T) {
 			},
 		},
 		{
-			name:   "key directly after key parses as inline nested map",
-			tokens: []Token{mkKey("K", 0), mkKey("N", 1), {Type: TokenValue, Value: "v"}},
-			check: func(t *testing.T, root *Value) {
-				k := root.Map["K"]
-				if k == nil || k.Type != ValueTypeMap || k.Map["N"] == nil {
-					t.Errorf("K = %v, want inline nested map with N", k)
-				}
-			},
+			// A second key on the SAME line means the plain scalar carried a
+			// ": " of its own ("k: a: b"), which YAML rejects; the parser must
+			// not turn one value into two entries.
+			name:    "second key on the same line is an error",
+			tokens:  []Token{mkKey("K", 0), mkKey("N", 0), {Type: TokenValue, Value: "v"}},
+			wantErr: true,
 		},
 		{
 			name:   "EOF right after key indent yields empty scalar",
@@ -845,13 +936,21 @@ func TestYAMLParser_TokenLevelBranches(t *testing.T) {
 			},
 		},
 		{
-			name:   "unexpected token in nested value yields scalar",
-			tokens: []Token{mkKey("K", 0), {Type: TokenIndent, Indent: 1}, {Type: TokenColon}},
-			check: func(t *testing.T, root *Value) {
-				if root.Map["K"] == nil || root.Map["K"].Scalar != "" {
-					t.Errorf("K = %v, want empty scalar for unknown token", root.Map["K"])
-				}
-			},
+			// parseNestedValue yields an empty scalar for the unknown token
+			// (defensive branch: TokenColon is never emitted by the lexer),
+			// but the token itself is then still pending at mapping level —
+			// which is now an error instead of a silent skip, so no entry can
+			// disappear without a signal.
+			name:    "unexpected token in nested value is an error",
+			tokens:  []Token{mkKey("K", 0), {Type: TokenIndent, Indent: 1}, {Type: TokenColon}, {Type: TokenEOF}},
+			wantErr: true,
+		},
+		{
+			// The token stream holds a value where the mapping expects an
+			// entry; the parser used to skip it, dropping data silently.
+			name:    "stray value token in mapping context is an error",
+			tokens:  []Token{mkKey("K", 0), {Type: TokenValue, Value: "v"}, {Type: TokenValue, Value: "stray"}},
+			wantErr: true,
 		},
 		{
 			name:   "dash then EOF yields array with empty scalar",
@@ -895,6 +994,12 @@ func TestYAMLParser_TokenLevelBranches(t *testing.T) {
 				// Depth-limit case: expect an error.
 				if err == nil {
 					t.Fatal("Parse() error = nil, want depth-limit error")
+				}
+				return
+			}
+			if tt.wantErr {
+				if err == nil {
+					t.Fatal("Parse() error = nil, want an error for the malformed mapping")
 				}
 				return
 			}

@@ -31,7 +31,8 @@ func NewPathValidator(cfg PathValidatorConfig) *PathValidator {
 }
 
 // Validate validates a file path for security.
-// It checks for path traversal attempts and other potentially dangerous patterns.
+// It applies every rule of ValidateStatic and then resolves symlinks against
+// the real file system to prevent symlink escape attacks (see validateSymlinks).
 //
 // Security checks performed:
 //   - Empty filename
@@ -44,6 +45,24 @@ func NewPathValidator(cfg PathValidatorConfig) *PathValidator {
 //   - Windows reserved device names
 //   - Symlink escape attacks
 func (v *PathValidator) Validate(filename string) error {
+	if err := v.ValidateStatic(filename); err != nil {
+		return err
+	}
+	// SECURITY: Resolve and validate symlinks to prevent symlink escape attacks
+	// A symlink within the allowed directory could point outside the intended scope
+	return v.validateSymlinks(filepath.Clean(filename))
+}
+
+// ValidateStatic applies every disk-free path rule of Validate: the empty,
+// null-byte, URL-encoding, control-character, UNC/network, rooted-path,
+// drive-letter, traversal, reserved-device-name and (on Windows) alternate
+// data stream checks. It performs NO syscalls — in particular no
+// filepath.EvalSymlinks — which makes it the validation used for injected
+// (non-OS) file systems: resolving symlinks there would consult the host
+// disk that the injected file system never reads, making validation outcomes
+// depend on files outside the injected boundary. The injected file system's
+// own Open is the final arbiter of what exists.
+func (v *PathValidator) ValidateStatic(filename string) error {
 	if filename == "" {
 		return &SecurityError{
 			Action: "file_access",
@@ -166,9 +185,7 @@ func (v *PathValidator) Validate(filename string) error {
 		}
 	}
 
-	// SECURITY: Resolve and validate symlinks to prevent symlink escape attacks
-	// A symlink within the allowed directory could point outside the intended scope
-	return v.validateSymlinks(cleanPath)
+	return nil
 }
 
 // reservedDeviceNames and reservedPseudoDevices are the Windows reserved
@@ -373,4 +390,12 @@ var DefaultPathValidator = NewPathValidator(PathValidatorConfig{})
 // This is a convenience function for backward compatibility.
 func ValidateFilePath(filename string) error {
 	return DefaultPathValidator.Validate(filename)
+}
+
+// ValidateFilePathStatic validates a file path using the default validator's
+// static (disk-free) rules only — every rule of ValidateFilePath except the
+// symlink resolution, which reads the real file system. See
+// PathValidator.ValidateStatic for when this is the right fidelity.
+func ValidateFilePathStatic(filename string) error {
+	return DefaultPathValidator.ValidateStatic(filename)
 }

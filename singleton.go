@@ -36,6 +36,12 @@ func getDefaultLoader() (*Loader, error) {
 // This function is intended for use in tests to ensure isolation between test cases.
 // It is safe for concurrent use.
 //
+// This is the Global Mode counterpart of Loader.Close: it closes and clears
+// the shared default loader and unregisters it. There is no env.Close()
+// function; after ResetDefaultLoader returns, the package-level functions
+// behave as if never initialized (see ErrNotInitialized) until Load/
+// Overload/LoadWithConfig is called again.
+//
 // Returns any error that occurred while closing the old loader.
 // A nil return value indicates either no loader was set or it was closed successfully.
 //

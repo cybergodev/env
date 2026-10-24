@@ -166,6 +166,14 @@ func escapeValueToBuilder(buf *strings.Builder, value string) {
 // quoted keys), so a key that would change tokenization on re-parse must
 // fail the marshal instead of producing output that re-parses as different
 // — potentially attacker-chosen — lines (SEC-06, CWE-74).
+//
+// The character checks below are the syntactic half; the final gate is the
+// reader's own key grammar (validateDefaultKeyScan, the same scan ValidateKey
+// applies to every .env line). Without it a map holding a key the .env loader
+// rejects — "apnews.com", "api-key", "user@host": all legal in the store,
+// since Loader.Set and the structured formats accept the IsValidJSONKey space
+// — marshaled successfully into a file this library then refused to load. The
+// writer and the reader must agree on what a key may be (SEC-06).
 func validateEnvKeyForMarshal(key string) error {
 	if key == "" {
 		return &MarshalError{Field: "key", Message: "key cannot be empty"}
@@ -188,6 +196,9 @@ func validateEnvKeyForMarshal(key string) error {
 	if key[0] == ' ' || key[len(key)-1] == ' ' {
 		return &MarshalError{Field: "key", Message: "key has leading or trailing whitespace, which would be trimmed on re-parse"}
 	}
+	if valid, _ := validateDefaultKeyScan(key); !valid {
+		return &MarshalError{Field: "key", Message: "key does not match the .env key pattern (^[A-Za-z][A-Za-z0-9_]*$) and would be rejected on re-parse"}
+	}
 	return nil
 }
 
@@ -196,7 +207,9 @@ func validateEnvKeyForMarshal(key string) error {
 // control characters, a ':' that terminates the key token (followed by
 // whitespace or end of key), a comment-starting '#' (at the start or after
 // whitespace), an array-item prefix ("- "), or leading/trailing whitespace
-// that would be trimmed on re-parse (SEC-06, CWE-74).
+// that would be trimmed on re-parse (SEC-06, CWE-74). The key must also
+// satisfy the reader's structured key grammar (IsValidJSONKey), so the
+// emitted file is one this library can load back (SEC-06).
 func validateYAMLKeyForMarshal(key string) error {
 	if key == "" {
 		return &MarshalError{Field: "key", Message: "key cannot be empty"}
@@ -218,6 +231,9 @@ func validateYAMLKeyForMarshal(key string) error {
 	}
 	if key[0] == ' ' || key[len(key)-1] == ' ' {
 		return &MarshalError{Field: "key", Message: "key has leading or trailing whitespace, which would be trimmed on re-parse"}
+	}
+	if !IsValidJSONKey(key) {
+		return &MarshalError{Field: "key", Message: "key does not match the loader's key pattern (letters, digits, '_', '@', '-', '.') and would be rejected on re-parse"}
 	}
 	return nil
 }

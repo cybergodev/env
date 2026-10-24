@@ -45,6 +45,16 @@ import (
 //   - Keys/All/Len/GetSecure: return nil/0
 //   - Set/Delete/Validate/ParseInto: return ErrNotInitialized
 //
+// ErrNotInitialized here is distinct from the ErrClosed a nil/closed Loader
+// returns from its methods: these two states (no default loader vs a closed
+// instance) are different. getDefaultLoader only hands out the live
+// singleton, so Global Mode never surfaces ErrClosed for a merely missing
+// initialization; the one exception is a concurrent ResetDefaultLoader
+// closing the singleton after it was fetched, after which a mutator reports
+// ErrClosed like its instance counterpart. The default loader is released
+// with ResetDefaultLoader, which closes and clears it — there is no
+// env.Close().
+//
 // ============================================================================
 
 // withLoader executes a function with the default loader.

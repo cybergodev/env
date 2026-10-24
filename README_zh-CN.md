@@ -117,8 +117,8 @@ if !exists {
 // CRUD 操作
 if err := env.Set("KEY", "value"); err != nil { /* 处理错误 */ }
 if err := env.Delete("KEY"); err != nil { /* 处理错误 */ }
-keys := env.Keys()                // 获取所有键
-all := env.All()                  // 获取所有变量为 map
+keys  := env.Keys()               // 获取所有键
+all   := env.All()                // 获取所有变量为 map
 count := env.Len()                // 变量数量
 ```
 
@@ -294,6 +294,7 @@ MESSAGE="Hello World"
 SINGLE='单引号也可以'
 
 # 变量展开
+HOST=localhost
 URL=${HOST}:${PORT:-443}
 ```
 
@@ -325,6 +326,24 @@ ports: [8080, 8081]
 
 **访问方式：** 与 JSON 相同 - 使用点号语法或大写下划线格式。
 
+> **值中含 `": "` 时必须加引号。** 未加引号的 YAML 纯量值不能包含「冒号+空白」——
+> YAML 会把它读成嵌套键。这类行现在会以 `YAMLError` 报错，而不是被静默拆成两个变量。
+> 用 `'...'` 或 `"..."` 包住即可保留原值：
+>
+> ```yaml
+> # 报错："Expires: ..." 会被当成第二个键
+> apnews.com: sid=1; Expires: Wed, 21 Oct 2015 07:28:00 GMT
+>
+> # 正确
+> apnews.com: 'sid=1; Expires: Wed, 21 Oct 2015 07:28:00 GMT'
+> ```
+>
+> 行内 JSON / flow 区（`{...}`、`[...]`）不受影响：其中的 `": "` 是数据，
+> `g_state={"i_l": 0}`、`{"a": "b: c"}` 均原样读取。空键、裸标量行、
+> 闭合引号之后的残留文本同样会报错，不再静默丢弃。
+> 以 `{`/`[` 开头且构成完整 flow 集合的值会展开为前缀/下标键
+> （`k: {"a": 1}` → `K_A`）；若要保留为一个字符串，请加引号。
+
 ---
 
 ## 🔄 序列化 / 反序列化
@@ -349,6 +368,14 @@ env.UnmarshalInto(m, &config)               // map 转结构体
 // 字符串直接转结构体
 env.UnmarshalStruct("PORT=8080\nDEBUG=true", &config, env.FormatEnv)
 ```
+
+> **Marshal 会拒绝加载器本就拒绝的键。** 输出文档必须能被本库自身加载，
+> 因此当键不被对应读取器接受时，`Marshal` 返回 `*MarshalError`：
+> `.env` 输出要求 `.env` 键语法（`^[A-Za-z][A-Za-z0-9_]*$`），
+> YAML/JSON 输出要求展平键空间（字母、数字、`_`、`@`、`-`、`.`）。
+> 变量表中可以合法存在更宽的键（`Loader.Set` 接受带点键名，YAML 加载会存下
+> `APNEWS.COM` 这类字面键），此时请选择读取器接受的格式，或重命名该键。
+> 用 `env.IsMarshalError(err)` 判断错误类型。
 
 ---
 
@@ -613,7 +640,8 @@ cfg.ExpansionScope     = env.ExpansionFileOnly    // ${VAR} 仅从文件内变�
 // === JSON 选项（JSONConfig）===
 cfg.JSONNullAsEmpty    = true
 cfg.JSONNumberAsString = true
-cfg.JSONBoolAsString   = true
+// cfg.JSONBoolAsString — 已弃用，无效果：JSON 布尔值始终按规范渲染
+// "true"/"false"。保持默认值 false。
 cfg.JSONMaxDepth       = 16
 
 // === YAML 选项（YAMLConfig）===
@@ -751,6 +779,7 @@ if errors.As(err, &parseErr) {
 | `NewSecureValueStrict(string)` | 创建 SecureValue，锁定失败时返回错误 |
 | `ResetDefaultLoader()` | 重置单例（测试用，返回 error） |
 | `ClearBytes([]byte)` | 安全清零字节切片 |
+| `ClearInternCache()` | 释放 .env 键驻留缓存（在解析高峰之间调用） |
 | `SetMemoryLockEnabled(bool)` | 启用/禁用内存锁定 |
 | `IsMemoryLockEnabled()` | 检查内存锁定是否启用 |
 | `SetMemoryLockStrict(bool)` | 启用锁定失败的严格模式 |

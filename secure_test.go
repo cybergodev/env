@@ -892,9 +892,10 @@ func TestLoader_NilMethodCalls(t *testing.T) {
 
 // TestBuildAuditorAdapter keeps the factory.go branch with no runtime
 // equivalent elsewhere: a custom auditor implementing FullAuditLogger is
-// passed through unwrapped. (The former "non-standard auditor" case was
-// removed — TestSetDelete_AuditGating in loader_test.go drives the same
-// wrapper end to end through New and asserts event routing.)
+// returned as a FullAuditLogger (since SEC-003 via the recovering wrapper,
+// which delegates the extended methods directly). (The former "non-standard
+// auditor" case was removed — TestSetDelete_AuditGating in loader_test.go
+// drives the same wrapper end to end through New and asserts event routing.)
 func TestBuildAuditorAdapter(t *testing.T) {
 	cfg := DefaultConfig()
 	cfg.CustomAuditor = &mockFullAuditLogger{}

@@ -49,7 +49,7 @@ func TestConfigPresets(t *testing.T) {
 			t.Error("AuditEnabled should be false")
 		}
 		// JSON/YAML
-		if !cfg.JSONNullAsEmpty || !cfg.JSONNumberAsString || !cfg.JSONBoolAsString || cfg.JSONMaxDepth != defaultStructuredMaxDepth {
+		if !cfg.JSONNullAsEmpty || !cfg.JSONNumberAsString || cfg.JSONBoolAsString || cfg.JSONMaxDepth != defaultStructuredMaxDepth {
 			t.Error("JSON defaults incorrect")
 		}
 		if !cfg.YAMLNullAsEmpty || !cfg.YAMLNumberAsString || !cfg.YAMLBoolAsString || cfg.YAMLMaxDepth != defaultStructuredMaxDepth {
@@ -194,10 +194,12 @@ func TestValidateKeyPattern(t *testing.T) {
 		{name: "nil pattern uses the default validation", pattern: nil, wantValid: true},
 		{name: "uppercase pattern is valid", pattern: regexp.MustCompile(`^[A-Z][A-Z0-9_]*$`), wantValid: true},
 		{
-			name:      "pattern not matching TEST_KEY is rejected",
-			pattern:   regexp.MustCompile(`^[a-z]+$`),
-			wantValid: false,
-			wantRule:  "valid_pattern",
+			// Namespace-style patterns need not match any particular sample
+			// key; validation only rejects patterns that would accept unsafe
+			// keys (the probes below).
+			name:      "namespace pattern not matching TEST_KEY is accepted",
+			pattern:   regexp.MustCompile(`^MYAPP_[A-Z0-9_]*$`),
+			wantValid: true,
 		},
 		{
 			name:      "pattern allowing numeric start is rejected",

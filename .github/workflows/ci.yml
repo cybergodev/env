@@ -65,3 +65,26 @@ jobs:
           go tool cover -func=coverage.out | tail -1
           go tool cover -func=coverage.out | tail -1 | awk \
             '{sub(/%/, "", $3); if ($3 + 0 < 90) { print "coverage below 90%: " $3 "%"; exit 1 }}'
+
+  fuzz:
+    name: Fuzz (30s × 3 targets)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      # GEN-001: the seed corpus runs in every `go test`, but long mutation
+      # fuzzing was previously a one-off audit-time exercise. Running each of
+      # the three parser targets for 30s on every PR keeps the hand-rolled
+      # YAML lexer/parser and both flatteners under continuous fuzz coverage.
+      # One target per invocation: Go runs only the single -fuzz target named.
+      - name: Fuzz .env parser
+        run: go test -run=^$ -fuzz=FuzzParseEnv -fuzztime=30s ./...
+      - name: Fuzz JSON parser
+        run: go test -run=^$ -fuzz=FuzzParseJSON -fuzztime=30s ./...
+      - name: Fuzz YAML parser
+        run: go test -run=^$ -fuzz=FuzzParseYAML -fuzztime=30s ./...

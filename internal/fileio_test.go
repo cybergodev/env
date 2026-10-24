@@ -113,12 +113,17 @@ func TestMarshalEnv_KeyValidation(t *testing.T) {
 		{"export prefix", "export PATH", true},
 		{"leading space", " KEY", true},
 		{"trailing space", "KEY ", true},
-		// Pinning actual behavior: an INTERIOR space does not trip the
-		// validator — only leading/trailing whitespace is stripped by the
-		// .env parser, so "BAD KEY=..." round-trips verbatim and marshals
-		// successfully.
-		{"interior space passes", "BAD KEY", false},
+		// The reader's own grammar is the final gate: a key the .env loader
+		// rejects must not be emitted, or the writer produces files this
+		// library refuses to load (SEC-06). Interior spaces, dots, hyphens
+		// and '@' all fail ^[A-Za-z][A-Za-z0-9_]*$ on reload.
+		{"interior space", "BAD KEY", true},
+		{"dotted key", "apnews.com", true},
+		{"hyphenated key", "api-key", true},
+		{"at-sign key", "user@host", true},
+		{"leading digit", "1KEY", true},
 		{"plain key", "GOOD_KEY", false},
+		{"key with digits", "KEY_2", false},
 	}
 
 	for _, tt := range tests {
@@ -369,10 +374,18 @@ func TestMarshalToYAML_KeyValidation(t *testing.T) {
 		{"array-item prefix", "- ITEM", true},
 		{"leading space", " KEY", true},
 		{"trailing space", "KEY ", true},
-		// A colon or '#' NOT at a token boundary is part of the key.
-		{"interior colon passes", "A:B", false},
-		{"interior hash passes", "A#B", false},
+		// Syntactically plain, but the loader's structured key grammar
+		// (IsValidJSONKey) rejects them on re-parse — so they must not be
+		// emitted either (SEC-06: writer and reader agree on the key space).
+		{"interior colon", "A:B", true},
+		{"interior hash", "A#B", true},
+		{"space inside key", "A B", true},
+		{"plus sign", "A+B", true},
+		// Loader-legal keys pass.
 		{"plain key", "GOOD_KEY", false},
+		{"dotted key", "cache.hosts.0", false},
+		{"hyphenated key", "api-key", false},
+		{"at-sign key", "user@example", false},
 	}
 
 	for _, tt := range tests {

@@ -180,14 +180,20 @@ func TestSEC06_MarshalRejectsUnsafeKeys(t *testing.T) {
 	}
 
 	// Keys that survive a re-parse are still accepted in both formats.
-	safe := map[string]string{"GOOD_KEY": "v", "cache.hosts.0": "h", "A#B": "x"}
-	for _, format := range []MarshalFormat{FormatEnv, FormatYAML} {
-		if _, err := MarshalEnvAs(safe, format, true); err != nil {
-			t.Errorf("MarshalEnvAs(%v) rejected safe keys: %v", format, err)
-		}
+	// "A#B" is excluded: the YAML writer rejects it because the loader's
+	// structured key grammar (IsValidJSONKey) would reject it on reload, and
+	// the .env writer rejects it because the .env parser's key pattern
+	// (^[A-Za-z][A-Za-z0-9_]*$) would — both writers now agree with their
+	// reader (SEC-06).
+	envSafe := map[string]string{"GOOD_KEY": "v", "KEY_2": "h"}
+	if _, err := MarshalEnvAs(envSafe, FormatEnv, true); err != nil {
+		t.Errorf("MarshalEnvAs(FormatEnv) rejected safe keys: %v", err)
 	}
-	// JSON accepts the loader's own key space (IsValidJSONKey). "A#B" is
-	// env/YAML-safe but NOT loader-loadable from JSON, so it is excluded.
+	yamlSafe := map[string]string{"GOOD_KEY": "v", "cache.hosts.0": "h", "user@example": "u"}
+	if _, err := MarshalEnvAs(yamlSafe, FormatYAML, true); err != nil {
+		t.Errorf("MarshalEnvAs(FormatYAML) rejected safe keys: %v", err)
+	}
+	// JSON accepts the loader's own key space (IsValidJSONKey).
 	jsonSafe := map[string]string{"GOOD_KEY": "v", "cache.hosts.0": "h", "user@example": "u"}
 	if _, err := MarshalEnvAs(jsonSafe, FormatJSON, true); err != nil {
 		t.Errorf("MarshalEnvAs(FormatJSON) rejected safe keys: %v", err)

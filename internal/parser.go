@@ -578,8 +578,24 @@ func KeysToUpperPooled(m map[string]string) map[string]bool {
 	return result
 }
 
-// PutKeysToUpperMap returns a pooled map obtained from KeysToUpperPooled.
-// It is safe to call with nil.
+// PutKeysToUpperMap returns a pooled map obtained from KeysToUpperPooled or
+// KeysToUpperFromSlice. It is safe to call with nil.
 func PutKeysToUpperMap(m map[string]bool) {
 	putKeysToUpperMap(m)
+}
+
+// KeysToUpperFromSlice converts a key slice into a pooled uppercase set —
+// the slice-backed counterpart of KeysToUpperPooled, for callers that hold
+// keys without their values (the Loader's Validate path) and so cannot build
+// a map[string]string for the pooled variant. Like KeysToUpperPooled, the
+// returned map MUST be returned to the pool using PutKeysToUpperMap.
+func KeysToUpperFromSlice(keys []string) map[string]bool {
+	result := getKeysToUpperMap()
+	for _, k := range keys {
+		if k == "" {
+			continue
+		}
+		result[ToUpperASCII(k)] = true
+	}
+	return result
 }

@@ -104,6 +104,33 @@
 // parse/marshal/utility families have no package-level counterpart by
 // design.
 //
+// Two consequences of the initializer design are easy to misread as layer
+// inconsistencies and are called out explicitly:
+//
+//   - Uninitialized vs closed errors: the package-level Set/Delete/Validate/
+//     ParseInto return ErrNotInitialized when no default loader exists, while
+//     the same-named Loader methods return ErrClosed on a nil or closed
+//     Loader. These are two genuinely different states, not a mismatch —
+//     getDefaultLoader only hands out the live singleton, so a package-level
+//     accessor never fails merely because initialization is missing. One
+//     narrow exception: a concurrent ResetDefaultLoader can close that
+//     singleton after it was fetched, and a package-level mutator then
+//     reports ErrClosed exactly like its instance counterpart.
+//
+//   - AutoApply: Load/Overload/LoadWithConfig force AutoApply=true regardless
+//     of cfg.AutoApply, so loaded (and subsequently Set) values are written to
+//     os.Environ; New honors cfg.AutoApply and defaults it to false. The same
+//     Config therefore has different process-environment side effects across
+//     the two layers, by design.
+//
+// The default loader has no env.Apply()/env.Close(): Load already applies, and
+// release goes through ResetDefaultLoader, which closes and clears the
+// singleton (the instance counterparts are Loader.Apply/Loader.Close). Every
+// other package-level accessor (GetString, GetInt, GetBool, GetUint64,
+// GetFloat64, GetDuration, Lookup, GetSecure, Keys, All, Len, Set, Delete,
+// Validate, ParseInto, GetSlice) is a direct proxy whose behavior matches the
+// same-named Loader method.
+//
 // A few process-wide knobs are deliberately NOT part of Config because they
 // are global rather than per-instance: SetMemoryLockEnabled/SetMemoryLockStrict
 // (memory locking), RegisterParser/ForceRegisterParser (the parser registry),
@@ -120,6 +147,15 @@
 //
 // All Loader methods are safe for concurrent use. The library uses sharded
 // locking for optimal performance in high-concurrency scenarios.
+//
+// # Panic Safety
+//
+// Public APIs do not panic on invalid input, on a nil or zero-value Loader,
+// or when user-supplied code invoked by the library panics: custom
+// components (ComponentConfig), parsers from RegisterParser, and
+// struct-field (un)marshaler callbacks are wrapped so a panic surfaces as an
+// error from the call that triggered it (see ComponentConfig's panic
+// contract).
 //
 // # Error Types
 //
@@ -303,11 +339,9 @@ func New(cfg ...Config) (*Loader, error) {
 		return nil, fmt.Errorf("%w: %w", ErrInvalidConfig, err)
 	}
 
-	// Use default file system if not specified
-	fs := c.FileSystem
-	if fs == nil {
-		fs = DefaultFileSystem
-	}
+	// Use default file system if not specified; custom file systems are
+	// wrapped for panic containment (SEC-003, see recovering.go).
+	fs := resolveComponentFileSystem(c.FileSystem)
 
 	// Build shared components once
 	factory := c.buildComponentFactoryWithFS(fs)
@@ -478,7 +512,7 @@ func (l *Loader) loadFileLocked(filename string) error {
 	}
 
 	// SECURITY: Validate file path to prevent path traversal attacks
-	if err := validateFilePath(filename); err != nil {
+	if err := validateFilePathForFS(filename, l.fs); err != nil {
 		_ = l.factory.Auditor().LogError(internal.ActionSecurity, "", "path validation failed: "+err.Error())
 		return err
 	}
@@ -812,6 +846,9 @@ func (l *Loader) set(key, value string) error {
 			return nil
 		}
 		if err := l.fs.Setenv(key, value); err != nil {
+			// Mirror applyLocked: the os-level failure reaches the audit
+			// stream, not only the returned error.
+			_ = l.factory.Auditor().LogError(internal.ActionSet, key, err.Error())
 			return fmt.Errorf("failed to set environment: %w", err)
 		}
 		l.vars.Set(key, value)
@@ -872,6 +909,18 @@ func (l *Loader) Delete(key string) error {
 	return l.auditCheckFailClosed()
 }
 
+// closeParsers closes parsers that hold resources, best-effort. Shared by
+// Loader.Close and the one-shot parse path in UnmarshalMapWithConfig, so a
+// custom parser registered via RegisterParser gets the same cleanup whether
+// it ran inside a Loader or a standalone parse.
+func closeParsers(parsers map[FileFormat]EnvParser) {
+	for _, p := range parsers {
+		if closer, ok := p.(io.Closer); ok {
+			_ = closer.Close() // best-effort, matches createParsers cleanup
+		}
+	}
+}
+
 // Close closes the loader and securely clears all stored values.
 // If the loader owns its ComponentFactory, it will also close the factory.
 //
@@ -899,11 +948,7 @@ func (l *Loader) Close() error {
 	// parsers when a sibling factory fails). Built-in parsers are not
 	// closable; custom parsers registered via RegisterParser may be, and
 	// skipping this leaked their resources for the loader's whole lifetime.
-	for _, p := range l.parsers {
-		if closer, ok := p.(io.Closer); ok {
-			_ = closer.Close() // best-effort, matches createParsers cleanup
-		}
-	}
+	closeParsers(l.parsers)
 
 	// Only close the factory if we own it.
 	// This prevents double-closing when the factory is shared.
@@ -964,24 +1009,43 @@ func (l *Loader) Validate() error {
 		return err
 	}
 	defer l.exitRead()
-	return l.factory.Validator().ValidateRequired(l.keysToUpper())
+	// Pooled uppercase-key index, the same mechanism the parsers use
+	// (validateRequiredKeys); this previously built a fresh map per call.
+	upperKeys := internal.KeysToUpperFromSlice(l.vars.Keys())
+	defer internal.PutKeysToUpperMap(upperKeys)
+	return l.factory.Validator().ValidateRequired(upperKeys)
 }
 
-// keysToUpper returns all keys as uppercase for comparison.
-// Caller must already hold the read lock (l.mu) — accesses l.vars directly
-// to avoid the nested RLock that would occur through l.Keys().
-func (l *Loader) keysToUpper() map[string]bool {
-	keys := l.vars.Keys()
-	result := make(map[string]bool, len(keys))
-	for _, k := range keys {
-		result[internal.ToUpperASCII(k)] = true
-	}
-	return result
-}
-
-// validateFilePath validates a file path for security.
+// validateFilePath validates a file path for security with the FULL rule
+// set, including symlink resolution against the real file system.
 // It checks for path traversal attempts and other potentially dangerous patterns.
 // Note: This function delegates to internal.PathValidator for the actual validation.
 func validateFilePath(filename string) error {
 	return internal.ValidateFilePath(filename)
+}
+
+// validateFilePathForFS validates a file path at the right fidelity for fs:
+// the full rule set — including real symlink resolution — when fs is the OS
+// file system, and the static, disk-free rules when fs is injected.
+// ValidateFilePath's EvalSymlinks step bypasses the FileSystem abstraction:
+// with a custom (e.g. in-memory) file system it consulted host-disk state
+// the injected FS never reads, so a load could be rejected (or accepted)
+// based on files outside the injected boundary. For an injected FS its own
+// Open is the final arbiter of what exists; the SecureReader limits remain
+// as defense in depth either way.
+func validateFilePathForFS(filename string, fs FileSystem) error {
+	if isOSFileSystem(fs) {
+		return validateFilePath(filename)
+	}
+	return internal.ValidateFilePathStatic(filename)
+}
+
+// isOSFileSystem reports whether fs, after unwrapping the panic-containment
+// layer (see recovering.go), is the real OS file system.
+func isOSFileSystem(fs FileSystem) bool {
+	if wrapped, ok := fs.(*recoveringFileSystem); ok {
+		fs = wrapped.FileSystem
+	}
+	_, ok := fs.(OSFileSystem)
+	return ok
 }
